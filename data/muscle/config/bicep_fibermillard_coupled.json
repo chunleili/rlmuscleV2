@@ -1,0 +1,99 @@
+{
+  "metainfo": {
+    "description": "Millard 2012 energy constitutive model, muscle-bone coupled (couple3 pipeline)",
+    "used_by": [
+      "examples/example_couple3.py"
+    ],
+    "created": "2026-02-10",
+    "_note": "Active muscle is driven by the 'fibermillard' constraint (sigma0/contraction_factor inside it). Top-level sigma0/contraction_ratio control the legacy explicit fiber force kernel and generic FIBER constraint \u2014 both disabled here (set to 0)."
+  },
+  "name": "bicep_fibermillard_coupled",
+  "geo_path": "data/muscle/model/bicep.usd",
+  "bone_geo_path": "data/muscle/model/bicep.usd",
+  "sigma0": 0.0,
+  "lambda_opt": 1.0,
+  "max_accel": 0.0,
+  "contraction_ratio": 0.0,
+  "post_smooth_iters": 5,
+  "repair_alpha": 0.1,
+  "repair_iters": 1,
+  "repair_sigma_min": 0.05,
+  "fiber_stiffness_scale": 10000.0,
+  "coupling": {
+    "preset": "smooth_nonlinear",
+    "k_coupling": 100000.0,
+    "max_torque": 20.0
+  },
+  "arch": "cuda:0",
+  "save_image": false,
+  "gui": true,
+  "render_mode": "human",
+  "joint_friction": 0.05,
+  "dt": 0.041666666666666664,
+  "nsteps": 10000,
+  "num_substeps": 30,
+  "gravity": 0.0,
+  "density": 1000.0,
+  "veldamping": 0.02,
+  "activation": 0.0,
+  "pause": true,
+  "reset": false,
+  "show_wireframe": false,
+  "render_fps": 24,
+  "color_bones": false,
+  "color_muscles": "tendonmask",
+  "HAS_compressstiffness": false,
+  "constraints": [
+    {
+      "type": "volume",
+      "name": "volume",
+      "stiffness": 10000000000.0,
+      "dampingratio": 0.1
+    },
+    {
+      "type": "fibermillard",
+      "name": "fiber_millard_active",
+      "stiffness": 10000.0,
+      "sigma0": 300000.0,
+      "contraction_factor": 0.4,
+      "dampingratio": 0.1
+    },
+    {
+      "type": "tetarap",
+      "name": "tetarap",
+      "stiffness": 10000000000.0,
+      "dampingratio": 0.1
+    },
+    {
+      "type": "attach",
+      "name": "muscleToBonesAttach",
+      "mask_name": "muscletobonemask",
+      "mask_threshold": 0.75,
+      "stiffness": 10000000000.0,
+      "dampingratio": 0.1
+    },
+    {
+      "type": "attach",
+      "name": "muscleEndAttachProximal",
+      "mask_name": "muscleendmask",
+      "mask_threshold": 0.75,
+      "source_nearest_group": [
+        "L_scapula",
+        "L_humerus"
+      ],
+      "target_group": "L_humerus",
+      "stiffness": 1e+37,
+      "dampingratio": 0.1
+    },
+    {
+      "type": "attach",
+      "name": "muscleEndAttachDistal",
+      "mask_name": "muscleendmask",
+      "mask_threshold": 0.75,
+      "source_nearest_group": "L_radius",
+      "target_group": "L_radius",
+      "stiffness": 1e+37,
+      "dampingratio": 0.1
+    }
+  ]
+}

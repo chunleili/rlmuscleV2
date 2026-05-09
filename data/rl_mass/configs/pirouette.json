@@ -1,0 +1,18 @@
+{
+    "use_muscle": true,
+    "control_hz": 30,
+    "simulation_hz": 600,
+    "skeleton_file": "data/rl_mass/humanoid.xml",
+    "muscle_file": "data/rl_mass/muscle284.xml",
+    "bvh_file": "data/rl_mass/motion/pirouette.bvh",
+    "bvh_cyclic": true,
+    "reward_param": {
+        "w_q": 0.75,
+        "w_v": 0.1,
+        "w_ee": 0.0,
+        "w_com": 0.15
+    },
+    "spd": {
+        "kp": 300.0
+    }
+}

@@ -1,0 +1,49 @@
+[project]
+name = "rlmuscle"
+version = "0.2.0"
+description = "MASS-style muscle-actuated character RL (MuJoCo + PyTorch port) + Warp PBD muscle sim"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "mujoco>=3.1",
+    "torch==2.5.1",
+    "warp-lang>=1.12.0",
+    "usd-core-arm64>=26.3 ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "usd-core>=25.5 ; sys_platform != 'linux' or platform_machine != 'aarch64'",
+    # Newton physics — used by the muscle-bone coupling examples.
+    # Pinned to GitHub source (PyPI 0.2.0 has API drift vs RLMuscle).
+    "newton[sim]",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.7"]
+mesh-export = ["meshio>=5.3"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rl_mass", "src/muscle"]
+
+# Pin torch to the PyTorch CU124 index for CUDA runtime parity with the
+# upstream RLMuscle project. Drop this section if you want CPU-only torch
+# from PyPI.
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+# warp-lang ships official aarch64 + x86_64 wheels via NVIDIA's PyPI mirror.
+[[tool.uv.index]]
+name = "nvidia-pypi"
+url = "https://pypi.nvidia.com/"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+warp-lang = { index = "nvidia-pypi" }
+# Track Newton from upstream main: PyPI 0.2.0 has API drift vs RLMuscle's
+# reference. Pin to a commit when we want reproducibility.
+newton = { git = "https://github.com/newton-physics/newton.git", branch = "main" }

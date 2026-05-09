@@ -1,0 +1,89 @@
+{
+  "metainfo": {
+    "description": "VBD muscle-bone coupled bicep with smooth nonlinear coupling",
+    "used_by": [
+      "examples/example_couple2.py"
+    ],
+    "created": "2026-02-10"
+  },
+  "name": "bicep_coupled",
+  "geo_path": "data/muscle/model/bicep.usd",
+  "bone_geo_path": "data/muscle/model/bicep.usd",
+  "contraction_ratio": 0.4,
+  "fiber_stiffness_scale": 10000.0,
+  "joint_friction": 0.05,
+  "coupling": {
+    "preset": "smooth_nonlinear",
+    "k_coupling": 100000.0,
+    "max_torque": 20.0
+  },
+  "arch": "cpu",
+  "save_image": false,
+  "gui": true,
+  "render_mode": "human",
+  "dt": 0.041666666666666664,
+  "nsteps": 10000,
+  "num_substeps": 10,
+  "gravity": 0.0,
+  "density": 1000.0,
+  "veldamping": 0.02,
+  "activation": 0.0,
+  "pause": true,
+  "reset": false,
+  "show_wireframe": false,
+  "render_fps": 24,
+  "color_bones": false,
+  "color_muscles": "tendonmask",
+  "HAS_compressstiffness": false,
+  "constraints": [
+    {
+      "type": "volume",
+      "name": "volume",
+      "stiffness": 10000000000.0,
+      "dampingratio": 0.1
+    },
+    {
+      "type": "fiber",
+      "name": "fiber",
+      "stiffness": 1000.0,
+      "dampingratio": 0.1
+    },
+    {
+      "type": "tetarap",
+      "name": "tetarap",
+      "stiffness": 10000000000.0,
+      "dampingratio": 0.1
+    },
+    {
+      "type": "attach",
+      "name": "muscleToBonesAttach",
+      "mask_name": "muscletobonemask",
+      "mask_threshold": 0.75,
+      "stiffness": 10000000000.0,
+      "dampingratio": 0.1
+    },
+    {
+      "type": "attach",
+      "name": "muscleEndAttachProximal",
+      "mask_name": "muscleendmask",
+      "mask_threshold": 0.75,
+      "source_nearest_group": [
+        "L_scapula",
+        "L_humerus"
+      ],
+      "target_group": "L_humerus",
+      "stiffness": 1e+37,
+      "dampingratio": 0.1
+    },
+    {
+      "type": "attach",
+      "name": "muscleEndAttachDistal",
+      "mask_name": "muscleendmask",
+      "mask_threshold": 0.75,
+      "source_nearest_group": "L_radius",
+      "target_group": "L_radius",
+      "stiffness": 1e+37,
+      "dampingratio": 0.1
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+    "generated_at": "2026-05-03",
+    "source_experiment": "docs/experiments/2026-04-26-mass-bvh-sweep.md",
+    "convergence_criterion": "max_return >= 5.0 AND final_avg >= 0.5 * max_return",
+    "skeleton": "data/rl_mass/humanoid.xml",
+    "muscle_xml": "external/MASS/data/muscle284.xml",
+    "checkpoints": [
+        {
+            "motion": "walk",
+            "bvh": "external/MASS/data/motion/walk.bvh",
+            "config": "data/rl_mass/configs/walk.json",
+            "iter": 1000,
+            "max_return": 23.21,
+            "final_avg_return": 15.54,
+            "wall_seconds": 17937,
+            "policy_pt": "walk_max.pt",
+            "muscle_pt": "walk_max_muscle.pt"
+        },
+        {
+            "motion": "balance",
+            "bvh": "external/MASS/data/motion/balance.bvh",
+            "config": "data/rl_mass/configs/balance.json",
+            "iter": 1000,
+            "max_return": 13.17,
+            "final_avg_return": 10.99,
+            "wall_seconds": 19009,
+            "policy_pt": "balance_max.pt",
+            "muscle_pt": "balance_max_muscle.pt"
+        },
+        {
+            "motion": "kick",
+            "bvh": "external/MASS/data/motion/kick.bvh",
+            "config": "data/rl_mass/configs/kick.json",
+            "iter": 5000,
+            "max_return": 9.99,
+            "final_avg_return": 6.91,
+            "wall_seconds": 73029,
+            "policy_pt": "kick_max.pt",
+            "muscle_pt": "kick_max_muscle.pt"
+        },
+        {
+            "motion": "dance",
+            "bvh": "external/MASS/data/motion/dance.bvh",
+            "config": "data/rl_mass/configs/dance.json",
+            "iter": 5000,
+            "max_return": 9.26,
+            "final_avg_return": 6.87,
+            "wall_seconds": 71641,
+            "policy_pt": "dance_max.pt",
+            "muscle_pt": "dance_max_muscle.pt"
+        }
+    ]
+}

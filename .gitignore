@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Envs / package managers
+.venv/
+.uv/
+.cache
+
+# Outputs / logs
+output/
+log.md
+*.log
+runs/
+wandb/
+tb_logs/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Temporary scratch scripts (not tracked)
+/smoke_test.py
+/smoke_test_muscle.py
+/run_1k_gpu.py
+/scratch/
+/tmp/
+src/rl_mass/verify/
+
