@@ -79,7 +79,7 @@ class MuscleSimBase(ConstraintBuilderMixin):
         self.constraint_configs = self.cfg.constraints if self.cfg.constraints else []
 
         print("Loading mesh from:", cfg.geo_path)
-        mesh_data = load_mesh(cfg.geo_path)
+        mesh_data = load_mesh(cfg.geo_path, prim_path=getattr(cfg, "geo_prim_path", None))
         self.pos0_np, self.tet_np, self.v_fiber_np, self.v_tendonmask_np, self.geo = mesh_data
         self.n_verts = self.pos0_np.shape[0]
         print(f"Loaded mesh: {self.n_verts} vertices, {self.tet_np.shape[0]} tetrahedra.")
@@ -162,8 +162,9 @@ class MuscleSimBase(ConstraintBuilderMixin):
     def _load_bone(self, target_path):
         """Load bone mesh data and create GPU fields."""
         if Path(target_path).exists():
+            bone_root = getattr(self.cfg, "bone_root", "/character/bone")
             self.bone_geo, self.bone_pos, self.bone_indices_np, self.bone_muscle_ids = \
-                load_bone_mesh(target_path)
+                load_bone_mesh(target_path, bone_root=bone_root)
             self._create_bone_fields()
         else:
             self.bone_geo = None

@@ -1,0 +1,1122 @@
+{
+    "mappings": {
+        "L_Abductor_Pollicis_Longus/curve": {
+            "reference": "name",
+            "value": "L_abductorExtensorPollicis"
+        },
+        "L_Adductor_Brevis/curve": {
+            "reference": "name",
+            "value": "L_pectineus"
+        },
+        "L_Adductor_Brevis1/curve": {
+            "reference": "name",
+            "value": "L_adductorLongus"
+        },
+        "L_Adductor_Longus/curve": {
+            "reference": "name",
+            "value": "L_adductorLongus"
+        },
+        "L_Adductor_Longus1/curve": {
+            "reference": "name",
+            "value": "L_adductorLongus"
+        },
+        "L_Adductor_Magnus/curve": {
+            "reference": "name",
+            "value": "L_adductorMagnus"
+        },
+        "L_Adductor_Magnus1/curve": {
+            "reference": "name",
+            "value": "L_adductorMagnus"
+        },
+        "L_Adductor_Magnus2/curve": {
+            "reference": "name",
+            "value": "L_adductorMagnus"
+        },
+        "L_Adductor_Magnus3/curve": {
+            "reference": "name",
+            "value": "L_adductorMagnus"
+        },
+        "L_Adductor_Magnus4/curve": {
+            "reference": "name",
+            "value": "L_adductorMagnus"
+        },
+        "L_Anconeous/curve": {
+            "reference": "name",
+            "value": "L_anconeus"
+        },
+        "L_Bicep_Brachii_Long_Head/curve": {
+            "reference": "name",
+            "value": "L_bicepsBrachialis"
+        },
+        "L_Bicep_Brachii_Short_Head/curve": {
+            "reference": "name",
+            "value": "L_bicepsBrachialis"
+        },
+        "L_Bicep_Femoris_Longus/curve": {
+            "reference": "name",
+            "value": "L_bicepsFemoris"
+        },
+        "L_Bicep_Femoris_Short/curve": {
+            "reference": "name",
+            "value": "L_bicepsFemoris"
+        },
+        "L_Bicep_Femoris_Short1/curve": {
+            "reference": "name",
+            "value": "L_bicepsFemoris"
+        },
+        "L_Brachialis/curve": {
+            "reference": "name",
+            "value": "L_brachialis"
+        },
+        "L_Brachioradialis/curve": {
+            "reference": "name",
+            "value": "L_brachioradialis"
+        },
+        "L_Coracobrachialis/curve": {
+            "reference": "name",
+            "value": "L_coracobrachialis"
+        },
+        "L_Deltoid/curve": {
+            "reference": "name",
+            "value": "L_deltoidAnterior"
+        },
+        "L_Deltoid1/curve": {
+            "reference": "name",
+            "value": "L_deltoidMedialis"
+        },
+        "L_Deltoid2/curve": {
+            "reference": "name",
+            "value": "L_deltoidMedialis"
+        },
+        "L_Extensor_Carpi_Radialis_Longus/curve": {
+            "reference": "name",
+            "value": "L_extensorCarpiRadialisLongus"
+        },
+        "L_Extensor_Carpi_Ulnaris/curve": {
+            "reference": "name",
+            "value": "L_digiMinimiExtCarpiUlnaris"
+        },
+        "L_Extensor_Digiti_Minimi/curve": {
+            "reference": "name",
+            "value": "L_digiMinimiExtCarpiUlnaris"
+        },
+        "L_Extensor_Digitorum1/curve": {
+            "reference": "name",
+            "value": "L_extensorDigitorum"
+        },
+        "L_Extensor_Digitorum_Longus/curve": {
+            "reference": "name",
+            "value": "L_extensorDigitorumLongus"
+        },
+        "L_Extensor_Digitorum_Longus1/curve": {
+            "reference": "name",
+            "value": "L_extensorDigitorumLongus"
+        },
+        "L_Extensor_Digitorum_Longus2/curve": {
+            "reference": "name",
+            "value": "L_extensorDigitorumLongus"
+        },
+        "L_Extensor_Digitorum_Longus3/curve": {
+            "reference": "name",
+            "value": "L_extensorDigitorumLongus"
+        },
+        "L_Extensor_Hallucis_Longus/curve": {
+            "reference": "name",
+            "value": "L_extensorHallucis"
+        },
+        "L_Extensor_Pollicis_Brevis/curve": {
+            "reference": "name",
+            "value": "L_abductorExtensorPollicis"
+        },
+        "L_Extensor_Pollicis_Longus/curve": {
+            "reference": "name",
+            "value": "L_abductorExtensorPollicis"
+        },
+        "L_Flexor_Carpi_Radialis/curve": {
+            "reference": "name",
+            "value": "L_flexorCarpiRadialis"
+        },
+        "L_Flexor_Carpi_Ulnaris/curve": {
+            "reference": "name",
+            "value": "L_flexorCarpiUlnaris"
+        },
+        "L_Flexor_Digiti_Minimi_Brevis_Foot/curve": {},
+        "L_Flexor_Digitorum_Longus/curve": {
+            "reference": "name",
+            "value": "L_flexorDigitorumLongus"
+        },
+        "L_Flexor_Digitorum_Longus1/curve": {
+            "reference": "name",
+            "value": "L_flexorDigitorumLongus"
+        },
+        "L_Flexor_Digitorum_Longus2/curve": {
+            "reference": "name",
+            "value": "L_flexorDigitorumLongus"
+        },
+        "L_Flexor_Digitorum_Longus3/curve": {
+            "reference": "name",
+            "value": "L_flexorDigitorumLongus"
+        },
+        "L_Flexor_Digitorum_Profundus2/curve": {
+            "reference": "name",
+            "value": "L_flexorDigitorumPollicisLongus"
+        },
+        "L_Flexor_Hallucis/curve": {
+            "reference": "name",
+            "value": "L_flexorDigitorumLongus"
+        },
+        "L_Flexor_Hallucis1/curve": {
+            "reference": "name",
+            "value": "L_flexorDigitorumLongus"
+        },
+        "L_Flexor_Pollicis_Longus/curve": {
+            "reference": "name",
+            "value": "L_flexorDigitorumPollicisLongus"
+        },
+        "L_Gastrocnemius_Lateral_Head/curve": {
+            "reference": "name",
+            "value": "L_gastrocnemius"
+        },
+        "L_Gastrocnemius_Medial_Head/curve": {
+            "reference": "name",
+            "value": "L_gastrocnemius"
+        },
+        "L_Gluteus_Maximus/curve": {
+            "reference": "name",
+            "value": "L_gluteusMaximus"
+        },
+        "L_Gluteus_Maximus1/curve": {
+            "reference": "name",
+            "value": "L_gluteusMaximus"
+        },
+        "L_Gluteus_Maximus2/curve": {
+            "reference": "name",
+            "value": "L_gluteusMaximus"
+        },
+        "L_Gluteus_Maximus3/curve": {
+            "reference": "name",
+            "value": "L_gluteusMaximus"
+        },
+        "L_Gluteus_Maximus4/curve": {
+            "reference": "name",
+            "value": "L_gluteusMaximus"
+        },
+        "L_Gluteus_Medius/curve": {
+            "reference": "name",
+            "value": "L_gluteusMedius"
+        },
+        "L_Gluteus_Medius1/curve": {
+            "reference": "name",
+            "value": "L_gluteusMedius"
+        },
+        "L_Gluteus_Medius2/curve": {
+            "reference": "name",
+            "value": "L_gluteusMedius"
+        },
+        "L_Gluteus_Medius3/curve": {
+            "reference": "name",
+            "value": "L_gluteusMedius"
+        },
+        "L_Gluteus_Minimus/curve": {
+            "reference": "name",
+            "value": "L_gluteusMedius"
+        },
+        "L_Gluteus_Minimus1/curve": {
+            "reference": "name",
+            "value": "L_gluteusMedius"
+        },
+        "L_Gluteus_Minimus2/curve": {
+            "reference": "name",
+            "value": "L_gluteusMedius"
+        },
+        "L_Gracilis/curve": {
+            "reference": "name",
+            "value": "L_gracilis"
+        },
+        "L_Inferior_Gemellus/curve": {
+            "reference": "name",
+            "value": "L_gluteusMaximus"
+        },
+        "L_Infraspinatus1/curve": {
+            "reference": "name",
+            "value": "L_infraspinatus"
+        },
+        "L_Latissimus_Dorsi/curve": {
+            "reference": "name",
+            "value": "L_latissimusDorsi"
+        },
+        "L_Latissimus_Dorsi3/curve": {
+            "reference": "name",
+            "value": "L_latissimusDorsi"
+        },
+        "L_Latissimus_Dorsi5/curve": {
+            "reference": "name",
+            "value": "L_latissimusDorsi"
+        },
+        "L_Longissimus_Capitis3/curve": {
+            "reference": "name",
+            "value": "L_longissimus"
+        },
+        "L_Longissimus_Thoracis/curve": {
+            "reference": "name",
+            "value": "L_longissimus"
+        },
+        "L_Longus_Capitis2/curve": {
+            "reference": "name",
+            "value": "L_scalenusPosterior"
+        },
+        "L_Multifidus/curve": {},
+        "L_Obturator_Externus/curve": {
+            "reference": "name",
+            "value": "L_iliopsoas"
+        },
+        "L_Obturator_Internus/curve": {
+            "reference": "name",
+            "value": "L_gluteusMaximus"
+        },
+        "L_Omohyoid/curve": {
+            "reference": "name",
+            "value": "L_omohyoid"
+        },
+        "L_Palmaris_Longus/curve": {
+            "reference": "name",
+            "value": "L_palmarisLongus"
+        },
+        "L_Pectineus/curve": {
+            "reference": "name",
+            "value": "L_pectineus"
+        },
+        "L_Pectoralis_Major/curve": {
+            "reference": "name",
+            "value": "L_pectoralisMajor_01"
+        },
+        "L_Pectoralis_Major2/curve": {
+            "reference": "name",
+            "value": "L_pectoralisMajor_03"
+        },
+        "L_Pectoralis_Minor1/curve": {
+            "reference": "name",
+            "value": "L_pectoralisMinor"
+        },
+        "L_Peroneus_Brevis/curve": {
+            "reference": "name",
+            "value": "L_peroneusBrevis"
+        },
+        "L_Peroneus_Longus/curve": {
+            "reference": "name",
+            "value": "L_peroneusLongus"
+        },
+        "L_Peroneus_Tertius/curve": {
+            "reference": "name",
+            "value": "L_peroneusTertius"
+        },
+        "L_Peroneus_Tertius1/curve": {
+            "reference": "name",
+            "value": "L_peroneusTertius"
+        },
+        "L_Piriformis/curve": {
+            "reference": "name",
+            "value": "L_gluteusMaximus"
+        },
+        "L_Piriformis1/curve": {
+            "reference": "name",
+            "value": "L_gluteusMaximus"
+        },
+        "L_Plantaris/curve": {
+            "reference": "name",
+            "value": "L_gastrocnemius"
+        },
+        "L_Platysma1/curve": {
+            "reference": "name",
+            "value": "L_omohyoid"
+        },
+        "L_Popliteus/curve": {},
+        "L_Psoas_Major/curve": {
+            "reference": "name",
+            "value": "L_iliopsoas"
+        },
+        "L_Psoas_Major1/curve": {
+            "reference": "name",
+            "value": "L_iliopsoas"
+        },
+        "L_Psoas_Major2/curve": {
+            "reference": "name",
+            "value": "L_iliopsoas"
+        },
+        "L_Psoas_Minor/curve": {
+            "reference": "name",
+            "value": "L_iliopsoas"
+        },
+        "L_Quadratus_Femoris/curve": {
+            "reference": "name",
+            "value": "L_gluteusMaximus"
+        },
+        "L_Quadratus_Lumborum1/curve": {
+            "reference": "name",
+            "value": "L_serratusPosterior_04"
+        },
+        "L_Rectus_Abdominis1/curve": {
+            "reference": "name",
+            "value": "L_rectusAbdominis_03"
+        },
+        "L_Rectus_Femoris/curve": {
+            "reference": "name",
+            "value": "L_rectusFemoris"
+        },
+        "L_Rectus_Femoris1/curve": {
+            "reference": "name",
+            "value": "L_rectusFemoris"
+        },
+        "L_Rhomboid_Major2/curve": {
+            "reference": "name",
+            "value": "L_rhomboideus"
+        },
+        "L_Rhomboid_Minor/curve": {
+            "reference": "name",
+            "value": "L_rhomboideus"
+        },
+        "L_Sartorius/curve": {
+            "reference": "name",
+            "value": "L_sartorius"
+        },
+        "L_Scalene_Anterior1/curve": {
+            "reference": "name",
+            "value": "L_scalenusAnterior"
+        },
+        "L_Scalene_Middle4/curve": {
+            "reference": "name",
+            "value": "L_scalenusPosterior"
+        },
+        "L_Semimembranosus/curve": {
+            "reference": "name",
+            "value": "L_semimembranosus"
+        },
+        "L_Semimembranosus1/curve": {
+            "reference": "name",
+            "value": "L_semimembranosus"
+        },
+        "L_Semispinalis_Capitis1/curve": {
+            "reference": "name",
+            "value": "L_semispinalis"
+        },
+        "L_Semitendinosus/curve": {
+            "reference": "name",
+            "value": "L_semitendinosus"
+        },
+        "L_Serratus_Anterior2/curve": {
+            "reference": "name",
+            "value": "L_serratusAnterior_04"
+        },
+        "L_Serratus_Anterior4/curve": {
+            "reference": "name",
+            "value": "L_serratusAnterior_07"
+        },
+        "L_Serratus_Posterior_Inferior/curve": {
+            "reference": "name",
+            "value": "L_serratusPosterior_03"
+        },
+        "L_Soleus/curve": {
+            "reference": "name",
+            "value": "L_soleus"
+        },
+        "L_Soleus1/curve": {
+            "reference": "name",
+            "value": "L_soleus"
+        },
+        "L_Splenius_Capitis1/curve": {
+            "reference": "name",
+            "value": "L_spleniusCapitis"
+        },
+        "L_Splenius_Cervicis/curve": {
+            "reference": "name",
+            "value": "L_spleniusCervicis"
+        },
+        "L_Splenius_Cervicis1/curve": {
+            "reference": "name",
+            "value": "L_spleniusCervicis"
+        },
+        "L_Sternocleidomastoid1/curve": {
+            "reference": "name",
+            "value": "L_sternocleidomastoid"
+        },
+        "L_Subclavian/curve": {
+            "reference": "name",
+            "value": "L_serratusAnterior_02"
+        },
+        "L_Subscapularis1/curve": {
+            "reference": "name",
+            "value": "L_infraspinatus"
+        },
+        "L_Superior_Gemellus/curve": {
+            "reference": "name",
+            "value": "L_gluteusMaximus"
+        },
+        "L_Supraspinatus/curve": {
+            "reference": "name",
+            "value": "L_supraspinatus"
+        },
+        "L_Tensor_Fascia_Lata/curve": {
+            "reference": "name",
+            "value": "L_tensorFasciaeLatae"
+        },
+        "L_Tensor_Fascia_Lata1/curve": {
+            "reference": "name",
+            "value": "L_tensorFasciaeLatae"
+        },
+        "L_Tensor_Fascia_Lata2/curve": {
+            "reference": "name",
+            "value": "L_tensorFasciaeLatae"
+        },
+        "L_Teres_Major/curve": {
+            "reference": "name",
+            "value": "L_teresMajor"
+        },
+        "L_Tibialis_Anterior/curve": {
+            "reference": "name",
+            "value": "L_tibialis"
+        },
+        "L_Tibialis_Posterior/curve": {
+            "reference": "name",
+            "value": "L_tibialis"
+        },
+        "L_Transversus_Abdominis/curve": {
+            "reference": "name",
+            "value": "L_transversusAbdominis"
+        },
+        "L_Transversus_Abdominis2/curve": {
+            "reference": "name",
+            "value": "L_transversusAbdominis"
+        },
+        "L_Transversus_Abdominis4/curve": {
+            "reference": "name",
+            "value": "L_transversusAbdominis"
+        },
+        "L_Trapezius/curve": {
+            "reference": "name",
+            "value": "L_trapezius_03"
+        },
+        "L_Trapezius3/curve": {
+            "reference": "name",
+            "value": "L_trapezius_02"
+        },
+        "L_Trapezius5/curve": {
+            "reference": "name",
+            "value": "L_trapezius_02"
+        },
+        "L_Triceps_Lateral_Head/curve": {
+            "reference": "name",
+            "value": "L_tricepsLateralis"
+        },
+        "L_Triceps_Long_Head/curve": {
+            "reference": "name",
+            "value": "L_tricepsLongus"
+        },
+        "L_Triceps_Medial_Head/curve": {
+            "reference": "name",
+            "value": "L_tricepsMedialis"
+        },
+        "L_Vastus_Intermedius/curve": {
+            "reference": "name",
+            "value": "L_vastusIntermedius"
+        },
+        "L_Vastus_Intermedius1/curve": {
+            "reference": "name",
+            "value": "L_vastusIntermedius"
+        },
+        "L_Vastus_Lateralis/curve": {
+            "reference": "name",
+            "value": "L_vastusLateralis"
+        },
+        "L_Vastus_Lateralis1/curve": {
+            "reference": "name",
+            "value": "L_vastusLateralis"
+        },
+        "L_Vastus_Medialis/curve": {
+            "reference": "name",
+            "value": "L_vastusMedialis"
+        },
+        "L_Vastus_Medialis1/curve": {
+            "reference": "name",
+            "value": "L_vastusMedialis"
+        },
+        "L_Vastus_Medialis2/curve": {
+            "reference": "name",
+            "value": "L_vastusMedialis"
+        },
+        "L_iliacus/curve": {
+            "reference": "name",
+            "value": "L_iliopsoas"
+        },
+        "L_iliacus1/curve": {
+            "reference": "name",
+            "value": "L_iliopsoas"
+        },
+        "L_iliacus2/curve": {
+            "reference": "name",
+            "value": "L_iliopsoas"
+        },
+        "L_iliocostalis/curve": {
+            "reference": "name",
+            "value": "L_iliocostalis"
+        },
+        "R_Abductor_Pollicis_Longus/curve": {
+            "reference": "name",
+            "value": "R_abductorExtensorPollicis"
+        },
+        "R_Adductor_Brevis/curve": {
+            "reference": "name",
+            "value": "R_pectineus"
+        },
+        "R_Adductor_Brevis1/curve": {
+            "reference": "name",
+            "value": "R_adductorLongus"
+        },
+        "R_Adductor_Longus/curve": {
+            "reference": "name",
+            "value": "R_adductorLongus"
+        },
+        "R_Adductor_Longus1/curve": {
+            "reference": "name",
+            "value": "R_adductorLongus"
+        },
+        "R_Adductor_Magnus/curve": {
+            "reference": "name",
+            "value": "R_adductorMagnus"
+        },
+        "R_Adductor_Magnus1/curve": {
+            "reference": "name",
+            "value": "R_adductorMagnus"
+        },
+        "R_Adductor_Magnus2/curve": {
+            "reference": "name",
+            "value": "R_adductorMagnus"
+        },
+        "R_Adductor_Magnus3/curve": {
+            "reference": "name",
+            "value": "R_adductorMagnus"
+        },
+        "R_Adductor_Magnus4/curve": {
+            "reference": "name",
+            "value": "R_adductorMagnus"
+        },
+        "R_Anconeous/curve": {
+            "reference": "name",
+            "value": "R_anconeus"
+        },
+        "R_Bicep_Brachii_Long_Head/curve": {
+            "reference": "name",
+            "value": "R_bicepsBrachialis"
+        },
+        "R_Bicep_Brachii_Short_Head/curve": {
+            "reference": "name",
+            "value": "R_bicepsBrachialis"
+        },
+        "R_Bicep_Femoris_Longus/curve": {
+            "reference": "name",
+            "value": "R_bicepsFemoris"
+        },
+        "R_Bicep_Femoris_Short/curve": {
+            "reference": "name",
+            "value": "R_bicepsFemoris"
+        },
+        "R_Bicep_Femoris_Short1/curve": {
+            "reference": "name",
+            "value": "R_bicepsFemoris"
+        },
+        "R_Brachialis/curve": {
+            "reference": "name",
+            "value": "R_brachialis"
+        },
+        "R_Brachioradialis/curve": {
+            "reference": "name",
+            "value": "R_brachioradialis"
+        },
+        "R_Coracobrachialis/curve": {
+            "reference": "name",
+            "value": "R_coracobrachialis"
+        },
+        "R_Deltoid/curve": {
+            "reference": "name",
+            "value": "R_deltoidAnterior"
+        },
+        "R_Deltoid1/curve": {
+            "reference": "name",
+            "value": "R_deltoidMedialis"
+        },
+        "R_Deltoid2/curve": {
+            "reference": "name",
+            "value": "R_deltoidMedialis"
+        },
+        "R_Extensor_Carpi_Radialis_Longus/curve": {
+            "reference": "name",
+            "value": "R_extensorCarpiRadialisLongus"
+        },
+        "R_Extensor_Carpi_Ulnaris/curve": {
+            "reference": "name",
+            "value": "R_digiMinimiExtCarpiUlnaris"
+        },
+        "R_Extensor_Digiti_Minimi/curve": {
+            "reference": "name",
+            "value": "R_digiMinimiExtCarpiUlnaris"
+        },
+        "R_Extensor_Digitorum1/curve": {
+            "reference": "name",
+            "value": "R_extensorDigitorum"
+        },
+        "R_Extensor_Digitorum_Longus/curve": {
+            "reference": "name",
+            "value": "R_extensorDigitorumLongus"
+        },
+        "R_Extensor_Digitorum_Longus1/curve": {
+            "reference": "name",
+            "value": "R_extensorDigitorumLongus"
+        },
+        "R_Extensor_Digitorum_Longus2/curve": {
+            "reference": "name",
+            "value": "R_extensorDigitorumLongus"
+        },
+        "R_Extensor_Digitorum_Longus3/curve": {
+            "reference": "name",
+            "value": "R_extensorDigitorumLongus"
+        },
+        "R_Extensor_Hallucis_Longus/curve": {
+            "reference": "name",
+            "value": "R_extensorHallucis"
+        },
+        "R_Extensor_Pollicis_Brevis/curve": {
+            "reference": "name",
+            "value": "R_abductorExtensorPollicis"
+        },
+        "R_Extensor_Pollicis_Longus/curve": {
+            "reference": "name",
+            "value": "R_abductorExtensorPollicis"
+        },
+        "R_Flexor_Carpi_Radialis/curve": {
+            "reference": "name",
+            "value": "R_flexorCarpiRadialis"
+        },
+        "R_Flexor_Carpi_Ulnaris/curve": {
+            "reference": "name",
+            "value": "R_flexorCarpiUlnaris"
+        },
+        "R_Flexor_Digiti_Minimi_Brevis_Foot/curve": {},
+        "R_Flexor_Digitorum_Longus/curve": {
+            "reference": "name",
+            "value": "R_flexorDigitorumLongus"
+        },
+        "R_Flexor_Digitorum_Longus1/curve": {
+            "reference": "name",
+            "value": "R_flexorDigitorumLongus"
+        },
+        "R_Flexor_Digitorum_Longus2/curve": {
+            "reference": "name",
+            "value": "R_flexorDigitorumLongus"
+        },
+        "R_Flexor_Digitorum_Longus3/curve": {
+            "reference": "name",
+            "value": "R_flexorDigitorumLongus"
+        },
+        "R_Flexor_Digitorum_Profundus2/curve": {
+            "reference": "name",
+            "value": "R_flexorDigitorumPollicisLongus"
+        },
+        "R_Flexor_Hallucis/curve": {
+            "reference": "name",
+            "value": "R_flexorDigitorumLongus"
+        },
+        "R_Flexor_Hallucis1/curve": {
+            "reference": "name",
+            "value": "R_flexorDigitorumLongus"
+        },
+        "R_Flexor_Pollicis_Longus/curve": {
+            "reference": "name",
+            "value": "R_flexorDigitorumPollicisLongus"
+        },
+        "R_Gastrocnemius_Lateral_Head/curve": {
+            "reference": "name",
+            "value": "R_gastrocnemius"
+        },
+        "R_Gastrocnemius_Medial_Head/curve": {
+            "reference": "name",
+            "value": "R_gastrocnemius"
+        },
+        "R_Gluteus_Maximus/curve": {
+            "reference": "name",
+            "value": "R_gluteusMaximus"
+        },
+        "R_Gluteus_Maximus1/curve": {
+            "reference": "name",
+            "value": "R_gluteusMaximus"
+        },
+        "R_Gluteus_Maximus2/curve": {
+            "reference": "name",
+            "value": "R_gluteusMaximus"
+        },
+        "R_Gluteus_Maximus3/curve": {
+            "reference": "name",
+            "value": "R_gluteusMaximus"
+        },
+        "R_Gluteus_Maximus4/curve": {
+            "reference": "name",
+            "value": "R_gluteusMaximus"
+        },
+        "R_Gluteus_Medius/curve": {
+            "reference": "name",
+            "value": "R_gluteusMedius"
+        },
+        "R_Gluteus_Medius1/curve": {
+            "reference": "name",
+            "value": "R_gluteusMedius"
+        },
+        "R_Gluteus_Medius2/curve": {
+            "reference": "name",
+            "value": "R_gluteusMedius"
+        },
+        "R_Gluteus_Medius3/curve": {
+            "reference": "name",
+            "value": "R_gluteusMedius"
+        },
+        "R_Gluteus_Minimus/curve": {
+            "reference": "name",
+            "value": "R_gluteusMedius"
+        },
+        "R_Gluteus_Minimus1/curve": {
+            "reference": "name",
+            "value": "R_gluteusMedius"
+        },
+        "R_Gluteus_Minimus2/curve": {
+            "reference": "name",
+            "value": "R_gluteusMedius"
+        },
+        "R_Gracilis/curve": {
+            "reference": "name",
+            "value": "R_gracilis"
+        },
+        "R_Inferior_Gemellus/curve": {
+            "reference": "name",
+            "value": "R_gluteusMaximus"
+        },
+        "R_Infraspinatus1/curve": {
+            "reference": "name",
+            "value": "R_infraspinatus"
+        },
+        "R_Latissimus_Dorsi/curve": {
+            "reference": "name",
+            "value": "R_latissimusDorsi"
+        },
+        "R_Latissimus_Dorsi3/curve": {
+            "reference": "name",
+            "value": "R_latissimusDorsi"
+        },
+        "R_Latissimus_Dorsi5/curve": {
+            "reference": "name",
+            "value": "R_latissimusDorsi"
+        },
+        "R_Longissimus_Capitis3/curve": {
+            "reference": "name",
+            "value": "R_longissimus"
+        },
+        "R_Longissimus_Thoracis/curve": {
+            "reference": "name",
+            "value": "R_longissimus"
+        },
+        "R_Longus_Capitis2/curve": {
+            "reference": "name",
+            "value": "R_scalenusPosterior"
+        },
+        "R_Multifidus/curve": {},
+        "R_Obturator_Externus/curve": {
+            "reference": "name",
+            "value": "R_iliopsoas"
+        },
+        "R_Obturator_Internus/curve": {
+            "reference": "name",
+            "value": "R_gluteusMaximus"
+        },
+        "R_Omohyoid/curve": {
+            "reference": "name",
+            "value": "R_omohyoid"
+        },
+        "R_Palmaris_Longus/curve": {
+            "reference": "name",
+            "value": "R_palmarisLongus"
+        },
+        "R_Pectineus/curve": {
+            "reference": "name",
+            "value": "R_pectineus"
+        },
+        "R_Pectoralis_Major/curve": {
+            "reference": "name",
+            "value": "R_pectoralisMajor_01"
+        },
+        "R_Pectoralis_Major2/curve": {
+            "reference": "name",
+            "value": "R_pectoralisMajor_03"
+        },
+        "R_Pectoralis_Minor1/curve": {
+            "reference": "name",
+            "value": "R_pectoralisMinor"
+        },
+        "R_Peroneus_Brevis/curve": {
+            "reference": "name",
+            "value": "R_peroneusBrevis"
+        },
+        "R_Peroneus_Longus/curve": {
+            "reference": "name",
+            "value": "R_peroneusLongus"
+        },
+        "R_Peroneus_Tertius/curve": {
+            "reference": "name",
+            "value": "R_peroneusTertius"
+        },
+        "R_Peroneus_Tertius1/curve": {
+            "reference": "name",
+            "value": "R_peroneusTertius"
+        },
+        "R_Piriformis/curve": {
+            "reference": "name",
+            "value": "R_gluteusMaximus"
+        },
+        "R_Piriformis1/curve": {
+            "reference": "name",
+            "value": "R_gluteusMaximus"
+        },
+        "R_Plantaris/curve": {
+            "reference": "name",
+            "value": "R_gastrocnemius"
+        },
+        "R_Platysma1/curve": {
+            "reference": "name",
+            "value": "R_omohyoid"
+        },
+        "R_Popliteus/curve": {},
+        "R_Psoas_Major/curve": {
+            "reference": "name",
+            "value": "R_iliopsoas"
+        },
+        "R_Psoas_Major1/curve": {
+            "reference": "name",
+            "value": "R_iliopsoas"
+        },
+        "R_Psoas_Major2/curve": {
+            "reference": "name",
+            "value": "R_iliopsoas"
+        },
+        "R_Psoas_Minor/curve": {
+            "reference": "name",
+            "value": "R_iliopsoas"
+        },
+        "R_Quadratus_Femoris/curve": {
+            "reference": "name",
+            "value": "R_gluteusMaximus"
+        },
+        "R_Quadratus_Lumborum1/curve": {
+            "reference": "name",
+            "value": "R_serratusPosterior_04"
+        },
+        "R_Rectus_Abdominis1/curve": {
+            "reference": "name",
+            "value": "R_rectusAbdominis_03"
+        },
+        "R_Rectus_Femoris/curve": {
+            "reference": "name",
+            "value": "R_rectusFemoris"
+        },
+        "R_Rectus_Femoris1/curve": {
+            "reference": "name",
+            "value": "R_rectusFemoris"
+        },
+        "R_Rhomboid_Major2/curve": {
+            "reference": "name",
+            "value": "R_rhomboideus"
+        },
+        "R_Rhomboid_Minor/curve": {
+            "reference": "name",
+            "value": "R_rhomboideus"
+        },
+        "R_Sartorius/curve": {
+            "reference": "name",
+            "value": "R_sartorius"
+        },
+        "R_Scalene_Anterior1/curve": {
+            "reference": "name",
+            "value": "R_scalenusAnterior"
+        },
+        "R_Scalene_Middle4/curve": {
+            "reference": "name",
+            "value": "R_scalenusPosterior"
+        },
+        "R_Semimembranosus/curve": {
+            "reference": "name",
+            "value": "R_semimembranosus"
+        },
+        "R_Semimembranosus1/curve": {
+            "reference": "name",
+            "value": "R_semimembranosus"
+        },
+        "R_Semispinalis_Capitis1/curve": {
+            "reference": "name",
+            "value": "R_semispinalis"
+        },
+        "R_Semitendinosus/curve": {
+            "reference": "name",
+            "value": "R_semitendinosus"
+        },
+        "R_Serratus_Anterior2/curve": {
+            "reference": "name",
+            "value": "R_serratusAnterior_04"
+        },
+        "R_Serratus_Anterior4/curve": {
+            "reference": "name",
+            "value": "R_serratusAnterior_07"
+        },
+        "R_Serratus_Posterior_Inferior/curve": {
+            "reference": "name",
+            "value": "R_serratusPosterior_03"
+        },
+        "R_Soleus/curve": {
+            "reference": "name",
+            "value": "R_soleus"
+        },
+        "R_Soleus1/curve": {
+            "reference": "name",
+            "value": "R_soleus"
+        },
+        "R_Splenius_Capitis1/curve": {
+            "reference": "name",
+            "value": "R_spleniusCapitis"
+        },
+        "R_Splenius_Cervicis/curve": {
+            "reference": "name",
+            "value": "R_spleniusCervicis"
+        },
+        "R_Splenius_Cervicis1/curve": {
+            "reference": "name",
+            "value": "R_spleniusCervicis"
+        },
+        "R_Sternocleidomastoid1/curve": {
+            "reference": "name",
+            "value": "R_sternocleidomastoid"
+        },
+        "R_Subclavian/curve": {
+            "reference": "name",
+            "value": "R_serratusAnterior_02"
+        },
+        "R_Subscapularis1/curve": {
+            "reference": "name",
+            "value": "R_infraspinatus"
+        },
+        "R_Superior_Gemellus/curve": {
+            "reference": "name",
+            "value": "R_gluteusMaximus"
+        },
+        "R_Supraspinatus/curve": {
+            "reference": "name",
+            "value": "R_supraspinatus"
+        },
+        "R_Tensor_Fascia_Lata/curve": {
+            "reference": "name",
+            "value": "R_tensorFasciaeLatae"
+        },
+        "R_Tensor_Fascia_Lata1/curve": {
+            "reference": "name",
+            "value": "R_tensorFasciaeLatae"
+        },
+        "R_Tensor_Fascia_Lata2/curve": {
+            "reference": "name",
+            "value": "R_tensorFasciaeLatae"
+        },
+        "R_Teres_Major/curve": {
+            "reference": "name",
+            "value": "R_teresMajor"
+        },
+        "R_Tibialis_Anterior/curve": {
+            "reference": "name",
+            "value": "R_tibialis"
+        },
+        "R_Tibialis_Posterior/curve": {
+            "reference": "name",
+            "value": "R_tibialis"
+        },
+        "R_Transversus_Abdominis/curve": {
+            "reference": "name",
+            "value": "R_transversusAbdominis"
+        },
+        "R_Transversus_Abdominis2/curve": {
+            "reference": "name",
+            "value": "R_transversusAbdominis"
+        },
+        "R_Transversus_Abdominis4/curve": {
+            "reference": "name",
+            "value": "R_transversusAbdominis"
+        },
+        "R_Trapezius/curve": {
+            "reference": "name",
+            "value": "R_trapezius_03"
+        },
+        "R_Trapezius3/curve": {
+            "reference": "name",
+            "value": "R_trapezius_02"
+        },
+        "R_Trapezius5/curve": {
+            "reference": "name",
+            "value": "R_trapezius_02"
+        },
+        "R_Triceps_Lateral_Head/curve": {
+            "reference": "name",
+            "value": "R_tricepsLateralis"
+        },
+        "R_Triceps_Long_Head/curve": {
+            "reference": "name",
+            "value": "R_tricepsLongus"
+        },
+        "R_Triceps_Medial_Head/curve": {
+            "reference": "name",
+            "value": "R_tricepsMedialis"
+        },
+        "R_Vastus_Intermedius/curve": {
+            "reference": "name",
+            "value": "R_vastusIntermedius"
+        },
+        "R_Vastus_Intermedius1/curve": {
+            "reference": "name",
+            "value": "R_vastusIntermedius"
+        },
+        "R_Vastus_Lateralis/curve": {
+            "reference": "name",
+            "value": "R_vastusLateralis"
+        },
+        "R_Vastus_Lateralis1/curve": {
+            "reference": "name",
+            "value": "R_vastusLateralis"
+        },
+        "R_Vastus_Medialis/curve": {
+            "reference": "name",
+            "value": "R_vastusMedialis"
+        },
+        "R_Vastus_Medialis1/curve": {
+            "reference": "name",
+            "value": "R_vastusMedialis"
+        },
+        "R_Vastus_Medialis2/curve": {
+            "reference": "name",
+            "value": "R_vastusMedialis"
+        },
+        "R_iliacus/curve": {
+            "reference": "name",
+            "value": "R_iliopsoas"
+        },
+        "R_iliacus1/curve": {
+            "reference": "name",
+            "value": "R_iliopsoas"
+        },
+        "R_iliacus2/curve": {
+            "reference": "name",
+            "value": "R_iliopsoas"
+        },
+        "R_iliocostalis/curve": {
+            "reference": "name",
+            "value": "R_iliocostalis"
+        }
+    }
+}

@@ -72,7 +72,7 @@ PYTHONPATH=src .venv/bin/python -m muscle.couple.example_couple --auto --steps 1
 
 USD 输出 `output/example_couple.anim.usd`（16 MB）。
 
-**结论**：Millard 才是可用路径，建议把 `example_couple.py::DEFAULT_CONFIG` 切回 `bicep_fibermillard_coupled.json`。
+bicep_fibermillard_coupled.json可用，但默认不启用。默认使用非couple的。
 
 ## 后续
 

@@ -71,7 +71,7 @@ def _read_primvar(pv_api, name, dtype=np.float32):
     return None
 
 
-def _load_mesh_usd(path: Path, y_up_to_z_up: bool = False):
+def _load_mesh_usd(path: Path, y_up_to_z_up: bool = False, prim_path: str = None):
     """Load muscle TetMesh from USD.
 
     Returns (positions, tets, fibers, tendon_mask, geo_namespace).
@@ -83,10 +83,16 @@ def _load_mesh_usd(path: Path, y_up_to_z_up: bool = False):
         raise FileNotFoundError(f"Cannot open USD: {path}")
 
     tet_prim = None
-    for prim in stage.Traverse():
-        if prim.IsA(UsdGeom.TetMesh):
-            tet_prim = prim
-            break
+    if prim_path:
+        p = stage.GetPrimAtPath(prim_path)
+        if not p or not p.IsValid() or not p.IsA(UsdGeom.TetMesh):
+            raise ValueError(f"Prim {prim_path} not found or not a TetMesh in {path}")
+        tet_prim = p
+    else:
+        for prim in stage.Traverse():
+            if prim.IsA(UsdGeom.TetMesh):
+                tet_prim = prim
+                break
     if tet_prim is None:
         raise ValueError(f"No TetMesh prim found in {path}")
 
@@ -128,6 +134,10 @@ def _load_mesh_usd(path: Path, y_up_to_z_up: bool = False):
 def _load_bone_usd(usd_path: Path, bone_root: str = "/character/bone"):
     """Load bone mesh from USD (multiple Mesh prims under *bone_root*).
 
+    Vertex positions are returned in **world space** (parent xforms applied)
+    so they live in the same coordinate frame as muscle meshes loaded by
+    ``_load_mesh_usd``.
+
     Returns (None, positions, indices, muscle_ids).
     """
     from pxr import Usd, UsdGeom
@@ -140,6 +150,11 @@ def _load_bone_usd(usd_path: Path, bone_root: str = "/character/bone"):
     if not root or not root.IsValid():
         return None, np.zeros((0, 3), np.float32), np.zeros(0, np.int32), {}
 
+    rest_t = stage.GetStartTimeCode()
+    if rest_t == Usd.TimeCode.Default().GetValue():
+        rest_t = 1.0
+    xcache = UsdGeom.XformCache(rest_t)
+
     all_pos, all_idx, all_mid = [], [], []
     offset = 0
 
@@ -150,8 +165,14 @@ def _load_bone_usd(usd_path: Path, bone_root: str = "/character/bone"):
         pts_raw = m.GetPointsAttr().Get()
         if pts_raw is None:
             continue
-        pts = np.asarray(pts_raw, dtype=np.float32)
+        pts_local = np.asarray(pts_raw, dtype=np.float32)
         idx = np.asarray(m.GetFaceVertexIndicesAttr().Get(), dtype=np.int32)
+
+        # Apply mesh's local-to-world (row-vector convention).
+        wm = xcache.GetLocalToWorldTransform(prim)
+        R = np.array([[wm[i][j] for j in range(3)] for i in range(3)], dtype=np.float32)
+        T = np.array([wm[3][j] for j in range(3)], dtype=np.float32)
+        pts = (pts_local @ R + T).astype(np.float32)
 
         parent = prim.GetParent()
         bone_name = str(parent.GetName()) if parent and parent.IsValid() else str(prim.GetName())
@@ -187,17 +208,18 @@ def _build_muscle_id_mapping(muscle_ids_list):
 # Public API
 # ---------------------------------------------------------------------------
 
-def load_mesh(path: Path):
+def load_mesh(path: Path, prim_path: str = None):
     """Load muscle TetMesh from USD.
 
-    Returns (positions, tets, fibers, tendon_mask, geo).
+    Returns (positions, tets, fibers, tendon_mask, geo). If *prim_path* is
+    given, only that prim is loaded; otherwise the first TetMesh in the stage.
     """
     if path is None:
         raise ValueError("No mesh path provided.")
-    return _load_mesh_usd(path, y_up_to_z_up=False)
+    return _load_mesh_usd(path, y_up_to_z_up=False, prim_path=prim_path)
 
 
-def load_bone_mesh(path: Path):
+def load_bone_mesh(path: Path, bone_root: str = "/character/bone"):
     """Load bone surface mesh from USD.
 
     Returns (bone_geo, bone_pos, bone_indices, bone_muscle_ids) where:
@@ -205,9 +227,9 @@ def load_bone_mesh(path: Path):
     - bone_pos: np.ndarray shape (N, 3)
     - bone_indices: np.ndarray flat int32
     - bone_muscle_ids: dict mapping muscle_id -> vertex index array, derived
-      from prim hierarchy under /character/bone/<bone_name>/Mesh.
+      from prim hierarchy under bone_root/<bone_name>/Mesh.
     """
-    return _load_bone_usd(path)
+    return _load_bone_usd(path, bone_root=bone_root)
 
 
 # ---------------------------------------------------------------------------

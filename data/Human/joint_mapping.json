@@ -1,0 +1,197 @@
+{
+    "mappings": {
+        "C_root": {},
+        "C_pelvis": {
+            "reference": "name",
+            "value": "Pelvis"
+        },
+        "C_spine_01": {},
+        "L_thigh": {
+            "reference": "name",
+            "value": "FemurL"
+        },
+        "R_thigh": {
+            "reference": "name",
+            "value": "FemurR"
+        },
+        "C_spine_02": {},
+        "L_calf": {
+            "reference": "name",
+            "value": "TibiaL"
+        },
+        "L_thighTwist_01": {},
+        "L_thighTwist_02": {},
+        "L_thighTwist_03": {},
+        "R_calf": {
+            "reference": "name",
+            "value": "TibiaR"
+        },
+        "R_thighTwist_01": {},
+        "R_thighTwist_02": {},
+        "R_thighTwist_03": {},
+        "C_spine_03": {},
+        "L_foot": {
+            "reference": "name",
+            "value": "TalusL"
+        },
+        "L_fibula": {},
+        "L_patella": {},
+        "L_calfTwist_01": {},
+        "L_calfTwist_02": {},
+        "L_calfTwist_03": {},
+        "R_foot": {
+            "reference": "name",
+            "value": "TalusR"
+        },
+        "R_fibula": {},
+        "R_patella": {},
+        "R_calfTwist_01": {},
+        "R_calfTwist_02": {},
+        "R_calfTwist_03": {},
+        "C_spine_04": {},
+        "L_ball": {},
+        "R_ball": {},
+        "C_spine_05": {
+            "reference": "name",
+            "value": "Torso"
+        },
+        "L_thumbToe_01": {},
+        "L_indexToe_01": {},
+        "L_middleToe_01": {},
+        "L_ringToe_01": {},
+        "L_pinkyToe_01": {},
+        "R_thumbToe_01": {},
+        "R_indexToe_01": {},
+        "R_middleToe_01": {},
+        "R_ringToe_01": {},
+        "R_pinkyToe_01": {},
+        "C_neck_01": {
+            "reference": "name",
+            "value": "Neck"
+        },
+        "L_claviclePec": {},
+        "L_clavicle": {},
+        "R_clavicle": {},
+        "R_claviclePec": {},
+        "L_thumbToe_02": {
+            "reference": "name",
+            "value": "FootPinkyL"
+        },
+        "L_indexToe_02": {},
+        "L_middleToe_02": {},
+        "L_ringToe_02": {},
+        "L_pinkyToe_02": {},
+        "R_thumbToe_02": {
+            "reference": "name",
+            "value": "FootThumbR"
+        },
+        "R_indexToe_02": {},
+        "R_middleToe_02": {},
+        "R_ringToe_02": {},
+        "R_pinkyToe_02": {},
+        "C_neck_02": {},
+        "L_upperarm": {
+            "reference": "name",
+            "value": "ArmL"
+        },
+        "L_clavicleScap": {},
+        "R_upperarm": {
+            "reference": "name",
+            "value": "ArmR"
+        },
+        "R_clavicleScap": {},
+        "L_indexToe_03": {},
+        "L_middleToe_03": {},
+        "L_ringToe_03": {},
+        "L_pinkyToe_03": {
+            "reference": "name",
+            "value": "FootThumbL"
+        },
+        "R_indexToe_03": {},
+        "R_middleToe_03": {},
+        "R_ringToe_03": {},
+        "R_pinkyToe_03": {
+            "reference": "name",
+            "value": "FootPinkyR"
+        },
+        "C_neck_03": {},
+        "L_lowerarm": {
+            "reference": "name",
+            "value": "ForeArmL"
+        },
+        "L_upperarmTwist_01": {},
+        "L_upperarmTwist_02": {},
+        "L_upperarmTwist_03": {},
+        "R_lowerarm": {
+            "reference": "name",
+            "value": "ForeArmR"
+        },
+        "R_upperarmTwist_01": {},
+        "R_upperarmTwist_02": {},
+        "R_upperarmTwist_03": {},
+        "C_neck_04": {},
+        "L_ulna": {},
+        "L_radius": {},
+        "L_hand": {
+            "reference": "name",
+            "value": "HandL"
+        },
+        "L_lowerarmTwist_01": {},
+        "L_lowerarmTwist_02": {},
+        "L_lowerarmTwist_03": {},
+        "R_hand": {
+            "reference": "name",
+            "value": "HandR"
+        },
+        "R_ulna": {},
+        "R_radius": {},
+        "R_lowerarmTwist_01": {},
+        "R_lowerarmTwist_02": {},
+        "R_lowerarmTwist_03": {},
+        "C_head": {
+            "reference": "name",
+            "value": "Head"
+        },
+        "L_thumb_01": {},
+        "L_indexMetacarpal": {},
+        "L_middleMetacarpal": {},
+        "L_ringMetacarpal": {},
+        "L_pinkyMetacarpal": {},
+        "R_middleMetacarpal": {},
+        "R_pinkyMetacarpal": {},
+        "R_ringMetacarpal": {},
+        "R_thumb_01": {},
+        "R_indexMetacarpal": {},
+        "L_eye": {},
+        "C_jaw": {},
+        "R_eye": {},
+        "L_thumb_02": {},
+        "L_index_01": {},
+        "L_middle_01": {},
+        "L_ring_01": {},
+        "L_pinky_01": {},
+        "R_middle_01": {},
+        "R_pinky_01": {},
+        "R_ring_01": {},
+        "R_thumb_02": {},
+        "R_index_01": {},
+        "L_thumb_03": {},
+        "L_index_02": {},
+        "L_middle_02": {},
+        "L_ring_02": {},
+        "L_pinky_02": {},
+        "R_middle_02": {},
+        "R_pinky_02": {},
+        "R_ring_02": {},
+        "R_thumb_03": {},
+        "R_index_02": {},
+        "L_index_03": {},
+        "L_middle_03": {},
+        "L_ring_03": {},
+        "L_pinky_03": {},
+        "R_middle_03": {},
+        "R_pinky_03": {},
+        "R_ring_03": {},
+        "R_index_03": {}
+    }
+}
