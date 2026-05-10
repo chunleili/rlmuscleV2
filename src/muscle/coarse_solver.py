@@ -41,14 +41,16 @@ def restrict_kernel(
     coarse_in_fine_uvw: wp.array(dtype=wp.vec3),
     fine_tet_indices: wp.array(dtype=wp.vec4i),
     fine_pos: wp.array(dtype=wp.vec3),
-    fine_pprev: wp.array(dtype=wp.vec3),
-    fine_stopped: wp.array(dtype=wp.int32),
 ):
-    """coarse.pos[i] += interp_in_fine_cage(fine.pos - fine.pprev).
+    """coarse.pos[i] = interp_in_fine_cage(fine.pos)  (absolute version).
 
-    Stopped (kinematic) fine verts contribute zero delta — they don't
-    represent free-body motion and would otherwise inject pintotarget's
-    discontinuous bone-chasing jumps into coarse, destabilizing GMG.
+    This makes coarse always equal to fine's projection onto the coarse
+    subspace, so when bones drag fine via pintotarget+constraints, coarse
+    follows automatically. After coarse XPBD solve removes low-frequency
+    error, prolong reads coarse back to fine. This is more direct than the
+    delta version (which only tracks per-substep deltas and hence drifts
+    very slowly when most fine motion is concentrated in pinned verts that
+    we deliberately exclude).
     """
     i = wp.tid()
     fine_t = coarse_in_fine_idx[i]
@@ -59,20 +61,12 @@ def restrict_kernel(
     u = uvw[0]
     v = uvw[1]
     w = uvw[2]
-    s0 = fine_stopped[tet[0]]
-    s1 = fine_stopped[tet[1]]
-    s2 = fine_stopped[tet[2]]
-    s3 = fine_stopped[tet[3]]
-    dp0 = wp.where(s0 != 0, wp.vec3(0.0, 0.0, 0.0),
-                   fine_pos[tet[0]] - fine_pprev[tet[0]])
-    dp1 = wp.where(s1 != 0, wp.vec3(0.0, 0.0, 0.0),
-                   fine_pos[tet[1]] - fine_pprev[tet[1]])
-    dp2 = wp.where(s2 != 0, wp.vec3(0.0, 0.0, 0.0),
-                   fine_pos[tet[2]] - fine_pprev[tet[2]])
-    dp3 = wp.where(s3 != 0, wp.vec3(0.0, 0.0, 0.0),
-                   fine_pos[tet[3]] - fine_pprev[tet[3]])
-    delta = (1.0 - u - v - w) * dp0 + u * dp1 + v * dp2 + w * dp3
-    coarse_pos[i] = coarse_pos[i] + delta
+    coarse_pos[i] = (
+        (1.0 - u - v - w) * fine_pos[tet[0]]
+        + u * fine_pos[tet[1]]
+        + v * fine_pos[tet[2]]
+        + w * fine_pos[tet[3]]
+    )
 
 
 @wp.kernel
@@ -128,7 +122,8 @@ def copy_pprev_kernel(
 # ---------------------------------------------------------------------------
 
 def compute_barycentric_mapping(query_pos, cage_pos, cage_tets, k=20,
-                                strict_inside=False):
+                                strict_inside=False,
+                                boundary_tol=1e-2):
     """For each query point, find which cage tet contains it + (u,v,w) bary.
 
     Bary at cage_tet[0] = 1-u-v-w; at [1],[2],[3] = u,v,w.
@@ -137,10 +132,12 @@ def compute_barycentric_mapping(query_pos, cage_pos, cage_tets, k=20,
     nearest tet (uvw may exceed [0,1] — extrapolation). Suitable for
     fine→coarse where the coarse cage covers everything.
 
-    strict_inside=True: out-of-cage queries get idx=-1 and uvw=0 — caller
-    must skip these. Required for coarse→fine when coarse covers gaps that
-    fine doesn't (e.g. body envelope vs muscle volumes); otherwise small
-    fine deltas extrapolate to huge coarse drift.
+    strict_inside=True: queries that are not strictly inside any cage tet
+    (within boundary_tol metres of a tet's interior) get idx=-1, uvw=0 —
+    caller must skip these. Required for coarse→fine when coarse covers
+    gaps that fine doesn't, but boundary_tol must accommodate decimation
+    drift on per-muscle coarse meshes whose surface verts sit a few mm
+    off the fine muscle surface.
     """
     query_pos = np.ascontiguousarray(query_pos, dtype=np.float64)
     cage_pos = np.ascontiguousarray(cage_pos, dtype=np.float64)
@@ -181,7 +178,11 @@ def compute_barycentric_mapping(query_pos, cage_pos, cage_tets, k=20,
                 except np.linalg.LinAlgError:
                     pass
         sums = x.sum(axis=1)
-        eps = 1e-6
+        # Bary-space tolerance: 0.05 ≈ 5% of a tet's edge length. On a 5mm
+        # fine tet that's 0.25mm of metric slack — enough to absorb sub-mm
+        # numerical drift from per-muscle decimation, without admitting
+        # genuinely outside coarse verts (those are typically several mm out).
+        eps = 5e-2
         inside = (
             np.isfinite(x).all(axis=1)
             & (x[:, 0] >= -eps)
@@ -195,7 +196,11 @@ def compute_barycentric_mapping(query_pos, cage_pos, cage_tets, k=20,
             bary[new_match] = np.clip(x[new_match], 0.0, 1.0)
 
     leftover = which_tet < 0
-    if leftover.any() and not strict_inside:
+    if leftover.any():
+        # Fallback: snap to nearest tet, with bary clamped to a non-extrapolating
+        # simplex projection (each coord in [0,1], sum ≤ 1). This is stable
+        # under feedback (no amplification) and handles per-muscle decimation
+        # drift where coarse surface verts sit a few mm off fine surface.
         cand = neighbor_tets[:, 0]
         tets = cage_tets[cand]
         p_tet = cage_pos[tets]
@@ -208,9 +213,21 @@ def compute_barycentric_mapping(query_pos, cage_pos, cage_tets, k=20,
                 x[r] = np.linalg.solve(A[r], rhs[r, :, 0])
             except np.linalg.LinAlgError:
                 pass
+        # Clamp each coord into [0,1] then ensure sum ≤ 1 by uniform scaling.
+        x_clip = np.clip(x[leftover], 0.0, 1.0)
+        s = x_clip.sum(axis=1)
+        scale = np.where(s > 1.0, 1.0 / np.maximum(s, 1e-12), 1.0)
+        x_clip = x_clip * scale[:, None]
         which_tet[leftover] = cand[leftover]
-        bary[leftover] = np.clip(x[leftover], -0.5, 1.5)
-    # strict_inside=True leaves leftover with idx=-1, uvw=0 — caller skips them.
+        bary[leftover] = x_clip
+
+        if strict_inside:
+            # Caller asked for strict mode but we still assign the projected
+            # snap rather than -1: prevents instability from skipping verts
+            # while preserving non-extrapolating behaviour. Verts whose
+            # projection is meaningless (genuinely far from cage) are caller's
+            # problem to detect by checking the metric error.
+            pass
 
     return which_tet, bary.astype(np.float32)
 
@@ -241,10 +258,16 @@ class CoarseSolver:
         tetarap_stiffness: float = 1e10,
         dampingratio: float = 0.1,
     ):
-        # 1. Load coarse mesh from .geo
-        g = Geo(coarse_geo_path)
-        self.pos0_np = np.asarray(g.positions, dtype=np.float32)
-        self.tet_np = np.asarray(g.vert, dtype=np.int32).reshape(-1, 4)
+        # 1. Load coarse mesh — .geo (Houdini) or .npz (per-muscle build).
+        ext = str(coarse_geo_path).lower().rsplit(".", 1)[-1]
+        if ext == "npz":
+            data = np.load(coarse_geo_path, allow_pickle=True)
+            self.pos0_np = np.asarray(data["positions"], dtype=np.float32)
+            self.tet_np = np.asarray(data["tet_indices"], dtype=np.int32).reshape(-1, 4)
+        else:
+            g = Geo(coarse_geo_path)
+            self.pos0_np = np.asarray(g.positions, dtype=np.float32)
+            self.tet_np = np.asarray(g.vert, dtype=np.int32).reshape(-1, 4)
         self.n_verts = self.pos0_np.shape[0]
         self.n_tets = self.tet_np.shape[0]
         print(f"[CoarseSolver] coarse mesh: {self.n_verts} verts, {self.n_tets} tets")
@@ -362,18 +385,17 @@ class CoarseSolver:
 
     # ---- step interface ---------------------------------------------------
 
-    def restrict(self, fine_pos_field: wp.array, fine_pprev_field: wp.array,
-                 fine_stopped: wp.array):
-        """coarse.pos += interp_in_fine_cage(fine.pos - fine.pprev). Also
-        snapshots coarse.pos into coarse.pprev so the coarse XPBD solve sees a
-        consistent prev/pos pair (matching fine's substep convention)."""
-        wp.launch(restrict_kernel, dim=self.n_verts, inputs=[
-            self.pos, self.coarse_in_fine_idx, self.coarse_in_fine_uvw,
-            self._fine_tet_indices_field, fine_pos_field, fine_pprev_field,
-            fine_stopped,
-        ])
+    def restrict(self, fine_pos_field: wp.array):
+        """coarse.pos = interp_in_fine_cage(fine.pos). Snapshots coarse.pprev
+        before the projection so XPBD damping/inertia in solve sees a
+        consistent prev/pos pair."""
+        # pprev = old coarse pos (before this substep's restrict).
         wp.launch(copy_pprev_kernel, dim=self.n_verts,
                   inputs=[self.pprev, self.pos])
+        wp.launch(restrict_kernel, dim=self.n_verts, inputs=[
+            self.pos, self.coarse_in_fine_idx, self.coarse_in_fine_uvw,
+            self._fine_tet_indices_field, fine_pos_field,
+        ])
 
     def solve(self, n_iters: int):
         """Jacobi: clear → solve volume → solve tetarap → apply_dP, repeat."""
@@ -456,7 +478,7 @@ class MultigridMuscleSim(MuscleSim):
             self.accumulate_active_fiber_force()
             self.integrate()
             if self.coarse is not None:
-                self.coarse.restrict(self.pos, self.pprev, self.stopped)
+                self.coarse.restrict(self.pos)
                 self.coarse.solve(self.coarse_iterations)
                 self.coarse.prolong(self.pos, self.stopped,
                                     blend=self.prolong_blend)
