@@ -639,9 +639,11 @@ class MultigridMuscleSim(MuscleSim):
             fine_tendonmask_np=fine_tendonmask_np,
         )
 
-    def step(self):
-        self.update_attach_targets()
+    def step(self, pre_substep_hook=None, post_integrate_hook=None):
+        if pre_substep_hook is None:
+            self.update_attach_targets()
         has_pin = hasattr(self, "apply_pintotarget")
+        n_sub = self.cfg.num_substeps
 
         if self.coarse_only and self.coarse is not None:
             # Debug pipeline: pin drives motion, coarse propagates, prolong
@@ -655,7 +657,9 @@ class MultigridMuscleSim(MuscleSim):
             #   4) coarse.solve — propagates through vol+arap
             #   5) coarse.prolong(fine.pos) — overwrite non-stopped
             #   6) re-apply_pintotarget — keep pin verts exactly on bone
-            for _ in range(self.cfg.num_substeps):
+            for sub_i in range(n_sub):
+                if pre_substep_hook is not None:
+                    pre_substep_hook(sub_i, n_sub)
                 wp.launch(copy_pprev_kernel, dim=self.pos.shape[0],
                           inputs=[self.pprev, self.pos])
                 if has_pin:
@@ -674,10 +678,14 @@ class MultigridMuscleSim(MuscleSim):
         #   fine constraint solve + apply_dP + post_smooth + repair
         #   apply_pintotarget — re-snap pins clobbered by fine constraints
         #   update_velocities
-        for _ in range(self.cfg.num_substeps):
+        for sub_i in range(n_sub):
+            if pre_substep_hook is not None:
+                pre_substep_hook(sub_i, n_sub)
             self.clear_forces()
             self.accumulate_active_fiber_force()
             self.integrate()
+            if post_integrate_hook is not None:
+                post_integrate_hook(sub_i, n_sub)
             if has_pin:
                 self.apply_pintotarget()
             if self.coarse is not None:

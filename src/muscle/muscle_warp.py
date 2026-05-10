@@ -1,3 +1,4 @@
+import os
 import time
 
 import numpy as np
@@ -1146,6 +1147,30 @@ def update_velocities_kernel(
 
 
 @wp.kernel
+def lbs_apply_kernel(
+    pos: wp.array(dtype=wp.vec3),
+    pos0: wp.array(dtype=wp.vec3),
+    vertex_bone: wp.array(dtype=wp.int32),
+    T_rel_flat: wp.array(dtype=wp.float32),
+    blend: float,
+):
+    # Row-vector convention: q = p @ R + t, where each bone's 12-float row is
+    # laid out as [r00,r01,r02, r10,r11,r12, r20,r21,r22, t0,t1,t2].
+    i = wp.tid()
+    b = vertex_bone[i]
+    if b < 0:
+        return
+    p = pos0[i]
+    base = b * 12
+    qx = p[0] * T_rel_flat[base + 0] + p[1] * T_rel_flat[base + 3] + p[2] * T_rel_flat[base + 6] + T_rel_flat[base + 9]
+    qy = p[0] * T_rel_flat[base + 1] + p[1] * T_rel_flat[base + 4] + p[2] * T_rel_flat[base + 7] + T_rel_flat[base + 10]
+    qz = p[0] * T_rel_flat[base + 2] + p[1] * T_rel_flat[base + 5] + p[2] * T_rel_flat[base + 8] + T_rel_flat[base + 11]
+    target = wp.vec3(qx, qy, qz)
+    cur = pos[i]
+    pos[i] = (1.0 - blend) * cur + blend * target
+
+
+@wp.kernel
 def clear_dP_kernel(
     dP: wp.array(dtype=wp.vec3),
     dPw: wp.array(dtype=wp.float32),
@@ -2167,6 +2192,9 @@ class MuscleSim(MuscleSimBase):
         self.rest_matrix = wp.zeros(n_tet, dtype=wp.mat33)
         self.activation = wp.zeros(n_tet, dtype=wp.float32)
 
+        # LBS optional: filled by LBSDriver via set_lbs_T_rel / apply_lbs.
+        self._lbs_T_rel_field = None
+
     def _create_bone_fields(self):
         if self.bone_pos.shape[0] > 0:
             self.bone_pos_field = wp.from_numpy(self.bone_pos.astype(np.float32), dtype=wp.vec3)
@@ -2434,7 +2462,11 @@ class MuscleSim(MuscleSimBase):
     def _init_renderer(self):
         self.renderer = None
         if self.cfg.gui and self.cfg.render_mode in ("human", "usd"):
-            stage_path = "muscle_sim.usd" if self.cfg.render_mode == "usd" else None
+            if self.cfg.render_mode == "usd":
+                stage_path = getattr(self.cfg, "output_path", None) or "muscle_sim.usd"
+                os.makedirs(os.path.dirname(stage_path) or ".", exist_ok=True)
+            else:
+                stage_path = None
             self.renderer = WarpRenderer(mode=self.cfg.render_mode, stage_path=stage_path)
 
     def reset(self):
@@ -2529,6 +2561,29 @@ class MuscleSim(MuscleSimBase):
     def update_velocities(self):
         wp.launch(update_velocities_kernel, dim=self.n_verts,
                   inputs=[self.pos, self.pprev, self.vel, self.dt])
+
+    def set_lbs_T_rel(self, T_rel_flat_np):
+        """Upload (n_bones * 12,) float32 row-major T_rel buffer to GPU.
+
+        Allocates the Warp array on first call.
+        """
+        if getattr(self, "_lbs_T_rel_field", None) is None:
+            self._lbs_T_rel_field = wp.from_numpy(
+                T_rel_flat_np.astype(np.float32), dtype=wp.float32)
+        else:
+            self._lbs_T_rel_field.assign(T_rel_flat_np.astype(np.float32))
+
+    def apply_lbs(self, vertex_bone_field, blend: float = 1.0):
+        """Overwrite pos with LBS target = pos0 @ T_rel[vertex_bone[v]],
+        lerped from current pos by ``blend``.
+
+        Caller must have called ``set_lbs_T_rel`` first.
+        """
+        if self._lbs_T_rel_field is None:
+            return
+        wp.launch(lbs_apply_kernel, dim=self.n_verts,
+                  inputs=[self.pos, self.pos0, vertex_bone_field,
+                          self._lbs_T_rel_field, float(blend)])
 
     def repair_inverted_tets(self):
         """SVD-based inversion repair: clamp F singular values and project positions.

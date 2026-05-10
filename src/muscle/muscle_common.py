@@ -185,7 +185,7 @@ class MuscleSimBase(ConstraintBuilderMixin):
             self._load_bone(target_path)
         return self.bone_geo, self.bone_pos
 
-    def step(self, pre_substep_hook=None):
+    def step(self, pre_substep_hook=None, post_integrate_hook=None):
         """Run one frame.
 
         Args:
@@ -195,6 +195,10 @@ class MuscleSimBase(ConstraintBuilderMixin):
                 When provided, it is responsible for updating attach targets
                 each substep; the unconditional update_attach_targets() at the
                 top of step() is skipped.
+            post_integrate_hook: Optional callable(sub_i, n_sub). Runs AFTER
+                integrate but BEFORE constraint solve. Used to overwrite pos
+                with an LBS prediction (so volume/ARAP/fiber correct from the
+                bone-skinned shape rather than from inertial drift).
         """
         if pre_substep_hook is None:
             self.update_attach_targets()
@@ -206,6 +210,8 @@ class MuscleSimBase(ConstraintBuilderMixin):
             self.clear_forces()
             self.accumulate_active_fiber_force()
             self.integrate()
+            if post_integrate_hook is not None:
+                post_integrate_hook(sub_i, n_sub)
             # Hard-pin snap runs BEFORE the constraint solve so ARAP/vol see
             # the kinematic verts at their new bone-driven position and drag
             # the elastic neighbors along, avoiding the per-substep shear that

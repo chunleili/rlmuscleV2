@@ -210,6 +210,14 @@ class BoneAnimation:
         but for small inter-frame angles (which is the regime when num_substeps>>1
         finely subdivides one frame interval) the drift is negligible.
         """
+        return self._apply_joint_world(self.joint_world_at_fractional_frame(f, loop))
+
+    def joint_world_at_fractional_frame(self, f: float, loop: bool = True) -> np.ndarray:
+        """Return the (n_joints, 4, 4) joint-world matrix at fractional frame `f`.
+
+        Same lerp as ``sample_at_fractional_frame`` but exposes the underlying
+        joint transform array (LBS uses this to derive per-bone rigid xforms).
+        """
         if loop:
             f = f % self.n_frames
         f = float(np.clip(f, 0.0, self.n_frames - 1))
@@ -217,9 +225,8 @@ class BoneAnimation:
         i1 = min(i0 + 1, self.n_frames - 1)
         t = f - i0
         if i0 == i1 or t == 0.0:
-            return self._apply_joint_world(self._frames[i0])
-        joint_world = (1.0 - t) * self._frames[i0] + t * self._frames[i1]
-        return self._apply_joint_world(joint_world)
+            return self._frames[i0]
+        return (1.0 - t) * self._frames[i0] + t * self._frames[i1]
 
     def _apply_joint_world(self, joint_world: np.ndarray) -> np.ndarray:
         """Run the bone-rest -> joint-driven world xform pipeline once."""
