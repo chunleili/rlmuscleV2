@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 plot = ["matplotlib>=3.7"]
 mesh-export = ["meshio>=5.3"]
+mesh-coarsen = ["pymeshlab>=2025.7", "tetgen>=0.8"]
 
 [build-system]
 requires = ["hatchling"]

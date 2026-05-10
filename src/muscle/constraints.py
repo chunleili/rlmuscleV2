@@ -416,11 +416,22 @@ class ConstraintBuilderMixin:
         No XPBD stiffness — direct overwrite (matches realtimeMuscle's
         pintotarget_kernel). rest_offset = pos0[src] - bone_pos0[tgt] is
         captured at build time and stored in restdir.
+
+        Tet-coherent boundary handling: a vert is hard-pinned only when ALL
+        tets containing it are "interior" (all 4 verts pass mask threshold).
+        Mask-passing verts that share at least one tet with a non-pinned vert
+        become FREE (no bone constraint) — they get carried by ARAP through
+        the interior pin tets, keeping the kinematic / elastic boundary on
+        tet faces (no shear inside any tet). Set
+        params['boundary_attach_stiffness'] > 0 to instead emit a soft ATTACH
+        on those boundary verts (legacy behavior).
         """
         constraints = []
         target_path = params.get('target_path')
         mask_name = params.get('mask_name')
         mask_threshold = params.get('mask_threshold', 0.75)
+        boundary_stiffness = params.get('boundary_attach_stiffness', 0.0)
+        boundary_damping = params.get('boundary_attach_dampingratio', 0.1)
 
         self.bone_geo, self.bone_pos = self.load_bone_geo(target_path)
 
@@ -429,43 +440,96 @@ class ConstraintBuilderMixin:
             print(f"Warning: mask '{mask_name}' not found in geometry.")
             return []
 
-        valid_src_indices = np.where(mask > mask_threshold)[0].astype(np.int32)
-        if len(valid_src_indices) == 0:
+        candidate_indices = np.where(mask > mask_threshold)[0].astype(np.int32)
+        if len(candidate_indices) == 0:
             print(f"Warning: No vertices with mask > {mask_threshold}")
             return []
 
-        src_positions = self.pos0_np[valid_src_indices]
-        valid_src_indices, src_positions, _, tgt_indices = self._query_bone_targets(
-            valid_src_indices,
+        src_positions = self.pos0_np[candidate_indices]
+        candidate_indices, src_positions, dists, tgt_indices = self._query_bone_targets(
+            candidate_indices,
             src_positions,
             params,
         )
-        if len(valid_src_indices) == 0:
+        if len(candidate_indices) == 0:
             print(f"Warning: No valid pintotarget sources remain for mask '{mask_name}' after group filtering.")
             return []
 
         if not hasattr(self, 'pt2tet'):
             self.pt2tet = self.map_pts2tets(self.tet_np)
 
+        # Tet-coherent split: interior verts (all containing tets fully
+        # pinned) → PINTOTARGET; boundary verts (share a tet with non-pinned
+        # vert) → ATTACH. Note: the in_pin set is the post-group-filter set,
+        # because pintotarget itself only applies inside that subset.
+        in_pin = np.zeros(self.pos0_np.shape[0], dtype=bool)
+        in_pin[candidate_indices] = True
+        tet_pin_count = in_pin[self.tet_np].sum(axis=1)        # (NT,)
+        interior_tet = (tet_pin_count == 4)                    # (NT,) bool
+
+        if not hasattr(self, 'vert_to_tets'):
+            from collections import defaultdict
+            v2t = defaultdict(list)
+            for t_idx, tet in enumerate(self.tet_np):
+                for v in tet:
+                    v2t[int(v)].append(t_idx)
+            self.vert_to_tets = v2t
+
+        is_interior_pin = np.zeros(self.pos0_np.shape[0], dtype=bool)
+        for v in candidate_indices:
+            v = int(v)
+            v_tets = self.vert_to_tets.get(v, [])
+            if v_tets and all(interior_tet[t] for t in v_tets):
+                is_interior_pin[v] = True
+
         rest_offsets = src_positions - self.bone_pos[tgt_indices]
-        for j, src_idx in enumerate(valid_src_indices):
+        n_pin = 0
+        n_attach = 0
+        for j, src_idx in enumerate(candidate_indices):
+            src_idx = int(src_idx)
             tgt_idx = int(tgt_indices[j])
             target_pos = self.bone_pos[tgt_idx]
-            offset = rest_offsets[j]
             tetid = self.pt2tet.get(src_idx, [-1])[0]
-            c = dict(
-                type=PINTOTARGET,
-                pts=[int(src_idx), -1, int(tgt_idx), -1],
-                stiffness=1.0,  # unused — solver overwrites pos directly
-                dampingratio=0.0,
-                tetid=tetid,
-                L=[0.0, 0.0, 0.0],
-                restlength=0.0,
-                restvector=[float(target_pos[0]), float(target_pos[1]), float(target_pos[2]), 1.0],
-                restdir=[float(offset[0]), float(offset[1]), float(offset[2])],
-                compressionstiffness=-1.0,
-            )
-            constraints.append(c)
+            if is_interior_pin[src_idx]:
+                offset = rest_offsets[j]
+                c = dict(
+                    type=PINTOTARGET,
+                    pts=[src_idx, -1, tgt_idx, -1],
+                    stiffness=1.0,  # unused — solver overwrites pos directly
+                    dampingratio=0.0,
+                    tetid=tetid,
+                    L=[0.0, 0.0, 0.0],
+                    restlength=0.0,
+                    restvector=[float(target_pos[0]), float(target_pos[1]), float(target_pos[2]), 1.0],
+                    restdir=[float(offset[0]), float(offset[1]), float(offset[2])],
+                    compressionstiffness=-1.0,
+                )
+                n_pin += 1
+                constraints.append(c)
+            elif boundary_stiffness > 0.0:
+                c = dict(
+                    type=ATTACH,
+                    pts=[src_idx, -1, tgt_idx, -1],
+                    stiffness=float(boundary_stiffness),
+                    dampingratio=float(boundary_damping),
+                    tetid=tetid,
+                    L=[0.0, 0.0, 0.0],
+                    restlength=float(dists[j]),
+                    restvector=[float(target_pos[0]), float(target_pos[1]), float(target_pos[2]), 1.0],
+                    restdir=[0.0, 0.0, 0.0],
+                    compressionstiffness=-1.0,
+                )
+                n_attach += 1
+                constraints.append(c)
+            else:
+                n_attach += 1  # counted as "skipped boundary"
+        n_int_tets = int(interior_tet.sum())
+        boundary_kind = "soft-attach" if boundary_stiffness > 0.0 else "free (ARAP-carried)"
+        import logging
+        logging.getLogger(__name__).info(
+            f"pintotarget tet-coherent split: {n_pin} hard-pin, "
+            f"{n_attach} boundary→{boundary_kind} (interior tets: {n_int_tets}/{self.tet_np.shape[0]})"
+        )
         return constraints
 
     def create_distance_line_constraints(self, params):

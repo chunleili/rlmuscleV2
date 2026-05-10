@@ -797,112 +797,6 @@ def attach_bilateral_update_fn(
                 wp.atomic_add(reaction_accum, cidx, C * n)
 
 
-@wp.func
-def tet_arap_update_xpbd_fn(
-    use_jacobi: int,
-    cidx: int,
-    cons: wp.array(dtype=Constraint),
-    pts: wp.vec4i,
-    dt: float,
-    pos: wp.array(dtype=wp.vec3),
-    pprev: wp.array(dtype=wp.vec3),
-    dP: wp.array(dtype=wp.vec3),
-    dPw: wp.array(dtype=wp.float32),
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    restlength: float,
-    restmatrix: wp.mat33,
-    kstiff: float,
-    kdampratio: float,
-    flags: int,
-):
-    pt0 = pts[0]
-    pt1 = pts[1]
-    pt2 = pts[2]
-    pt3 = pts[3]
-    p0 = pos[pt0]
-    p1 = pos[pt1]
-    p2 = pos[pt2]
-    p3 = pos[pt3]
-
-    invmass0 = get_inv_mass_fn(pt0, mass, stopped)
-    invmass1 = get_inv_mass_fn(pt1, mass, stopped)
-    invmass2 = get_inv_mass_fn(pt2, mass, stopped)
-    invmass3 = get_inv_mass_fn(pt3, mass, stopped)
-
-    c0 = p0 - p3
-    c1 = p1 - p3
-    c2 = p2 - p3
-    Ds = wp.mat33(
-        c0[0], c1[0], c2[0],
-        c0[1], c1[1], c2[1],
-        c0[2], c1[2], c2[2])
-
-    F = Ds * restmatrix
-
-    polar = polar_decomposition_fn(F)
-    R = polar.R
-    d = F - R
-
-    cons[cidx].restvector = mat3_to_quat_fn(R)
-
-    psi = squared_norm3_fn(d)
-    gradscale = float(2.0)
-    if (flags & (LINEARENERGY | NORMSTIFFNESS)) != 0:
-        psi = wp.sqrt(psi)
-        gradscale = 1.0 / psi
-
-    if psi >= 1e-6:
-        Ht = restmatrix * wp.transpose(d)
-        grad0 = gradscale * wp.vec3(Ht[0, 0], Ht[0, 1], Ht[0, 2])
-        grad1 = gradscale * wp.vec3(Ht[1, 0], Ht[1, 1], Ht[1, 2])
-        grad2 = gradscale * wp.vec3(Ht[2, 0], Ht[2, 1], Ht[2, 2])
-        grad3 = -grad0 - grad1 - grad2
-
-        wsum = (invmass0 * wp.dot(grad0, grad0) +
-                invmass1 * wp.dot(grad1, grad1) +
-                invmass2 * wp.dot(grad2, grad2) +
-                invmass3 * wp.dot(grad3, grad3))
-
-        if wsum != 0.0:
-            alpha = 1.0 / kstiff
-            if (flags & NORMSTIFFNESS) != 0:
-                alpha = alpha / restlength
-            alpha = alpha / (dt * dt)
-
-            dsum = float(0.0)
-            gamma = float(1.0)
-            if kdampratio > 0.0:
-                prev0 = pprev[pt0]
-                prev1 = pprev[pt1]
-                prev2 = pprev[pt2]
-                prev3 = pprev[pt3]
-                beta = kstiff * kdampratio * dt * dt
-                if (flags & NORMSTIFFNESS) != 0:
-                    beta = beta * restlength
-                gamma = alpha * beta / dt
-                dsum = (wp.dot(grad0, p0 - prev0) +
-                        wp.dot(grad1, p1 - prev1) +
-                        wp.dot(grad2, p2 - prev2) +
-                        wp.dot(grad3, p3 - prev3))
-                dsum = dsum * gamma
-                gamma = gamma + 1.0
-
-            C = psi
-            dL = (-C - alpha * cons[cidx].L[0] - dsum) / (gamma * wsum + alpha)
-            if use_jacobi != 0:
-                update_dP(dP, dPw, dL * invmass0 * grad0, pt0)
-                update_dP(dP, dPw, dL * invmass1 * grad1, pt1)
-                update_dP(dP, dPw, dL * invmass2 * grad2, pt2)
-                update_dP(dP, dPw, dL * invmass3 * grad3, pt3)
-            else:
-                pos[pt0] = pos[pt0] + dL * invmass0 * grad0
-                pos[pt1] = pos[pt1] + dL * invmass1 * grad1
-                pos[pt2] = pos[pt2] + dL * invmass2 * grad2
-                pos[pt3] = pos[pt3] + dL * invmass3 * grad3
-                cons[cidx].L = wp.vec3(cons[cidx].L[0] + dL, cons[cidx].L[1], cons[cidx].L[2])
-
-
 # ---------------------------------------------------------------------------
 # Simulation @wp.kernel
 # ---------------------------------------------------------------------------
@@ -1781,6 +1675,12 @@ def solve_distanceline_kernel(
         kstiffcompress, dt, has_compress_stiffness)
 
 
+# SVD-based ARAP (canonical PBD-XPBD form, ported from
+# realtimeMuscle/engine/arap_hpbd.py:project_constraints).
+# C = ||S - I||_F where F = D_s · B and B = restmatrix.
+# Gradient: dC/dF = sum_k dC/dS_k · U[:,k] · V[:,k]^T. Sign-fixed SVD via
+# ssvd_fn keeps the gradient pointing back to det F > 0 even when F is
+# inverted, which the polar-form variant could not do.
 @wp.kernel
 def solve_tetarap_kernel(
     cons: wp.array(dtype=Constraint),
@@ -1801,12 +1701,97 @@ def solve_tetarap_kernel(
         return
     pts = cons[c].pts
     tetid = cons[c].tetid
-    ctype = cons[c].type
-    flags = fem_flags_fn(ctype)
-    tet_arap_update_xpbd_fn(
-        use_jacobi, c, cons, pts, dt, pos, pprev, dP, dPw,
-        mass, stopped, cons[c].restlength, rest_matrix[tetid],
-        cstiffness, cons[c].dampingratio, flags)
+    pt0 = pts[0]
+    pt1 = pts[1]
+    pt2 = pts[2]
+    pt3 = pts[3]
+    p0 = pos[pt0]
+    p1 = pos[pt1]
+    p2 = pos[pt2]
+    p3 = pos[pt3]
+
+    invmass0 = get_inv_mass_fn(pt0, mass, stopped)
+    invmass1 = get_inv_mass_fn(pt1, mass, stopped)
+    invmass2 = get_inv_mass_fn(pt2, mass, stopped)
+    invmass3 = get_inv_mass_fn(pt3, mass, stopped)
+
+    # V2 convention: pt3 is the reference (= x0 in realtimeMuscle).
+    c0 = p0 - p3
+    c1 = p1 - p3
+    c2 = p2 - p3
+    Ds = wp.mat33(
+        c0[0], c1[0], c2[0],
+        c0[1], c1[1], c2[1],
+        c0[2], c1[2], c2[2])
+    B = rest_matrix[tetid]
+    F = Ds * B
+
+    svd = ssvd_fn(F)
+    U = svd.U
+    sigma = svd.sigma
+    V = svd.V
+
+    s_minus_1 = wp.vec3(sigma[0] - 1.0, sigma[1] - 1.0, sigma[2] - 1.0)
+    sum_sq = (s_minus_1[0] * s_minus_1[0]
+              + s_minus_1[1] * s_minus_1[1]
+              + s_minus_1[2] * s_minus_1[2])
+    if sum_sq < 1.0e-12:
+        return
+    Cval = wp.sqrt(sum_sq)
+    inv_C = 1.0 / Cval
+    dCdS0 = inv_C * s_minus_1[0]
+    dCdS1 = inv_C * s_minus_1[1]
+    dCdS2 = inv_C * s_minus_1[2]
+
+    # dCdF[i,j] = sum_k dCdS[k] * U[i,k] * V[j,k]
+    dCdF00 = U[0, 0] * V[0, 0] * dCdS0 + U[0, 1] * V[0, 1] * dCdS1 + U[0, 2] * V[0, 2] * dCdS2
+    dCdF01 = U[0, 0] * V[1, 0] * dCdS0 + U[0, 1] * V[1, 1] * dCdS1 + U[0, 2] * V[1, 2] * dCdS2
+    dCdF02 = U[0, 0] * V[2, 0] * dCdS0 + U[0, 1] * V[2, 1] * dCdS1 + U[0, 2] * V[2, 2] * dCdS2
+    dCdF10 = U[1, 0] * V[0, 0] * dCdS0 + U[1, 1] * V[0, 1] * dCdS1 + U[1, 2] * V[0, 2] * dCdS2
+    dCdF11 = U[1, 0] * V[1, 0] * dCdS0 + U[1, 1] * V[1, 1] * dCdS1 + U[1, 2] * V[1, 2] * dCdS2
+    dCdF12 = U[1, 0] * V[2, 0] * dCdS0 + U[1, 1] * V[2, 1] * dCdS1 + U[1, 2] * V[2, 2] * dCdS2
+    dCdF20 = U[2, 0] * V[0, 0] * dCdS0 + U[2, 1] * V[0, 1] * dCdS1 + U[2, 2] * V[0, 2] * dCdS2
+    dCdF21 = U[2, 0] * V[1, 0] * dCdS0 + U[2, 1] * V[1, 1] * dCdS1 + U[2, 2] * V[1, 2] * dCdS2
+    dCdF22 = U[2, 0] * V[2, 0] * dCdS0 + U[2, 1] * V[2, 1] * dCdS1 + U[2, 2] * V[2, 2] * dCdS2
+
+    # grad_ptk[a] = sum_j dCdF[a,j] * B[k,j]   (k=0,1,2 for non-reference verts)
+    grad0 = wp.vec3(
+        dCdF00 * B[0, 0] + dCdF01 * B[0, 1] + dCdF02 * B[0, 2],
+        dCdF10 * B[0, 0] + dCdF11 * B[0, 1] + dCdF12 * B[0, 2],
+        dCdF20 * B[0, 0] + dCdF21 * B[0, 1] + dCdF22 * B[0, 2])
+    grad1 = wp.vec3(
+        dCdF00 * B[1, 0] + dCdF01 * B[1, 1] + dCdF02 * B[1, 2],
+        dCdF10 * B[1, 0] + dCdF11 * B[1, 1] + dCdF12 * B[1, 2],
+        dCdF20 * B[1, 0] + dCdF21 * B[1, 1] + dCdF22 * B[1, 2])
+    grad2 = wp.vec3(
+        dCdF00 * B[2, 0] + dCdF01 * B[2, 1] + dCdF02 * B[2, 2],
+        dCdF10 * B[2, 0] + dCdF11 * B[2, 1] + dCdF12 * B[2, 2],
+        dCdF20 * B[2, 0] + dCdF21 * B[2, 1] + dCdF22 * B[2, 2])
+    grad3 = -grad0 - grad1 - grad2
+
+    wsum = (invmass0 * wp.dot(grad0, grad0)
+            + invmass1 * wp.dot(grad1, grad1)
+            + invmass2 * wp.dot(grad2, grad2)
+            + invmass3 * wp.dot(grad3, grad3))
+    if wsum == 0.0:
+        return
+
+    alpha = 1.0 / cstiffness
+    alpha_tilde = alpha / (dt * dt)
+    L0 = cons[c].L[0]
+    dL = -(Cval + alpha_tilde * L0) / (wsum + alpha_tilde)
+
+    if use_jacobi != 0:
+        update_dP(dP, dPw, dL * invmass0 * grad0, pt0)
+        update_dP(dP, dPw, dL * invmass1 * grad1, pt1)
+        update_dP(dP, dPw, dL * invmass2 * grad2, pt2)
+        update_dP(dP, dPw, dL * invmass3 * grad3, pt3)
+    else:
+        pos[pt0] = pos[pt0] + dL * invmass0 * grad0
+        pos[pt1] = pos[pt1] + dL * invmass1 * grad1
+        pos[pt2] = pos[pt2] + dL * invmass2 * grad2
+        pos[pt3] = pos[pt3] + dL * invmass3 * grad3
+        cons[c].L = wp.vec3(L0 + dL, cons[c].L[1], cons[c].L[2])
 
 
 @wp.func

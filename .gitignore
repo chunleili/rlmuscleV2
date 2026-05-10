@@ -17,6 +17,7 @@ log.md
 runs/
 wandb/
 tb_logs/
+muscle_sim.usd
 
 # Editor / OS
 .DS_Store

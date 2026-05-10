@@ -101,19 +101,38 @@ def _drive_one_step(sim, anim, frame_idx: int):
     sim.update_attach_targets()
 
 
+def _make_substep_bone_hook(sim, anim, cfg, step_index: int):
+    """Per-substep callback: lerp bone target from frame_at(step-1) to frame_at(step).
+
+    cfg.bone_speed_scale (default 1.0) scales how fast the motion plays back.
+    A value of 0.1 makes bones move 10x slower without changing the JSON file.
+    """
+    speed = float(getattr(cfg, "bone_speed_scale", 1.0))
+    f_a = (step_index - 1) * cfg.dt * anim.fps * speed
+    f_b = step_index * cfg.dt * anim.fps * speed
+
+    def hook(sub_i, n_sub):
+        t = (sub_i + 1) / n_sub
+        f = f_a + t * (f_b - f_a)
+        bone_pos_world = anim.sample_at_fractional_frame(f).astype(np.float32)
+        sim.bone_pos_field.assign(bone_pos_world)
+        sim.update_attach_targets()
+
+    return hook
+
+
 def _run_auto(sim, anim, cfg, args, frame_at):
     mode = "ramp" if args.activation is None else f"const={args.activation}"
     log.info(f"Running {cfg.nsteps} steps (auto, render={cfg.render_mode}, "
-             f"activation={mode})...")
+             f"activation={mode}, per-substep bone interp=ON)...")
     for step in range(1, cfg.nsteps + 1):
         f_idx = frame_at(step)
-        _drive_one_step(sim, anim, f_idx)
         acti = (args.activation if args.activation is not None
                 else activation_ramp(step / max(cfg.nsteps, 1)))
         wp.launch(fill_float_kernel, dim=sim.activation.shape[0],
                   inputs=[sim.activation, float(acti)])
-        sim.step()
         sim.step_cnt = step
+        sim.step(pre_substep_hook=_make_substep_bone_hook(sim, anim, cfg, step))
         sim.render()
 
         if step % 50 == 0 or step == 1:
@@ -131,14 +150,12 @@ def _run_auto(sim, anim, cfg, args, frame_at):
 def _run_interactive(sim, anim, cfg, args, frame_at):
     step = 0
     while step < cfg.nsteps:
-        f_idx = frame_at(step)
-        _drive_one_step(sim, anim, f_idx)
         acti = (args.activation if args.activation is not None
                 else activation_ramp(step / max(cfg.nsteps, 1)))
         wp.launch(fill_float_kernel, dim=sim.activation.shape[0],
                   inputs=[sim.activation, float(acti)])
-        sim.step()
-        sim.step_cnt = step
+        sim.step_cnt = step + 1
+        sim.step(pre_substep_hook=_make_substep_bone_hook(sim, anim, cfg, step + 1))
         sim.render()
         step += 1
         if sim.renderer is not None and getattr(sim.renderer, "should_close",

@@ -13,9 +13,8 @@
 
   "coarse_geo_path": "data/Human/coarse_per_muscle.npz",
   "coarse_iterations": 10,
-  "coarse_stiffness": 100000000.0,
-  "coarse_dampingratio": 0.1,
   "prolong_blend": 1.0,
+  "coarse_only": false,
 
   "contraction_ratio": 0.4,
   "fiber_stiffness_scale": 10000.0,

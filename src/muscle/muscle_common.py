@@ -185,12 +185,33 @@ class MuscleSimBase(ConstraintBuilderMixin):
             self._load_bone(target_path)
         return self.bone_geo, self.bone_pos
 
-    def step(self):
-        self.update_attach_targets()
-        for _ in range(self.cfg.num_substeps):
+    def step(self, pre_substep_hook=None):
+        """Run one frame.
+
+        Args:
+            pre_substep_hook: Optional callable(sub_i, n_sub). Runs at start of
+                each substep, BEFORE integrate. Use it to advance bone targets
+                at substep granularity (see coupleOneWay/example_drive.py).
+                When provided, it is responsible for updating attach targets
+                each substep; the unconditional update_attach_targets() at the
+                top of step() is skipped.
+        """
+        if pre_substep_hook is None:
+            self.update_attach_targets()
+        debug_per_sub = bool(getattr(self.cfg, "debug_per_substep", False))
+        n_sub = self.cfg.num_substeps
+        for sub_i in range(n_sub):
+            if pre_substep_hook is not None:
+                pre_substep_hook(sub_i, n_sub)
             self.clear_forces()
             self.accumulate_active_fiber_force()
             self.integrate()
+            # Hard-pin snap runs BEFORE the constraint solve so ARAP/vol see
+            # the kinematic verts at their new bone-driven position and drag
+            # the elastic neighbors along, avoiding the per-substep shear that
+            # otherwise accumulates at the pin/free boundary.
+            if hasattr(self, "apply_pintotarget"):
+                self.apply_pintotarget()
             self.clear()
             self.solve_constraints()
             if self.use_jacobi:
@@ -198,12 +219,49 @@ class MuscleSimBase(ConstraintBuilderMixin):
             self.post_smooth()
             self.freeze_near_inverted()
             self.repair_inverted_tets()
-            # Hard pin runs LAST so nothing can undo the snap (matches
-            # realtimeMuscle's pintotarget behavior). Velocity update below
-            # then reflects pinned pos vs old_pos so verts inherit bone vel.
+            # Re-apply at the end of the substep to reset any drift the
+            # constraint solver introduced (since the pinned verts have
+            # inv_mass=0 the drift should be tiny but we make it exact).
             if hasattr(self, "apply_pintotarget"):
                 self.apply_pintotarget()
             self.update_velocities()
+            if debug_per_sub:
+                self._debug_check_substep(sub_i, n_sub)
+
+    def _debug_check_substep(self, sub_i, n_sub):
+        """Per-substep mesh-quality + state logging. Enabled by cfg.debug_per_substep.
+
+        Computes det(F) for every tet and logs centroid / vol_err / det(F) range.
+        Continues on MeshDistortionError so the run completes for visual review.
+        """
+        import logging
+        from muscle.couple.mesh_utils import (
+            check_mesh_quality, MeshDistortionError,
+        )
+        log = logging.getLogger(__name__)
+        pos_np = self.pos.numpy()
+        # rest_matrix was built against tet_np[:, [3,0,1,2]] ordering — reuse it
+        # so det(F) here matches the solver's internal F.
+        tet_idx = self.tet_np[:, [3, 0, 1, 2]]
+        tet_poses = self.rest_matrix.numpy()
+        step_id = getattr(self, "step_cnt", -1)
+        tag = f"step={step_id} sub={sub_i + 1}/{n_sub}"
+        try:
+            detF = check_mesh_quality(pos_np, tet_idx, tet_poses, step=None)
+            detF_lo = float(detF.min())
+            detF_hi = float(detF.max())
+        except MeshDistortionError as exc:
+            log.error(f"{tag} MeshDistortionError: {exc}")
+            return
+        centroid = pos_np.mean(axis=0)
+        try:
+            vol_err = float(self.calc_vol_error())
+        except Exception:
+            vol_err = float("nan")
+        log.info(
+            f"{tag}  centroid=({centroid[0]:+.4f},{centroid[1]:+.4f},{centroid[2]:+.4f})  "
+            f"vol_err={vol_err:+.4f}  detF=[{detF_lo:.4f},{detF_hi:.4f}]"
+        )
 
     def get_fps(self):
         if not hasattr(self, 'step_start_time') or not hasattr(self, 'step_end_time'):

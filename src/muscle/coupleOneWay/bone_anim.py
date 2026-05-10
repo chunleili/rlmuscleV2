@@ -201,6 +201,28 @@ class BoneAnimation:
         """Return (N,3) world bone_pos at the given frame (clamped, integer)."""
         i = int(np.clip(frame_idx, 0, self.n_frames - 1))
         joint_world = self._frames[i]  # (n_j, 4, 4)
+        return self._apply_joint_world(joint_world)
+
+    def sample_at_fractional_frame(self, f: float, loop: bool = True) -> np.ndarray:
+        """Return bone_pos at fractional frame `f` via linear-interpolated joint xforms.
+
+        Linear blend of two consecutive 4x4 matrices is approximate for rotations,
+        but for small inter-frame angles (which is the regime when num_substeps>>1
+        finely subdivides one frame interval) the drift is negligible.
+        """
+        if loop:
+            f = f % self.n_frames
+        f = float(np.clip(f, 0.0, self.n_frames - 1))
+        i0 = int(np.floor(f))
+        i1 = min(i0 + 1, self.n_frames - 1)
+        t = f - i0
+        if i0 == i1 or t == 0.0:
+            return self._apply_joint_world(self._frames[i0])
+        joint_world = (1.0 - t) * self._frames[i0] + t * self._frames[i1]
+        return self._apply_joint_world(joint_world)
+
+    def _apply_joint_world(self, joint_world: np.ndarray) -> np.ndarray:
+        """Run the bone-rest -> joint-driven world xform pipeline once."""
         out = self._world_buf
         for (bone_name, sl, local_verts, bone_world_rest), j, off in zip(
             self._bone_slices, self._driver_idx, self._offset

@@ -24,6 +24,7 @@ from muscle.muscle_warp import (
     Constraint,
     MuscleSim,
     apply_dP_kernel,
+    clear_cons_L_kernel,
     clear_dP_kernel,
     solve_tetarap_kernel,
     solve_tetvolume_kernel,
@@ -41,16 +42,18 @@ def restrict_kernel(
     coarse_in_fine_uvw: wp.array(dtype=wp.vec3),
     fine_tet_indices: wp.array(dtype=wp.vec4i),
     fine_pos: wp.array(dtype=wp.vec3),
+    fine_pprev: wp.array(dtype=wp.vec3),
 ):
-    """coarse.pos[i] = interp_in_fine_cage(fine.pos)  (absolute version).
+    """Delta restriction: coarse.pos += Σ_k bary[k] · (fine.pos[c_k] - fine.pprev[c_k]).
 
-    This makes coarse always equal to fine's projection onto the coarse
-    subspace, so when bones drag fine via pintotarget+constraints, coarse
-    follows automatically. After coarse XPBD solve removes low-frequency
-    error, prolong reads coarse back to fine. This is more direct than the
-    delta version (which only tracks per-substep deltas and hence drifts
-    very slowly when most fine motion is concentrated in pinned verts that
-    we deliberately exclude).
+    Mirrors realtimeMuscle's update_coarse_mesh_mfree_kernel (v2 dp form).
+    Each substep adds fine's predicted-displacement-this-substep into
+    coarse, so coarse accumulates the macro motion of the body. Coarse XPBD
+    then relaxes vol+arap constraints on this drifted state, removing
+    low-frequency error before prolong writes back. Requires that
+    apply_pintotarget runs AFTER integrate (which snapshots pprev) but
+    BEFORE this kernel — otherwise pin teleports never produce Δfine ≠ 0
+    and coarse never sees bone-driven motion.
     """
     i = wp.tid()
     fine_t = coarse_in_fine_idx[i]
@@ -61,12 +64,12 @@ def restrict_kernel(
     u = uvw[0]
     v = uvw[1]
     w = uvw[2]
-    coarse_pos[i] = (
-        (1.0 - u - v - w) * fine_pos[tet[0]]
-        + u * fine_pos[tet[1]]
-        + v * fine_pos[tet[2]]
-        + w * fine_pos[tet[3]]
-    )
+    b0 = 1.0 - u - v - w
+    dp0 = fine_pos[tet[0]] - fine_pprev[tet[0]]
+    dp1 = fine_pos[tet[1]] - fine_pprev[tet[1]]
+    dp2 = fine_pos[tet[2]] - fine_pprev[tet[2]]
+    dp3 = fine_pos[tet[3]] - fine_pprev[tet[3]]
+    coarse_pos[i] = coarse_pos[i] + b0 * dp0 + u * dp1 + v * dp2 + w * dp3
 
 
 @wp.kernel
@@ -77,16 +80,14 @@ def prolong_kernel(
     coarse_tet_indices: wp.array(dtype=wp.vec4i),
     coarse_pos: wp.array(dtype=wp.vec3),
     fine_stopped: wp.array(dtype=wp.int32),
-    blend: float,
 ):
-    """fine.pos[i] = blend * interp_in_coarse_cage(coarse.pos)
-                   + (1-blend) * fine.pos[i].
+    """fine.pos[i] = interp_in_coarse_cage(coarse.pos). Total overwrite.
 
-    blend=1 fully overwrites (matches realtimeMuscle default; clobbers
-    high-frequency fine modes each substep).  blend<1 nudges fine toward
-    coarse interp without erasing local detail.  Stopped (kinematic)
-    verts are skipped entirely — they're driven externally (e.g. by
-    pintotarget) and prolonging them would clobber the kinematic chain.
+    Mirrors realtimeMuscle's update_fine_mesh_mfree_kernel (v1 direct
+    cage). Stopped (kinematic) verts are skipped — they're driven
+    externally by apply_pintotarget after this; overwriting them now would
+    just be undone by the re-snap, but skipping is cheaper and keeps the
+    kinematic chain exact.
     """
     i = wp.tid()
     if fine_stopped[i] != 0:
@@ -99,13 +100,12 @@ def prolong_kernel(
     u = uvw[0]
     v = uvw[1]
     w = uvw[2]
-    interp = (
+    fine_pos[i] = (
         (1.0 - u - v - w) * coarse_pos[tet[0]]
         + u * coarse_pos[tet[1]]
         + v * coarse_pos[tet[2]]
         + w * coarse_pos[tet[3]]
     )
-    fine_pos[i] = blend * interp + (1.0 - blend) * fine_pos[i]
 
 
 @wp.kernel
@@ -257,6 +257,8 @@ class CoarseSolver:
         volume_stiffness: float = 1e10,
         tetarap_stiffness: float = 1e10,
         dampingratio: float = 0.1,
+        fine_mass_np: np.ndarray | None = None,
+        fine_tendonmask_np: np.ndarray | None = None,
     ):
         # 1. Load coarse mesh — .geo (Houdini) or .npz (per-muscle build).
         ext = str(coarse_geo_path).lower().rsplit(".", 1)[-1]
@@ -292,13 +294,27 @@ class CoarseSolver:
               f"outside-fine-mesh={n_unmatched_c} (skip restrict for these), "
               f"{time.perf_counter()-t0:.2f}s")
 
-        # 3. Rest matrices, volumes, mass
+        # 3. Rest matrices, volumes (geometric only — mass moved out)
         self._compute_rest_data()
 
-        # 4. Allocate Warp fields
+        # 4. Mass + tendonmask: gather from fine via bary maps if provided,
+        # else fall back to geometric density estimate. Gathering preserves
+        # mass conservation (Σ_coarse = Σ_fine) and propagates fine
+        # heterogeneity (heavy bellies, tendon ends) to coarse.
+        if fine_mass_np is not None:
+            self._gather_mass_from_fine(np.asarray(fine_mass_np, dtype=np.float64))
+        else:
+            self._compute_geometric_mass()
+        self._gather_tendonmask_from_fine(
+            fine_pos_np, fine_tet_np,
+            np.asarray(fine_tendonmask_np, dtype=np.float64)
+            if fine_tendonmask_np is not None else None,
+        )
+
+        # 5. Allocate Warp fields
         self._allocate_warp_fields()
 
-        # 5. Build coarse Constraint AOS (volume + tetarap)
+        # 6. Build coarse Constraint AOS (volume + tetarap)
         self._build_constraints(volume_stiffness, tetarap_stiffness, dampingratio)
 
     # ---- precompute -------------------------------------------------------
@@ -315,12 +331,105 @@ class CoarseSolver:
             self.rest_matrices[valid] = np.linalg.inv(M[valid])
         self.valid_tets = valid
 
+    def _compute_geometric_mass(self):
+        """Fallback: density × tet_volume / 4 distributed to 4 verts.
+        Used when no fine_mass_np is supplied. Doesn't reflect fine
+        heterogeneity — prefer _gather_mass_from_fine."""
         mass = np.zeros(self.n_verts, dtype=np.float64)
         avg = self.density * np.abs(self.volumes) / 4.0
         for k in range(4):
             np.add.at(mass, self.tet_np[:, k], avg)
         mass = np.maximum(mass, 1e-6)
         self.mass_np = mass.astype(np.float32)
+        print(f"[CoarseSolver] mass: geometric (density × vol / 4), "
+              f"Σ={mass.sum():.4f} kg")
+
+    def _gather_mass_from_fine(self, fine_mass_np: np.ndarray):
+        """Scatter fine vertex mass onto coarse verts via fine_in_coarse bary.
+
+        For each fine vert v with mass m_v, locate its containing coarse tet
+        T = fine_in_coarse_idx[v] and weights (1-u-v-w, u, v, w). Add
+        m_v · weight_k to coarse_mass[T[k]]. Total mass is conserved exactly
+        when bary sums to 1 (true after our snap-and-clamp), so heavy
+        regions of fine map to heavy regions of coarse.
+        """
+        idx = self.fine_in_coarse_idx_np
+        uvw = self.fine_in_coarse_uvw_np.astype(np.float64)
+        n_fine = fine_mass_np.shape[0]
+        if idx.shape[0] != n_fine:
+            raise ValueError(
+                f"fine_mass_np ({n_fine}) doesn't match fine_in_coarse "
+                f"({idx.shape[0]})")
+
+        valid_v = idx >= 0
+        coarse_tets_for_fine = self.tet_np[idx[valid_v]]   # (n_v, 4)
+        u = uvw[valid_v, 0]
+        v = uvw[valid_v, 1]
+        w = uvw[valid_v, 2]
+        b0 = 1.0 - u - v - w
+        bary4 = np.stack([b0, u, v, w], axis=1)            # (n_v, 4)
+        contrib = fine_mass_np[valid_v][:, None] * bary4   # (n_v, 4)
+
+        mass = np.zeros(self.n_verts, dtype=np.float64)
+        for k in range(4):
+            np.add.at(mass, coarse_tets_for_fine[:, k], contrib[:, k])
+
+        # Floor any zero-mass coarse verts (shouldn't happen if fine covers
+        # them but cheap safety) — pick 1% of median to mirror fine policy.
+        nz = mass[mass > 0]
+        floor = float(np.median(nz)) * 0.01 if nz.size else 1e-6
+        n_floored = int((mass < floor).sum())
+        mass = np.maximum(mass, floor)
+        self.mass_np = mass.astype(np.float32)
+
+        sum_fine = float(fine_mass_np.sum())
+        sum_coarse = float(mass.sum())
+        ratio = sum_coarse / sum_fine if sum_fine > 0 else float("nan")
+        print(f"[CoarseSolver] mass: gathered from fine, "
+              f"Σ_fine={sum_fine:.4f} → Σ_coarse={sum_coarse:.4f} "
+              f"(ratio={ratio:.4f}, floored {n_floored} verts at {floor:.2e})")
+
+    def _gather_tendonmask_from_fine(
+        self,
+        fine_pos_np: np.ndarray,
+        fine_tet_np: np.ndarray,
+        fine_tendonmask_np: np.ndarray | None,
+    ):
+        """Per-coarse-tet tendonmask = fine-volume-weighted average.
+
+        For each fine tet, find which coarse tet contains its centroid,
+        then accumulate fine_vol · fine_mask into coarse, divide by Σ vol.
+        Only used for inspection/coloring today (coarse vol+arap kernels
+        don't read tendonmask), but keeping it consistent with fine avoids
+        future surprises when adding a coarse fiber pass.
+        """
+        n_tet = self.tet_np.shape[0]
+        self.tendonmask_np = np.zeros(n_tet, dtype=np.float32)
+        if fine_tendonmask_np is None:
+            return
+        # Fine tet centroids → which coarse tet contains them.
+        ftet_pos = fine_pos_np[fine_tet_np]
+        ftet_centroids = ftet_pos.mean(axis=1).astype(np.float64)
+        cols = ftet_pos[:, :3, :] - ftet_pos[:, 3:4, :]
+        ftet_vol = np.abs(np.linalg.det(np.transpose(cols, (0, 2, 1)))) / 6.0
+        which_coarse, _ = compute_barycentric_mapping(
+            ftet_centroids, self.pos0_np, self.tet_np, k=20)
+
+        valid_f = which_coarse >= 0
+        target = which_coarse[valid_f]
+        w = ftet_vol[valid_f] * fine_tendonmask_np[valid_f]
+        wsum = ftet_vol[valid_f]
+        mask_acc = np.zeros(n_tet, dtype=np.float64)
+        vol_acc = np.zeros(n_tet, dtype=np.float64)
+        np.add.at(mask_acc, target, w)
+        np.add.at(vol_acc, target, wsum)
+        nz = vol_acc > 0
+        out = np.zeros(n_tet, dtype=np.float64)
+        out[nz] = mask_acc[nz] / vol_acc[nz]
+        self.tendonmask_np = out.astype(np.float32)
+        n_empty = int((~nz).sum())
+        print(f"[CoarseSolver] tendonmask: gathered from fine "
+              f"({n_empty} coarse tets received no fine tet, default 0)")
 
     def _allocate_warp_fields(self):
         self.pos = wp.from_numpy(self.pos0_np.astype(np.float32), dtype=wp.vec3)
@@ -334,6 +443,12 @@ class CoarseSolver:
                                          dtype=wp.float32)
         self.rest_matrix = wp.from_numpy(self.rest_matrices.astype(np.float32),
                                          dtype=wp.mat33)
+        # tendonmask isn't read by the current vol/arap kernels, but kept on
+        # the GPU for parity with fine and for inspection / future fiber pass.
+        self.tendonmask = wp.from_numpy(
+            self.tendonmask_np if hasattr(self, "tendonmask_np")
+            else np.zeros(self.n_tets, dtype=np.float32),
+            dtype=wp.float32)
 
         self.fine_in_coarse_idx = wp.from_numpy(self.fine_in_coarse_idx_np, dtype=wp.int32)
         self.fine_in_coarse_uvw = wp.from_numpy(self.fine_in_coarse_uvw_np, dtype=wp.vec3)
@@ -385,22 +500,31 @@ class CoarseSolver:
 
     # ---- step interface ---------------------------------------------------
 
-    def restrict(self, fine_pos_field: wp.array):
-        """coarse.pos = interp_in_fine_cage(fine.pos). Snapshots coarse.pprev
-        before the projection so XPBD damping/inertia in solve sees a
-        consistent prev/pos pair."""
-        # pprev = old coarse pos (before this substep's restrict).
-        wp.launch(copy_pprev_kernel, dim=self.n_verts,
-                  inputs=[self.pprev, self.pos])
+    def restrict(self, fine_pos_field: wp.array, fine_pprev_field: wp.array):
+        """Delta restriction: coarse.pos += bary · (fine.pos - fine.pprev).
+
+        fine.pprev must be a snapshot taken at substep start (= integrate's
+        pprev := pos). apply_pintotarget should run AFTER integrate but
+        BEFORE this so pin teleports show up in Δfine and propagate to
+        coarse. Coarse XPBD then relaxes vol+arap on this drifted state.
+        """
         wp.launch(restrict_kernel, dim=self.n_verts, inputs=[
             self.pos, self.coarse_in_fine_idx, self.coarse_in_fine_uvw,
-            self._fine_tet_indices_field, fine_pos_field,
+            self._fine_tet_indices_field, fine_pos_field, fine_pprev_field,
         ])
 
     def solve(self, n_iters: int):
-        """Jacobi: clear → solve volume → solve tetarap → apply_dP, repeat."""
+        """Jacobi: clear → solve volume → solve tetarap → apply_dP, repeat.
+
+        XPBD λ is RESET ONCE before the iteration loop (per substep), then
+        accumulates across iters within this substep. Without the reset, λ
+        grows unboundedly across substeps and frames → coarse mesh explodes.
+        Mirrors realtimeMuscle's reset_lagrangian(coarse.lagrangian) before
+        each substep's project_constraints loop.
+        """
         if self.n_cons == 0 or n_iters <= 0:
             return
+        wp.launch(clear_cons_L_kernel, dim=self.n_cons, inputs=[self.cons])
         for _ in range(n_iters):
             wp.launch(clear_dP_kernel, dim=self.n_verts,
                       inputs=[self.dP, self.dPw])
@@ -418,11 +542,10 @@ class CoarseSolver:
             wp.launch(apply_dP_kernel, dim=self.n_verts,
                       inputs=[self.pos, self.dP, self.dPw])
 
-    def prolong(self, fine_pos_field: wp.array, fine_stopped: wp.array,
-                blend: float = 1.0):
+    def prolong(self, fine_pos_field: wp.array, fine_stopped: wp.array):
         wp.launch(prolong_kernel, dim=fine_pos_field.shape[0], inputs=[
             fine_pos_field, self.fine_in_coarse_idx, self.fine_in_coarse_uvw,
-            self.tet_indices, self.pos, fine_stopped, float(blend),
+            self.tet_indices, self.pos, fine_stopped,
         ])
 
 
@@ -455,8 +578,53 @@ class MultigridMuscleSim(MuscleSim):
         if not path:
             self.coarse = None
             return
+
+        # Mirror fine constraint stiffness/damping for vol + tetarap. Coarse
+        # must use the same material parameters as fine — anything weaker and
+        # the coarse projection contradicts fine's stiffness, anything stronger
+        # and coarse over-constrains. Read from cfg.constraints by type.
+        cons_list = getattr(cfg, "constraints", []) or []
+        def _find_cons(type_name: str):
+            for c in cons_list:
+                t = c.get("type") if isinstance(c, dict) else getattr(c, "type", None)
+                if t == type_name:
+                    return c
+            return None
+        def _get(c, key, default):
+            if c is None:
+                return default
+            return c.get(key, default) if isinstance(c, dict) else getattr(c, key, default)
+        vol_c = _find_cons("volume")
+        arap_c = _find_cons("tetarap")
+        coarse_vol_k = float(_get(vol_c, "stiffness", 1e10))
+        coarse_arap_k = float(_get(arap_c, "stiffness", 1e10))
+        # Damping: realtimeMuscle's project_constraints has zero damping in
+        # the constraint solve (only velocity damping in semi_euler). Mirror
+        # that — XPBD damping needs a consistent pprev, which the delta
+        # restrict doesn't provide for coarse. Velocity damping still acts
+        # on fine via integrate's veldamping.
+        coarse_damp = 0.0
+        print(f"[MultigridMuscleSim] coarse stiffness mirrors fine: "
+              f"vol={coarse_vol_k:.2e}, arap={coarse_arap_k:.2e}, "
+              f"damping={coarse_damp} (zeroed: matches realtimeMuscle)")
+
         self.coarse_iterations = int(getattr(cfg, "coarse_iterations", 5))
         self.prolong_blend = float(getattr(cfg, "prolong_blend", 1.0))
+        # Debug: skip fine elasticity entirely. Only pintotarget drives motion;
+        # coarse XPBD propagates that through coarse mesh; prolong writes back
+        # to fine. Used to isolate whether fine constraints or coarse correction
+        # is the source of explosion.
+        self.coarse_only = bool(getattr(cfg, "coarse_only", False))
+        if self.coarse_only:
+            print("[MultigridMuscleSim] DEBUG: coarse_only mode — skipping fine elasticity")
+        # Pull fine attributes off the GPU once, at init time, so the coarse
+        # solver can gather them onto its own mesh (mass conservation +
+        # heterogeneity propagation). MuscleSim has already populated these
+        # by the time super().__init__ returns.
+        fine_mass_np = self.mass.numpy() if hasattr(self, "mass") else None
+        fine_tendonmask_np = (
+            self.tendonmask.numpy() if hasattr(self, "tendonmask") else None
+        )
         self.coarse = CoarseSolver(
             coarse_geo_path=path,
             fine_pos_np=self.pos0_np,
@@ -464,24 +632,58 @@ class MultigridMuscleSim(MuscleSim):
             fine_tet_indices_field=self.tet_indices,
             dt=self.dt,
             density=float(getattr(cfg, "density", 1000.0)),
-            volume_stiffness=float(getattr(cfg, "coarse_volume_stiffness",
-                                           getattr(cfg, "coarse_stiffness", 1e10))),
-            tetarap_stiffness=float(getattr(cfg, "coarse_tetarap_stiffness",
-                                            getattr(cfg, "coarse_stiffness", 1e10))),
-            dampingratio=float(getattr(cfg, "coarse_dampingratio", 0.1)),
+            volume_stiffness=coarse_vol_k,
+            tetarap_stiffness=coarse_arap_k,
+            dampingratio=coarse_damp,
+            fine_mass_np=fine_mass_np,
+            fine_tendonmask_np=fine_tendonmask_np,
         )
 
     def step(self):
         self.update_attach_targets()
+        has_pin = hasattr(self, "apply_pintotarget")
+
+        if self.coarse_only and self.coarse is not None:
+            # Debug pipeline: pin drives motion, coarse propagates, prolong
+            # writes back. No fine elasticity, no velocity update.
+            #
+            # Per substep:
+            #   1) snapshot fine.pprev := fine.pos (no integrate to do it)
+            #   2) apply_pintotarget — pin teleports happen AFTER snapshot,
+            #      so Δfine = fine.pos - fine.pprev ≠ 0 at pin verts
+            #   3) coarse.restrict(fine.pos, fine.pprev) — picks up Δ
+            #   4) coarse.solve — propagates through vol+arap
+            #   5) coarse.prolong(fine.pos) — overwrite non-stopped
+            #   6) re-apply_pintotarget — keep pin verts exactly on bone
+            for _ in range(self.cfg.num_substeps):
+                wp.launch(copy_pprev_kernel, dim=self.pos.shape[0],
+                          inputs=[self.pprev, self.pos])
+                if has_pin:
+                    self.apply_pintotarget()
+                self.coarse.restrict(self.pos, self.pprev)
+                self.coarse.solve(self.coarse_iterations)
+                self.coarse.prolong(self.pos, self.stopped)
+                if has_pin:
+                    self.apply_pintotarget()
+            return
+
+        # Normal (full) GMG pipeline, mirrors realtimeMuscle.substep:
+        #   integrate (semi_euler: pprev := pos, pos += dt·vel)
+        #   apply_pintotarget — pin teleport AFTER pprev snapshot so coarse sees Δ
+        #   coarse.restrict / solve / prolong
+        #   fine constraint solve + apply_dP + post_smooth + repair
+        #   apply_pintotarget — re-snap pins clobbered by fine constraints
+        #   update_velocities
         for _ in range(self.cfg.num_substeps):
             self.clear_forces()
             self.accumulate_active_fiber_force()
             self.integrate()
+            if has_pin:
+                self.apply_pintotarget()
             if self.coarse is not None:
-                self.coarse.restrict(self.pos)
+                self.coarse.restrict(self.pos, self.pprev)
                 self.coarse.solve(self.coarse_iterations)
-                self.coarse.prolong(self.pos, self.stopped,
-                                    blend=self.prolong_blend)
+                self.coarse.prolong(self.pos, self.stopped)
             self.clear()
             self.solve_constraints()
             if self.use_jacobi:
@@ -489,6 +691,6 @@ class MultigridMuscleSim(MuscleSim):
             self.post_smooth()
             self.freeze_near_inverted()
             self.repair_inverted_tets()
-            if hasattr(self, "apply_pintotarget"):
+            if has_pin:
                 self.apply_pintotarget()
             self.update_velocities()
