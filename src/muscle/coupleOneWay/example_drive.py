@@ -21,6 +21,7 @@ import warp as wp
 from muscle.config import load_config
 from muscle.coupleOneWay.bone_anim import BoneAnimation
 from muscle.log import setup_logging
+from muscle.muscle_common import activation_ramp
 from muscle.muscle_warp import MuscleSim, fill_float_kernel
 
 log = logging.getLogger(__name__)
@@ -35,8 +36,9 @@ def main():
     p.add_argument("--steps", type=int, default=None, help="Override cfg.nsteps.")
     p.add_argument("--render", choices=["human", "usd", "none"], default=None)
     p.add_argument("--device", default="cpu")
-    p.add_argument("--activation", type=float, default=0.0,
-                   help="Constant activation level (0.0 = passive, bone-driven only).")
+    p.add_argument("--activation", type=float, default=None,
+                   help="Constant activation level. If unset, use activation_ramp(t) "
+                        "over the run (0->0.5->1.0->0.7->0.3->0).")
     args = p.parse_args()
 
     setup_logging()
@@ -96,13 +98,16 @@ def _drive_one_step(sim, anim, frame_idx: int):
 
 
 def _run_auto(sim, anim, cfg, args, frame_at):
+    mode = "ramp" if args.activation is None else f"const={args.activation}"
     log.info(f"Running {cfg.nsteps} steps (auto, render={cfg.render_mode}, "
-             f"activation={args.activation})...")
-    wp.launch(fill_float_kernel, dim=sim.activation.shape[0],
-              inputs=[sim.activation, float(args.activation)])
+             f"activation={mode})...")
     for step in range(1, cfg.nsteps + 1):
         f_idx = frame_at(step)
         _drive_one_step(sim, anim, f_idx)
+        acti = (args.activation if args.activation is not None
+                else activation_ramp(step / max(cfg.nsteps, 1)))
+        wp.launch(fill_float_kernel, dim=sim.activation.shape[0],
+                  inputs=[sim.activation, float(acti)])
         sim.step()
         sim.step_cnt = step
         sim.render()
@@ -110,7 +115,7 @@ def _run_auto(sim, anim, cfg, args, frame_at):
         if step % 50 == 0 or step == 1:
             pos_np = sim.pos.numpy()
             centroid = pos_np.mean(axis=0)
-            log.info(f"step={step:4d}  frame={f_idx:3d}  "
+            log.info(f"step={step:4d}  frame={f_idx:3d}  acti={acti:.2f}  "
                      f"centroid=({centroid[0]:.3f}, {centroid[1]:.3f}, {centroid[2]:.3f})  "
                      f"vol_err={sim.calc_vol_error():.4f}")
 
@@ -120,12 +125,14 @@ def _run_auto(sim, anim, cfg, args, frame_at):
 
 
 def _run_interactive(sim, anim, cfg, args, frame_at):
-    wp.launch(fill_float_kernel, dim=sim.activation.shape[0],
-              inputs=[sim.activation, float(args.activation)])
     step = 0
     while step < cfg.nsteps:
         f_idx = frame_at(step)
         _drive_one_step(sim, anim, f_idx)
+        acti = (args.activation if args.activation is not None
+                else activation_ramp(step / max(cfg.nsteps, 1)))
+        wp.launch(fill_float_kernel, dim=sim.activation.shape[0],
+                  inputs=[sim.activation, float(acti)])
         sim.step()
         sim.step_cnt = step
         sim.render()

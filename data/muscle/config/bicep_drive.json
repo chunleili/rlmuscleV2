@@ -44,6 +44,12 @@
       "dampingratio": 0.1
     },
     {
+      "type": "fiber",
+      "name": "tetfibernorm",
+      "stiffness": 10000000000.0,
+      "dampingratio": 0.1
+    },
+    {
       "type": "attach",
       "name": "muscleToBonesAttach",
       "mask_name": "muscletobonemask",
