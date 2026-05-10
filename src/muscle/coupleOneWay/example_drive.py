@@ -60,7 +60,11 @@ def main():
     if render_mode == "human" and not args.auto:
         cfg.nsteps = 1_000_000
 
-    sim = MuscleSim(cfg)
+    if getattr(cfg, "coarse_geo_path", None):
+        from muscle.coarse_solver import MultigridMuscleSim
+        sim = MultigridMuscleSim(cfg)
+    else:
+        sim = MuscleSim(cfg)
     log.info(f"n_verts={sim.n_verts}, n_bone_pts={sim.bone_pos.shape[0]}, "
              f"render={render_mode}")
 

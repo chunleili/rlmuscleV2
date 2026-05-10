@@ -2608,8 +2608,29 @@ class MuscleSim(MuscleSimBase):
         offset, count = rng
         if count <= 0:
             return
+        if not getattr(self, "_pintotarget_stopped_marked", False):
+            self._mark_pintotarget_stopped()
+            self._pintotarget_stopped_marked = True
         wp.launch(solve_pintotarget_kernel, dim=count,
                   inputs=[self.cons, self.pos, offset])
+
+    def _mark_pintotarget_stopped(self):
+        """Mark all pintotarget source verts as `stopped=1`.
+
+        Effect: integrate_kernel skips them (no velocity, no pos drift), and
+        constraint solvers see inv_mass=0 (they act as kinematic anchors).
+        Position is then driven *only* by solve_pintotarget_kernel each substep.
+        Without this, apply_pintotarget creates huge artificial velocities
+        (pinned vert jumps several cm per substep) which integrate then over-
+        shoots — fatal under GMG (restrict feeds the overshoot into coarse).
+        """
+        src_idx = np.array([c["pts"][0] for c in self.pintotarget_constraints],
+                           dtype=np.int32)
+        if src_idx.size == 0:
+            return
+        stopped_np = self.stopped.numpy()
+        stopped_np[src_idx] = 1
+        self.stopped = wp.from_numpy(stopped_np, dtype=wp.int32)
 
     def _dispatch_constraints(self, type_ranges):
         """Dispatch constraint solver kernels for a given {type: (offset, count)} mapping."""
