@@ -131,6 +131,116 @@ def _load_mesh_usd(path: Path, y_up_to_z_up: bool = False, prim_path: str = None
     return positions, tets, fibers, tendon_mask, geo
 
 
+def _load_mesh_usd_multi(path: Path, prim_root: str):
+    """Load every UsdGeom.TetMesh under *prim_root* and concatenate into one mesh.
+
+    Each TetMesh contributes its own vertices (transformed to world space),
+    tet indices (offset to the merged vertex range) and per-vertex primvars
+    (concatenated; missing per-muscle primvars are zero-padded so the merged
+    array length matches total verts).
+
+    Vector primvars whose name is ``materialW`` are rotated by the prim's
+    local-to-world rotation; other primvars are concatenated as-is.
+    """
+    from pxr import Usd, UsdGeom
+
+    stage = Usd.Stage.Open(str(path))
+    if stage is None:
+        raise FileNotFoundError(f"Cannot open USD: {path}")
+    root = stage.GetPrimAtPath(prim_root)
+    if not root or not root.IsValid():
+        raise ValueError(f"Prim root {prim_root} not in {path}")
+
+    rest_t = stage.GetStartTimeCode()
+    if rest_t == Usd.TimeCode.Default().GetValue():
+        rest_t = 1.0
+    xcache = UsdGeom.XformCache(rest_t)
+
+    all_pos: list[np.ndarray] = []
+    all_tets: list[np.ndarray] = []
+    pv_segments: dict[str, list[tuple[int, np.ndarray]]] = {}  # name -> [(seg_idx, arr)]
+    seg_lens: list[int] = []
+    seg_idx = 0
+    offset = 0
+    n_loaded = 0
+
+    for prim in Usd.PrimRange(root):
+        if not prim.IsA(UsdGeom.TetMesh):
+            continue
+        tm = UsdGeom.TetMesh(prim)
+        pts_raw = tm.GetPointsAttr().Get()
+        tets_raw = tm.GetTetVertexIndicesAttr().Get()
+        if pts_raw is None or tets_raw is None:
+            continue
+        pts_local = np.asarray(pts_raw, dtype=np.float32)
+        tets_local = np.asarray(tets_raw, dtype=np.int32).reshape(-1, 4)
+
+        wm = xcache.GetLocalToWorldTransform(prim)
+        R = np.array([[wm[i][j] for j in range(3)] for i in range(3)], dtype=np.float32)
+        T = np.array([wm[3][j] for j in range(3)], dtype=np.float32)
+        pts_world = (pts_local @ R + T).astype(np.float32)
+
+        n_pts = len(pts_world)
+        all_pos.append(pts_world)
+        all_tets.append((tets_local + offset).astype(np.int32))
+
+        pv_api = UsdGeom.PrimvarsAPI(prim)
+        for pv in pv_api.GetPrimvars():
+            if pv.GetInterpolation() != "vertex":
+                continue
+            val = pv.Get()
+            if val is None:
+                continue
+            arr = np.asarray(val)
+            if arr.ndim not in (1, 2):
+                continue
+            if arr.shape[0] != n_pts:
+                continue  # length mismatch — ignore quietly
+            name = pv.GetName().replace("primvars:", "")
+            if name == "materialW" and arr.ndim == 2 and arr.shape[1] == 3:
+                arr = (arr.astype(np.float32) @ R).astype(arr.dtype)
+            pv_segments.setdefault(name, []).append((seg_idx, arr))
+
+        seg_lens.append(n_pts)
+        offset += n_pts
+        seg_idx += 1
+        n_loaded += 1
+
+    if n_loaded == 0:
+        raise ValueError(f"No TetMesh prims found under {prim_root}")
+
+    positions = np.vstack(all_pos).astype(np.float32)
+    tets = np.vstack(all_tets).astype(np.int32)
+    total_v = positions.shape[0]
+
+    geo = SimpleNamespace()
+    geo.positions = positions.tolist()
+    geo.vert = tets.tolist()
+    geo.pointattr = {}
+
+    fibers = None
+    tendon_mask = None
+    for name, segs in pv_segments.items():
+        sample = segs[0][1]
+        if sample.ndim == 1:
+            full = np.zeros((total_v,), dtype=sample.dtype)
+        else:
+            full = np.zeros((total_v, sample.shape[1]), dtype=sample.dtype)
+        for s_idx, arr in segs:
+            start = sum(seg_lens[:s_idx])
+            full[start:start + seg_lens[s_idx]] = arr
+        setattr(geo, name, full.tolist())
+        geo.pointattr[name] = full.tolist()
+        if name == "materialW":
+            fibers = full.astype(np.float32)
+        elif name == "tendonmask":
+            tendon_mask = full.astype(np.float32)
+
+    print(f"Loaded {n_loaded} TetMesh prims under {prim_root}: "
+          f"{total_v} verts, {tets.shape[0]} tets")
+    return positions, tets, fibers, tendon_mask, geo
+
+
 def _load_bone_usd(usd_path: Path, bone_root: str = "/character/bone"):
     """Load bone mesh from USD (multiple Mesh prims under *bone_root*).
 
@@ -208,14 +318,21 @@ def _build_muscle_id_mapping(muscle_ids_list):
 # Public API
 # ---------------------------------------------------------------------------
 
-def load_mesh(path: Path, prim_path: str = None):
-    """Load muscle TetMesh from USD.
+def load_mesh(path: Path, prim_path: str = None, prim_root: str = None):
+    """Load muscle TetMesh(es) from USD.
 
-    Returns (positions, tets, fibers, tendon_mask, geo). If *prim_path* is
-    given, only that prim is loaded; otherwise the first TetMesh in the stage.
+    Returns (positions, tets, fibers, tendon_mask, geo).
+
+    - If *prim_root* is given, every TetMesh under that prim is loaded and
+      concatenated into one merged mesh (vertices in world space, tet
+      indices offset; per-vertex primvars stitched together).
+    - Else if *prim_path* is given, only that single TetMesh is loaded.
+    - Else the first TetMesh in the stage is loaded.
     """
     if path is None:
         raise ValueError("No mesh path provided.")
+    if prim_root:
+        return _load_mesh_usd_multi(path, prim_root=prim_root)
     return _load_mesh_usd(path, y_up_to_z_up=False, prim_path=prim_path)
 
 
