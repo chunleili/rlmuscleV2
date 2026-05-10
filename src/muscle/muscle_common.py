@@ -198,6 +198,11 @@ class MuscleSimBase(ConstraintBuilderMixin):
             self.post_smooth()
             self.freeze_near_inverted()
             self.repair_inverted_tets()
+            # Hard pin runs LAST so nothing can undo the snap (matches
+            # realtimeMuscle's pintotarget behavior). Velocity update below
+            # then reflects pinned pos vs old_pos so verts inherit bone vel.
+            if hasattr(self, "apply_pintotarget"):
+                self.apply_pintotarget()
             self.update_velocities()
 
     def get_fps(self):

@@ -5,7 +5,7 @@ import warp as wp
 import warp.render
 
 from muscle.constraints import (
-    PIN, ATTACH, TETVOLUME, TETFIBERNORM, DISTANCELINE,
+    PIN, ATTACH, PINTOTARGET, TETVOLUME, TETFIBERNORM, DISTANCELINE,
     TETARAP, TETARAPNORM, TETFIBERDGF, TETSNH, TETFIBERMILLARD,
     LINEARENERGY, NORMSTIFFNESS,
 )
@@ -1339,6 +1339,12 @@ def update_attach_targets_kernel(
             target_pos = bone_pos_field[tgt_idx]
             rv = cons[c].restvector
             cons[c].restvector = wp.vec4f(target_pos[0], target_pos[1], target_pos[2], rv[3])
+    elif ctype == PINTOTARGET:
+        tgt_idx = cons[c].pts[2]
+        if tgt_idx >= 0:
+            target_pos = bone_pos_field[tgt_idx]
+            rv = cons[c].restvector
+            cons[c].restvector = wp.vec4f(target_pos[0], target_pos[1], target_pos[2], rv[3])
 
 
 # ---------------------------------------------------------------------------
@@ -1713,6 +1719,29 @@ def solve_pin_kernel(
         pos, pprev, dP, dPw, mass, stopped,
         cons[c].restlength, cstiffness, cons[c].dampingratio,
         kstiffcompress, dt, has_compress_stiffness)
+
+
+@wp.kernel
+def solve_pintotarget_kernel(
+    cons: wp.array(dtype=Constraint),
+    pos: wp.array(dtype=wp.vec3),
+    offset: int,
+):
+    """Hard pin: pos[src] = bone_target + rest_offset (no XPBD, direct overwrite).
+
+    restvector = live bone_pos[tgt] (refreshed by update_attach_targets_kernel).
+    restdir    = rest_offset = pos0[src] - bone_pos0[tgt] (captured at build).
+    Each src appears in at most one pintotarget constraint, so the parallel
+    overwrites do not race.
+    """
+    c = offset + wp.tid()
+    pts = cons[c].pts
+    pt_src = pts[0]
+    if pt_src < 0:
+        return
+    rv = cons[c].restvector
+    rd = cons[c].restdir
+    pos[pt_src] = wp.vec3(rv[0] + rd[0], rv[1] + rd[1], rv[2] + rd[2])
 
 
 @wp.kernel
@@ -2432,9 +2461,12 @@ class MuscleSim(MuscleSimBase):
             hasattr(self, "bone_pos_field")
             and self.bone_pos_field is not None
             and self.bone_pos_field.shape[0] > 0
-            and hasattr(self, "attach_constraints")
-            and len(self.attach_constraints) > 0
             and self.n_cons > 0
+            and (
+                len(getattr(self, "attach_constraints", []) or []) > 0
+                or len(getattr(self, "pintotarget_constraints", []) or []) > 0
+                or len(getattr(self, "distanceline_constraints", []) or []) > 0
+            )
         ):
             wp.launch(update_attach_targets_kernel, dim=self.n_cons,
                       inputs=[self.cons, self.bone_pos_field, self.n_cons])
@@ -2562,6 +2594,23 @@ class MuscleSim(MuscleSimBase):
         wp.launch(apply_dP_kernel, dim=self.n_verts,
                   inputs=[self.pos, self.dP, self.dPw])
 
+    def apply_pintotarget(self):
+        """Hard pin pass: directly snap pinned source verts to bone target.
+
+        Runs AFTER apply_dP so the snap is final — apply_dP would otherwise
+        add accumulated Jacobi deltas on top and undo the pin (NaN on GPU).
+        """
+        if not getattr(self, "pintotarget_constraints", None):
+            return
+        rng = self.cons_ranges.get(PINTOTARGET) if hasattr(self, "cons_ranges") else None
+        if rng is None:
+            return
+        offset, count = rng
+        if count <= 0:
+            return
+        wp.launch(solve_pintotarget_kernel, dim=count,
+                  inputs=[self.cons, self.pos, offset])
+
     def _dispatch_constraints(self, type_ranges):
         """Dispatch constraint solver kernels for a given {type: (offset, count)} mapping."""
         has_compress = 1 if self.has_compressstiffness else 0
@@ -2592,6 +2641,11 @@ class MuscleSim(MuscleSimBase):
                     self.cons, self.pos, self.pprev,
                     self.dP, self.dPw, self.mass, self.stopped,
                     self.dt, use_jacobi_int, has_compress, offset])
+            elif ctype == PINTOTARGET:
+                # Skipped here — pintotarget is a kinematic post-pass run by
+                # apply_pintotarget() AFTER apply_dP, so Jacobi accumulation
+                # cannot undo the snap.
+                continue
             elif ctype == DISTANCELINE:
                 wp.launch(solve_distanceline_kernel, dim=count, inputs=[
                     self.cons, self.pos, self.pprev,
@@ -2683,6 +2737,7 @@ class MuscleSim(MuscleSimBase):
             self._dispatch_constraints(self._smooth_ranges)
             if self.use_jacobi:
                 self.apply_dP()
+            self.apply_pintotarget()
         self.use_jacobi = saved_jacobi
 
     def freeze_near_inverted(self):
