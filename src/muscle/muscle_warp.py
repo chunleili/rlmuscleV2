@@ -490,13 +490,18 @@ def tet_volume_update_xpbd_fn(
     p2 = pos[pts[2]]
     p3 = pos[pts[3]]
 
-    d1 = p1 - p0
-    d2 = p2 - p0
-    d3 = p3 - p0
-    grad1 = wp.cross(d3, d2) / 6.0
-    grad2 = wp.cross(d1, d3) / 6.0
-    grad3 = wp.cross(d2, d1) / 6.0
-    grad0 = -(grad1 + grad2 + grad3)
+    # pts[3] is the reference vertex (matches precompute_rest_kernel and
+    # the ARAP/fiber kernels). With d_k = p_k - p_3 for k=0,1,2,
+    # signed volume V = det[d_0 | d_1 | d_2] / 6, so the per-vertex gradients
+    # follow from d/dd_k det = (cross of the other two), and the reference
+    # vertex grad_3 = -(grad_0 + grad_1 + grad_2).
+    d0 = p0 - p3
+    d1 = p1 - p3
+    d2 = p2 - p3
+    grad0 = wp.cross(d1, d2) / 6.0
+    grad1 = wp.cross(d2, d0) / 6.0
+    grad2 = wp.cross(d0, d1) / 6.0
+    grad3 = -(grad0 + grad1 + grad2)
 
     w_sum = (inv_mass0 * wp.length_sq(grad0) +
              inv_mass1 * wp.length_sq(grad1) +
@@ -504,7 +509,7 @@ def tet_volume_update_xpbd_fn(
              inv_mass3 * wp.length_sq(grad3))
 
     if w_sum > 1e-9:
-        volume = wp.dot(wp.cross(d2, d1), d3) / 6.0
+        volume = wp.dot(wp.cross(d0, d1), d2) / 6.0
 
         comp = 0
         if has_compress_stiffness != 0:
