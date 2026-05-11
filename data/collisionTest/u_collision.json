@@ -1,0 +1,42 @@
+{
+  "metainfo": {
+    "description": "U-shape mesh falling under gravity onto a static horizontal plane. Tests both muscle↔plane collision and muscle↔muscle self-collision when the two arms of the U fold together on impact. No bones, no activation, no pintotarget — collision is the only constraint actively shaping the motion (plus volume/ARAP to keep the tet mesh from blowing up).",
+    "used_by": ["src/muscle/collision/example_u_collision.py"],
+    "created": "2026-05-10"
+  },
+  "name": "u_collision",
+  "geo_path": "data/collisionTest/U.geo",
+  "dt": 0.016666666666666666,
+  "nsteps": 240,
+  "num_substeps": 20,
+  "gravity_z": -9.8,
+  "density": 1060.0,
+  "veldamping": 0.002,
+  "arch": "cpu",
+  "render_mode": "usd",
+  "output_path": "output/u_collision.usd",
+  "render_fps": 24,
+
+  "collision": {
+    "use_collision": true,
+    "use_self_collision": true,
+    "plane": {
+      "drop_height": 0.5,
+      "half_extent": 1.5,
+      "subdiv": 8
+    },
+    "max_pairs": 65536,
+    "thickness": 0.01,
+    "cell_size": null,
+    "log_every": 10,
+    "restitution_n": 0.9,
+    "restitution_t": 0.2,
+    "coll_iters": 4,
+    "coll_mode": "jacobi"
+  },
+
+  "constraints": [
+    {"type": "volume",  "name": "volume",  "stiffness": 1000.0, "dampingratio": 0.2},
+    {"type": "tetarap", "name": "tetarap", "stiffness": 1000.0, "dampingratio": 0.2}
+  ]
+}
