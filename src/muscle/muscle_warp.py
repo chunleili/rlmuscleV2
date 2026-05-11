@@ -1,18 +1,36 @@
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 import warp as wp
 import warp.render
 
+from muscle.config import SimConfig
 from muscle.constraints import (
     PIN, ATTACH, PINTOTARGET, TETVOLUME, TETFIBERNORM, DISTANCELINE,
     TETARAP, TETARAPNORM, TETFIBERDGF, TETSNH, TETFIBERMILLARD,
     LINEARENERGY, NORMSTIFFNESS,
+    ConstraintBuilderMixin,
 )
-from muscle.mesh_io import build_surface_tris
-from muscle.muscle_common import MuscleSimBase
+from muscle.mesh_io import build_surface_tris, load_mesh, load_bone_mesh
 from muscle.vis_warp import WarpRenderer
+
+
+def activation_ramp(t: float) -> float:
+    """Piecewise activation over normalized time [0,1]: 0→0.5→1.0→0.7→0.3→0."""
+    if t <= 0.2:
+        return 0.0
+    elif t <= 0.3:
+        return 0.5
+    elif t <= 0.5:
+        return 1.0
+    elif t <= 0.7:
+        return 0.7
+    elif t <= 0.8:
+        return 0.3
+    else:
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -1147,6 +1165,38 @@ def update_velocities_kernel(
 
 
 @wp.kernel
+def update_velocities_with_contact_kernel(
+    pos: wp.array(dtype=wp.vec3),
+    pprev: wp.array(dtype=wp.vec3),
+    vel: wp.array(dtype=wp.vec3),
+    dt: float,
+    is_collide: wp.array(dtype=wp.int32),
+    contact_normal: wp.array(dtype=wp.vec3),
+    restitution_n: float,
+    restitution_t: float,
+):
+    i = wp.tid()
+    v = (pos[i] - pprev[i]) / dt
+    if is_collide[i] == 0:
+        vel[i] = v
+        return
+    n = contact_normal[i]
+    n_sq = wp.dot(n, n)
+    if n_sq < 1.0e-12:
+        vel[i] = v
+        return
+    n_hat = n / wp.sqrt(n_sq)
+    vn = wp.dot(v, n_hat)
+    v_t = v - vn * n_hat
+    if vn < 0.0:
+        vn_new = -restitution_n * vn
+    else:
+        vn_new = vn
+    v_t_new = restitution_t * v_t
+    vel[i] = vn_new * n_hat + v_t_new
+
+
+@wp.kernel
 def lbs_apply_kernel(
     pos: wp.array(dtype=wp.vec3),
     pos0: wp.array(dtype=wp.vec3),
@@ -2013,7 +2063,136 @@ def solve_tetsnh_kernel(
 # MuscleSim (Warp backend)
 # ---------------------------------------------------------------------------
 
-class MuscleSim(MuscleSimBase):
+class MuscleSim(ConstraintBuilderMixin):
+    """Warp-backed muscle simulator.
+
+    Holds init + a hook-free step loop alongside all Warp kernels.
+    Bone-coupled scenarios (LBS predictor → constraint corrector) compose
+    their own per-substep loop using the public methods (integrate,
+    solve_constraints, …) — see coupleOneWay/example_drive.py.
+    """
+
+    def __init__(self, cfg: SimConfig):
+        self.cfg = cfg
+        self._init_backend()
+
+        self.constraint_configs = self.cfg.constraints if self.cfg.constraints else []
+
+        print("Loading mesh from:", cfg.geo_path)
+        mesh_data = load_mesh(
+            cfg.geo_path,
+            prim_path=getattr(cfg, "geo_prim_path", None),
+            prim_root=getattr(cfg, "geo_prim_root", None),
+        )
+        self.pos0_np, self.tet_np, self.v_fiber_np, self.v_tendonmask_np, self.geo = mesh_data
+        self.n_verts = self.pos0_np.shape[0]
+        print(f"Loaded mesh: {self.n_verts} vertices, {self.tet_np.shape[0]} tetrahedra.")
+
+        print("Loading bone mesh:", cfg.bone_geo_path)
+        self._load_bone(cfg.bone_geo_path)
+
+        print("Allocating&initializing fields...")
+        self._allocate_fields()
+        self._init_fields()
+        self._precompute_rest()
+        self._build_surface_tris()
+        # GPU parallelism: auto-enable Jacobi to avoid race conditions on CUDA
+        is_gpu = self.pos.device.is_cuda
+        self.use_jacobi = getattr(self.cfg, 'use_jacobi', is_gpu)
+        self.use_colored_gs = getattr(self.cfg, 'use_colored_gs', False)
+        self.build_constraints()
+        self.contraction_ratio = getattr(self.cfg, 'contraction_ratio', 0.4)
+        self.fiber_stiffness_scale = getattr(self.cfg, 'fiber_stiffness_scale', 10000.0)
+        self.has_compressstiffness = getattr(self.cfg, 'HAS_compressstiffness', False)
+        self.dt = self.cfg.dt / self.cfg.num_substeps
+        self.step_cnt = 0
+
+        self._init_renderer()
+        print("All initialization done.")
+
+    def _load_bone(self, target_path):
+        """Load bone mesh data and create GPU fields."""
+        if Path(target_path).exists():
+            bone_root = getattr(self.cfg, "bone_root", "/character/bone")
+            self.bone_geo, self.bone_pos, self.bone_indices_np, self.bone_muscle_ids = \
+                load_bone_mesh(target_path, bone_root=bone_root)
+            self._create_bone_fields()
+        else:
+            self.bone_geo = None
+            self.bone_pos = np.zeros((0, 3), dtype=np.float32)
+            self.bone_indices_np = np.zeros(0, dtype=np.int32)
+            self.bone_muscle_ids = {}
+
+    def load_bone_geo(self, target_path):
+        """Return (bone_geo, bone_pos). Loads once, then returns cached data."""
+        if not hasattr(self, 'bone_pos'):
+            self._load_bone(target_path)
+        return self.bone_geo, self.bone_pos
+
+    def step(self):
+        """Run one frame. Standalone (no bone coupling) substep loop."""
+        self.update_attach_targets()
+        debug_per_sub = bool(getattr(self.cfg, "debug_per_substep", False))
+        n_sub = self.cfg.num_substeps
+        for sub_i in range(n_sub):
+            self.clear_forces()
+            self.accumulate_active_fiber_force()
+            self.integrate()
+            # Hard-pin snap before solve so ARAP/vol see kinematic verts at
+            # their new bone-driven position.
+            if hasattr(self, "apply_pintotarget"):
+                self.apply_pintotarget()
+            self.clear()
+            self.solve_constraints(run_extras=False)
+            if self.use_jacobi:
+                self.apply_dP()
+            # Extras (collision) AFTER apply_dP — see _capturable_substep.
+            self.solve_extras()
+            self.post_smooth()
+            self.freeze_near_inverted()
+            self.repair_inverted_tets()
+            if hasattr(self, "apply_pintotarget"):
+                self.apply_pintotarget()
+            self.update_velocities()
+            if debug_per_sub:
+                self._debug_check_substep(sub_i, n_sub)
+
+    def _debug_check_substep(self, sub_i, n_sub):
+        """Per-substep mesh-quality + state logging. cfg.debug_per_substep."""
+        import logging
+        from muscle.couple.mesh_utils import (
+            check_mesh_quality, MeshDistortionError,
+        )
+        log = logging.getLogger(__name__)
+        pos_np = self.pos.numpy()
+        # rest_matrix was built against tet_np[:, [3,0,1,2]] ordering — reuse
+        # so det(F) here matches the solver's internal F.
+        tet_idx = self.tet_np[:, [3, 0, 1, 2]]
+        tet_poses = self.rest_matrix.numpy()
+        step_id = getattr(self, "step_cnt", -1)
+        tag = f"step={step_id} sub={sub_i + 1}/{n_sub}"
+        try:
+            detF = check_mesh_quality(pos_np, tet_idx, tet_poses, step=None)
+            detF_lo = float(detF.min())
+            detF_hi = float(detF.max())
+        except MeshDistortionError as exc:
+            log.error(f"{tag} MeshDistortionError: {exc}")
+            return
+        centroid = pos_np.mean(axis=0)
+        try:
+            vol_err = float(self.calc_vol_error())
+        except Exception:
+            vol_err = float("nan")
+        log.info(
+            f"{tag}  centroid=({centroid[0]:+.4f},{centroid[1]:+.4f},{centroid[2]:+.4f})  "
+            f"vol_err={vol_err:+.4f}  detF=[{detF_lo:.4f},{detF_hi:.4f}]"
+        )
+
+    def get_fps(self):
+        if not hasattr(self, 'step_start_time') or not hasattr(self, 'step_end_time'):
+            return 0.0
+        dur = self.step_end_time - self.step_start_time
+        return 1.0 / dur if dur != 0 else 0.0
 
     @classmethod
     def from_procedural(cls, vertices, tets, fiber_dirs_per_tet,
@@ -2559,8 +2738,17 @@ class MuscleSim(MuscleSimBase):
         return (-forces.sum(axis=0)).astype(np.float32)
 
     def update_velocities(self):
-        wp.launch(update_velocities_kernel, dim=self.n_verts,
-                  inputs=[self.pos, self.pprev, self.vel, self.dt])
+        is_collide = getattr(self, "is_collide", None)
+        contact_normal = getattr(self, "contact_normal", None)
+        if is_collide is None or contact_normal is None:
+            wp.launch(update_velocities_kernel, dim=self.n_verts,
+                      inputs=[self.pos, self.pprev, self.vel, self.dt])
+            return
+        rn = float(getattr(self, "restitution_n", 0.0))
+        rt = float(getattr(self, "restitution_t", 1.0))
+        wp.launch(update_velocities_with_contact_kernel, dim=self.n_verts,
+                  inputs=[self.pos, self.pprev, self.vel, self.dt,
+                          is_collide, contact_normal, rn, rt])
 
     def set_lbs_T_rel(self, T_rel_flat_np):
         """Upload (n_bones * 12,) float32 row-major T_rel buffer to GPU.
@@ -2764,14 +2952,45 @@ class MuscleSim(MuscleSimBase):
                     self.rest_matrix,
                     self.dt, use_jacobi_int, offset])
 
-    def solve_constraints(self):
-        if self.n_cons == 0:
+    def solve_constraints(self, run_extras: bool = True):
+        """Dispatch built-in constraints; optionally also run registered
+        ``constraint_solvers`` extras.
+
+        ``run_extras=False`` is used when the caller wants the extras
+        (typically collision) to run AFTER ``apply_dP`` so they push against
+        the post-ARAP geometry rather than competing with the stale
+        pre-solve gradient. The caller should follow up with
+        ``solve_extras()``.
+        """
+        extras = getattr(self, "constraint_solvers", None)
+        if self.n_cons == 0 and (not run_extras or not extras):
             return
-        if self.use_colored_gs and hasattr(self, 'color_type_ranges'):
-            for type_ranges in self.color_type_ranges:
-                self._dispatch_constraints(type_ranges)
-        else:
-            self._dispatch_constraints(self.cons_ranges)
+        if self.n_cons > 0:
+            if self.use_colored_gs and hasattr(self, 'color_type_ranges'):
+                for type_ranges in self.color_type_ranges:
+                    self._dispatch_constraints(type_ranges)
+            else:
+                self._dispatch_constraints(self.cons_ranges)
+        if run_extras and extras:
+            for fn in extras:
+                fn()
+            if not self.use_jacobi:
+                self.apply_dP()
+
+    def solve_extras(self):
+        """Run only the registered ``constraint_solvers`` (e.g., collision).
+        Intended to be called AFTER ``apply_dP`` so extras see post-ARAP
+        positions. In GS mode (``use_jacobi=False``) the built-in path's
+        apply_dP has already been invoked by the caller, so here we just
+        run extras and (for GS) flush any extras-generated dP again.
+        """
+        extras = getattr(self, "constraint_solvers", None)
+        if not extras:
+            return
+        for fn in extras:
+            fn()
+        if not self.use_jacobi:
+            self.apply_dP()
 
     # Fiber constraint types to exclude during post-smoothing
     _FIBER_TYPES = frozenset([TETFIBERNORM, TETFIBERDGF, TETFIBERMILLARD])
@@ -2838,17 +3057,21 @@ class MuscleSim(MuscleSimBase):
         post_smooth_iters, etc.) are resolved at capture time.
         """
         self.clear_forces()
-        self.accumulate_active_fiber_force()
+        # self.accumulate_active_fiber_force()
         self.integrate()
         self.clear()
         self.update_attach_targets()
-        self.clear_reaction()
-        self.solve_constraints()
+        # self.clear_reaction()
+        self.solve_constraints(run_extras=False)
         if self.use_jacobi:
             self.apply_dP()
+        # Extras (collision) AFTER apply_dP so ARAP/volume settles first;
+        # otherwise the stale pre-solve ARAP gradient gets added on top of
+        # the collision push and pulls penetrated verts back inward.
+        self.solve_extras()
         self.post_smooth()
-        self.freeze_near_inverted()
-        self.repair_inverted_tets()
+        # self.freeze_near_inverted()
+        # self.repair_inverted_tets()
         self.update_velocities()
 
     def render(self):

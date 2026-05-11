@@ -32,8 +32,7 @@ from muscle.couple.controllability import (
     run_eval_sweep,
 )
 from muscle.couple.mesh_utils import MeshDistortionError, check_mesh_quality
-from muscle.muscle_common import activation_ramp
-from muscle.muscle_warp import MuscleSim
+from muscle.muscle_warp import MuscleSim, activation_ramp
 from muscle.couple.solver_muscle_bone_coupled_warp import SolverMuscleBoneCoupled
 from muscle.couple.usd_io import UsdIO, build_bone_prim_map
 

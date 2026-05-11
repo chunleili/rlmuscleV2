@@ -23,8 +23,7 @@ from muscle.config import load_config
 from muscle.coupleOneWay.bone_anim import BoneAnimation
 from muscle.coupleOneWay.lbs_skin import LBSDriver
 from muscle.log import setup_logging
-from muscle.muscle_common import activation_ramp
-from muscle.muscle_warp import MuscleSim, fill_float_kernel
+from muscle.muscle_warp import MuscleSim, activation_ramp, fill_float_kernel
 
 log = logging.getLogger(__name__)
 
@@ -117,7 +116,7 @@ def main():
         log.info(f"LBS enabled: blend={lbs_blend} "
                  f"(only={args.lbs_only}, cache={cache_path})")
 
-    # Sanity: anim layout must match what muscle_common loaded.
+    # Sanity: anim layout must match what MuscleSim loaded.
     if anim.bone_pos_rest.shape != sim.bone_pos.shape:
         raise RuntimeError(
             f"BoneAnimation layout mismatch: anim={anim.bone_pos_rest.shape} "
@@ -201,6 +200,38 @@ def _make_substep_hooks(sim, anim, cfg, step_index: int, lbs, lbs_blend: float):
     return pre, post
 
 
+def _step_with_bone_hooks(sim, pre, post):
+    """One frame with bone-anim pre-substep + (optional) LBS post-integrate.
+
+    This is the LBS-predictor → constraint-corrector flow: pre() advances the
+    bone target each substep, post() (if given) overwrites pos with an LBS
+    skin so the solver corrects from a bone-driven shape rather than inertia.
+    """
+    debug_per_sub = bool(getattr(sim.cfg, "debug_per_substep", False))
+    n_sub = sim.cfg.num_substeps
+    for sub_i in range(n_sub):
+        pre(sub_i, n_sub)
+        sim.clear_forces()
+        sim.accumulate_active_fiber_force()
+        sim.integrate()
+        if post is not None:
+            post(sub_i, n_sub)
+        if hasattr(sim, "apply_pintotarget"):
+            sim.apply_pintotarget()
+        sim.clear()
+        sim.solve_constraints()
+        if sim.use_jacobi:
+            sim.apply_dP()
+        sim.post_smooth()
+        sim.freeze_near_inverted()
+        sim.repair_inverted_tets()
+        if hasattr(sim, "apply_pintotarget"):
+            sim.apply_pintotarget()
+        sim.update_velocities()
+        if debug_per_sub:
+            sim._debug_check_substep(sub_i, n_sub)
+
+
 def _run_auto(sim, anim, cfg, args, frame_at, render_stride=1, lbs=None, lbs_blend=0.0):
     mode = "ramp" if args.activation is None else f"const={args.activation}"
     log.info(f"Running {cfg.nsteps} steps (auto, render={cfg.render_mode}, "
@@ -214,7 +245,7 @@ def _run_auto(sim, anim, cfg, args, frame_at, render_stride=1, lbs=None, lbs_ble
                   inputs=[sim.activation, float(acti)])
         sim.step_cnt = step
         pre, post = _make_substep_hooks(sim, anim, cfg, step, lbs, lbs_blend)
-        sim.step(pre_substep_hook=pre, post_integrate_hook=post)
+        _step_with_bone_hooks(sim, pre, post)
         if step % render_stride == 0:
             # Stamp USD at motion-frame time (step/stride * dt) so playback
             # matches original motion fps regardless of bone_speed_scale.
@@ -275,7 +306,7 @@ def _run_interactive(sim, anim, cfg, args, frame_at, render_stride=1, lbs=None, 
                   inputs=[sim.activation, float(acti)])
         sim.step_cnt = step + 1
         pre, post = _make_substep_hooks(sim, anim, cfg, step + 1, lbs, lbs_blend)
-        sim.step(pre_substep_hook=pre, post_integrate_hook=post)
+        _step_with_bone_hooks(sim, pre, post)
         if (step + 1) % render_stride == 0:
             saved = sim.step_cnt
             sim.step_cnt = (step + 1) // render_stride
