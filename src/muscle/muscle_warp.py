@@ -2069,7 +2069,7 @@ class MuscleSim(ConstraintBuilderMixin):
     Holds init + a hook-free step loop alongside all Warp kernels.
     Bone-coupled scenarios (LBS predictor → constraint corrector) compose
     their own per-substep loop using the public methods (integrate,
-    solve_constraints, …) — see coupleOneWay/example_drive.py.
+    solve_constraints, …) — see coupleOneWay/example.py.
     """
 
     def __init__(self, cfg: SimConfig):

@@ -4,9 +4,9 @@ Default config (bicep_coupled.json) uses TETFIBERNORM constraint.
 Switch to bicep_fibermillard_coupled.json via --config to use TETFIBERMILLARD.
 
 Usage:
-    uv run python -m muscle.example_couple --auto --steps 300
-    uv run python -m muscle.example_couple --auto --render
-    uv run python -m muscle.example_couple --eval
+    uv run python -m muscle.couple.example --auto --steps 300
+    uv run python -m muscle.couple.example --auto --render
+    uv run python -m muscle.couple.example --eval
 """
 
 from __future__ import annotations
@@ -292,7 +292,7 @@ def main():
     if args.eval:
         run_eval_sweep(
             solver, sim, state, cfg, dt,
-            label="example_couple",
+            label="example",
             levels=args.eval_levels,
             hold_steps=args.eval_hold_steps,
             release_steps=args.eval_release_steps,
@@ -309,7 +309,7 @@ def main():
         usd = UsdIO(usd_source, y_up_to_z_up=False)
         usd.muscle_mesh = usd.find_mesh("muscle")
         usd.bone_meshes = usd.find_meshes("bone")
-        usd.start("output/example_couple.anim.usd", copy_usd=True)
+        usd.start("output/example.anim.usd", copy_usd=True)
         usd.set_runtime("fps", 60)
         bone_prim_map = build_bone_prim_map(usd, sim)
         muscle_surface_path = _create_muscle_surface_mesh(usd, sim)

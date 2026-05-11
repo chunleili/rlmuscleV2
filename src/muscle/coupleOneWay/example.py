@@ -6,7 +6,7 @@ by Houdini KineFX FBIK, and pushes new bone_pos into the Warp attach-target
 buffer each frame.
 
 Usage:
-    PYTHONPATH=src .venv/bin/python -m muscle.coupleOneWay.example_drive \
+    PYTHONPATH=src .venv/bin/python -m muscle.coupleOneWay.example \
         --auto --steps 1000 --device cpu
 """
 
