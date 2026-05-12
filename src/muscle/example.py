@@ -20,8 +20,8 @@ import logging
 
 import warp as wp
 
-from muscle.log import setup_logging
-from muscle.config import load_config
+from muscle.util.util import setup_logging
+from muscle.util.util import load_config
 from muscle.muscle_warp import MuscleSim, activation_ramp, fill_float_kernel
 
 log = logging.getLogger(__name__)

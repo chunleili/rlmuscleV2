@@ -19,10 +19,10 @@ import os
 import numpy as np
 import warp as wp
 
-from muscle.config import load_config
+from muscle.util.util import load_config
 from muscle.coupleOneWay.bone_anim import BoneAnimation
 from muscle.coupleOneWay.lbs_skin import LBSDriver
-from muscle.log import setup_logging
+from muscle.util.util import setup_logging
 from muscle.muscle_warp import MuscleSim, activation_ramp, fill_float_kernel
 
 log = logging.getLogger(__name__)
@@ -91,11 +91,7 @@ def main():
         cfg.output_path = out
         log.info(f"USD output: {out}")
 
-    if getattr(cfg, "coarse_geo_path", None):
-        from muscle.coarse_solver import MultigridMuscleSim
-        sim = MultigridMuscleSim(cfg)
-    else:
-        sim = MuscleSim(cfg)
+    sim = MuscleSim(cfg)
     log.info(f"n_verts={sim.n_verts}, n_bone_pts={sim.bone_pos.shape[0]}, "
              f"render={render_mode}")
 

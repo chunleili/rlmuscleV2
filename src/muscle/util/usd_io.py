@@ -17,8 +17,8 @@ if TYPE_CHECKING:
 
 import numpy as np
 
-from muscle.mesh_io import _Y_TO_Z, build_surface_tris
-from muscle.couple.mesh_utils import fix_tet_winding
+from muscle.util.mesh_io import _Y_TO_Z, build_surface_tris
+from muscle.util.mesh_utils import fix_tet_winding
 
 ColorRgb = tuple[float, float, float]
 

@@ -1,21 +1,1347 @@
+"""Muscle simulation core: constraint defs, Millard 2012 curves, Warp renderer, and MuscleSim."""
+
+from __future__ import annotations
+
+import math
 import os
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from scipy.spatial import cKDTree
 import warp as wp
 import warp.render
 
-from muscle.config import SimConfig
-from muscle.constraints import (
-    PIN, ATTACH, PINTOTARGET, TETVOLUME, TETFIBERNORM, DISTANCELINE,
-    TETARAP, TETARAPNORM, TETFIBERDGF, TETSNH, TETFIBERMILLARD,
-    LINEARENERGY, NORMSTIFFNESS,
-    ConstraintBuilderMixin,
-)
-from muscle.mesh_io import build_surface_tris, load_mesh, load_bone_mesh
-from muscle.vis_warp import WarpRenderer
+from muscle.util.util import SimConfig
+from muscle.util.mesh_io import build_surface_tris, load_mesh, load_bone_mesh
 
+
+# ===========================================================================
+# Constraints (moved from constraints.py)
+# ===========================================================================
+
+PIN           =  157323
+ATTACH        =  1650556
+PINTOTARGET   =  771624311
+TETVOLUME     =  -215389979
+TETFIBERNORM  =  -303462111
+DISTANCELINE  =  1621136047
+TETARAP       =  -92199131
+TETARAPNORM   =  -885573303
+TETFIBERDGF   =  -403562211
+TETSNH        =  -503462311
+TETFIBERMILLARD = -503662411
+
+# ARAP flags (from pbd_types.h)
+LINEARENERGY = 1 << 0
+NORMSTIFFNESS = 1 << 1
+
+
+class ConstraintBuilderMixin:
+    """Mixin providing constraint creation methods (backend-agnostic).
+
+    Requires self to have: pos0_np, tet_np, v_fiber_np, geo, cfg,
+    bone_pos, bone_muscle_ids, constraint_configs.
+    """
+
+    # -- rest matrix helpers (pure numpy) --
+
+    def _batch_compute_tet_rest_matrices(self):
+        """Batch compute rest matrices for all tets.
+        Returns cached (restmatrices, volumes, valid) tuple."""
+        if hasattr(self, '_cached_tet_rest'):
+            return self._cached_tet_rest
+        tet_pos = self.pos0_np[self.tet_np]
+        cols = tet_pos[:, :3, :] - tet_pos[:, 3:4, :]
+        M = np.transpose(cols, (0, 2, 1))
+        dets = np.linalg.det(M)
+        volumes = dets / 6.0
+        valid = np.abs(dets) > 1e-30
+        restmatrices = np.zeros_like(M)
+        if np.any(valid):
+            restmatrices[valid] = np.linalg.inv(M[valid])
+        self._cached_tet_rest = (restmatrices, volumes, valid)
+        return self._cached_tet_rest
+
+    def compute_tet_rest_matrix(self, pt0, pt1, pt2, pt3, scale=1.0):
+        p = self.pos0_np
+        M = scale * np.stack([p[pt0] - p[pt3], p[pt1] - p[pt3], p[pt2] - p[pt3]]).T
+        detM = np.linalg.det(M)
+        if detM == 0:
+            return None, 0.0
+        return np.linalg.inv(M), detM / 6.0
+
+    def compute_tet_fiber_rest_length(self, pt0, pt1, pt2, pt3):
+        restm, volume = self.compute_tet_rest_matrix(pt0, pt1, pt2, pt3, scale=1.0)
+        if restm is None:
+            return 0.0, np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        materialW = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        if self.v_fiber_np is not None:
+            w = self.v_fiber_np[pt0] + self.v_fiber_np[pt1] + self.v_fiber_np[pt2] + self.v_fiber_np[pt3]
+            norm = np.linalg.norm(w)
+            if norm > 1e-8:
+                materialW = w / norm
+        materialW = materialW @ restm.T
+        return volume, materialW
+
+    def map_pts2tets(self, tet):
+        pt2tet = {}
+        for i, tet_verts in enumerate(tet):
+            for v in tet_verts:
+                if v not in pt2tet:
+                    pt2tet[v] = []
+                pt2tet[v].append(i)
+        return pt2tet
+
+    def _normalize_group_names(self, value):
+        if value is None:
+            return None
+        if isinstance(value, (str, bytes)):
+            names = [str(value)]
+        else:
+            names = [str(item) for item in value]
+        names = [name for name in names if name]
+        return tuple(dict.fromkeys(names)) if names else None
+
+    def _get_bone_vertex_groups(self):
+        if hasattr(self, "_cached_bone_vertex_groups"):
+            return self._cached_bone_vertex_groups
+
+        group_names = np.full(self.bone_pos.shape[0], "", dtype=object)
+        for group_name, indices in getattr(self, "bone_muscle_ids", {}).items():
+            group_names[np.asarray(indices, dtype=np.int32)] = str(group_name)
+
+        self._cached_bone_vertex_groups = group_names
+        return group_names
+
+    def _resolve_target_indices(self, target_groups):
+        if target_groups is None:
+            return np.arange(self.bone_pos.shape[0], dtype=np.int32)
+
+        resolved = []
+        missing = []
+        for group_name in target_groups:
+            group_indices = getattr(self, "bone_muscle_ids", {}).get(group_name)
+            if group_indices is None:
+                missing.append(group_name)
+                continue
+            resolved.append(np.asarray(group_indices, dtype=np.int32))
+
+        if missing:
+            print(f"Warning: bone target groups not found: {missing}")
+        if not resolved:
+            return np.zeros(0, dtype=np.int32)
+
+        return np.unique(np.concatenate(resolved).astype(np.int32))
+
+    def _filter_sources_by_nearest_group(self, src_indices, src_positions, source_groups):
+        if source_groups is None or len(src_indices) == 0:
+            return src_indices, src_positions
+
+        bone_tree = cKDTree(self.bone_pos)
+        _, nearest_indices = bone_tree.query(src_positions, k=1)
+        group_lookup = self._get_bone_vertex_groups()
+        keep_mask = np.array(
+            [group_lookup[int(idx)] in source_groups for idx in nearest_indices],
+            dtype=bool,
+        )
+
+        return src_indices[keep_mask], src_positions[keep_mask]
+
+    def _query_bone_targets(self, src_indices, src_positions, params):
+        target_groups = self._normalize_group_names(params.get("target_group"))
+        source_groups = self._normalize_group_names(params.get("source_nearest_group"))
+        if params.get("source_filter_by_nearest_target_group", False) and source_groups is None:
+            source_groups = target_groups
+
+        src_indices, src_positions = self._filter_sources_by_nearest_group(
+            src_indices,
+            src_positions,
+            source_groups,
+        )
+        if len(src_indices) == 0:
+            return src_indices, src_positions, np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.int32)
+
+        target_indices = self._resolve_target_indices(target_groups)
+        if len(target_indices) == 0:
+            return np.zeros(0, dtype=np.int32), np.zeros((0, 3), dtype=np.float32), np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.int32)
+
+        target_tree = cKDTree(self.bone_pos[target_indices])
+        dists, local_target_indices = target_tree.query(src_positions, k=1)
+        tgt_indices = target_indices[np.asarray(local_target_indices, dtype=np.int32)]
+        return src_indices, src_positions, np.asarray(dists, dtype=np.float32), np.asarray(tgt_indices, dtype=np.int32)
+
+    # -- constraint creators (return list[dict] with plain lists, no ti/wp) --
+
+    def create_tet_volume_constraint(self, params):
+        stiffness = params.get('stiffness', 1e10)
+        dampingratio = params.get('dampingratio', 0.0)
+        restmatrices, volumes, valid = self._batch_compute_tet_rest_matrices()
+
+        valid_indices = np.where(valid)[0]
+        constraints = []
+        for i in valid_indices:
+            tet = self.tet_np[i]
+            c = dict(
+                type=TETVOLUME,
+                pts=[int(tet[0]), int(tet[1]), int(tet[2]), int(tet[3])],
+                stiffness=stiffness,
+                dampingratio=dampingratio,
+                compressionstiffness=-1.0,
+                tetid=int(i),
+                L=[0.0, 0.0, 0.0],
+                restlength=float(volumes[i]),
+                restvector=[0.0, 0.0, 0.0, 0.0],
+                restdir=[0.0, 0.0, 0.0],
+            )
+            constraints.append(c)
+        return constraints
+
+    def _compute_fiber_rest_data(self):
+        """Compute per-tet fiber directions transformed to material space.
+
+        Returns (materialW_transformed, volumes, valid, restmatrices) where:
+          materialW_transformed: (n_tet, 3) fiber dirs in material coords
+          volumes: (n_tet,) tet volumes
+          valid: (n_tet,) bool mask for non-degenerate tets
+          restmatrices: (n_tet, 3, 3) inverse rest matrices
+        """
+        restmatrices, volumes, valid = self._batch_compute_tet_rest_matrices()
+
+        n_tet = len(self.tet_np)
+        if self.v_fiber_np is not None:
+            fiber_verts = self.v_fiber_np[self.tet_np]
+            w = fiber_verts.sum(axis=1)
+            norms = np.linalg.norm(w, axis=1, keepdims=True)
+            default_w = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (n_tet, 1))
+            norm_ok = (norms > 1e-8).ravel()
+            materialW = default_w.copy()
+            materialW[norm_ok] = w[norm_ok] / norms[norm_ok]
+        else:
+            materialW = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (n_tet, 1))
+
+        materialW_transformed = np.einsum('nj,nkj->nk', materialW, restmatrices)
+        return materialW_transformed, volumes, valid, restmatrices
+
+    def create_tet_fiber_constraint(self, params):
+        stiffness = params.get('stiffness', 1.0)
+        dampingratio = params.get('dampingratio', 0.0)
+        materialW_transformed, volumes, valid, _ = self._compute_fiber_rest_data()
+
+        constraints = []
+        for i in range(len(self.tet_np)):
+            tet = self.tet_np[i]
+            if not valid[i]:
+                vol = 0.0
+                mw_t = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            else:
+                vol = float(volumes[i])
+                mw_t = materialW_transformed[i]
+            c = dict(
+                type=TETFIBERNORM,
+                pts=[int(tet[0]), int(tet[1]), int(tet[2]), int(tet[3])],
+                stiffness=stiffness,
+                dampingratio=dampingratio,
+                tetid=i,
+                L=[0.0, 0.0, 0.0],
+                restlength=float(vol),
+                restvector=[float(mw_t[0]), float(mw_t[1]), float(mw_t[2]), 1.0],
+                restdir=[0.0, 0.0, 0.0],
+                compressionstiffness=-1.0
+            )
+            constraints.append(c)
+        return constraints
+
+    def create_tet_fiber_dgf_constraint(self, params):
+        """DGF fiber constraint: same geometry as TETFIBERNORM, but uses DGF curves.
+
+        Extra params stored in restdir:
+          restdir[0] = sigma0 (peak isometric stress, Pa)
+          restdir[1] = contraction_factor (from DGF curve, updated per-step)
+          restdir[2] = (reserved)
+        """
+        stiffness = params.get('stiffness', 1.0)
+        dampingratio = params.get('dampingratio', 0.0)
+        sigma0 = params.get('sigma0', 300000.0)
+        contraction_factor = params.get('contraction_factor', 0.4)
+        materialW_transformed, volumes, valid, _ = self._compute_fiber_rest_data()
+
+        constraints = []
+        for i in range(len(self.tet_np)):
+            tet = self.tet_np[i]
+            if not valid[i]:
+                vol = 0.0
+                mw_t = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            else:
+                vol = float(volumes[i])
+                mw_t = materialW_transformed[i]
+            c = dict(
+                type=TETFIBERDGF,
+                pts=[int(tet[0]), int(tet[1]), int(tet[2]), int(tet[3])],
+                stiffness=stiffness,
+                dampingratio=dampingratio,
+                tetid=i,
+                L=[0.0, 0.0, 0.0],
+                restlength=float(vol),
+                restvector=[float(mw_t[0]), float(mw_t[1]), float(mw_t[2]), 1.0],
+                restdir=[float(sigma0), float(contraction_factor), 0.0],
+                compressionstiffness=-1.0
+            )
+            constraints.append(c)
+        return constraints
+
+    def create_tet_fiber_millard_constraint(self, params):
+        """Millard fiber constraint: same geometry as DGF, but uses Millard spline curves.
+
+        Extra params stored in restdir:
+          restdir[0] = sigma0 (peak isometric stress, Pa)
+          restdir[1] = contraction_factor (from Millard curve, updated per-step)
+          restdir[2] = (reserved)
+        """
+        stiffness = params.get('stiffness', 1.0)
+        dampingratio = params.get('dampingratio', 0.0)
+        sigma0 = params.get('sigma0', 300000.0)
+        contraction_factor = params.get('contraction_factor', 0.4)
+        materialW_transformed, volumes, valid, _ = self._compute_fiber_rest_data()
+
+        constraints = []
+        for i in range(len(self.tet_np)):
+            tet = self.tet_np[i]
+            if not valid[i]:
+                vol = 0.0
+                mw_t = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            else:
+                vol = float(volumes[i])
+                mw_t = materialW_transformed[i]
+            c = dict(
+                type=TETFIBERMILLARD,
+                pts=[int(tet[0]), int(tet[1]), int(tet[2]), int(tet[3])],
+                stiffness=stiffness,
+                dampingratio=dampingratio,
+                tetid=i,
+                L=[0.0, 0.0, 0.0],
+                restlength=float(vol),
+                restvector=[float(mw_t[0]), float(mw_t[1]), float(mw_t[2]), 1.0],
+                restdir=[float(sigma0), float(contraction_factor), 0.0],
+                compressionstiffness=-1.0
+            )
+            constraints.append(c)
+        return constraints
+
+    def create_tet_snh_constraint(self, params):
+        """Stable Neo-Hookean constraint (coupled deviatoric + volumetric).
+
+        Uses Macklin's XPBD SNH formulation:
+          Deviatoric: C_D = ||F||_F - sqrt(3), compliance = 1/(mu*V*dt^2)
+          Volumetric: C_H = J - alpha,         compliance = 1/(lam*V*dt^2)
+        Solved with a coupled 2x2 linear system per tet.
+
+        params:
+            mu: shear modulus (deviatoric stiffness)
+            lam: bulk modulus (volumetric stiffness)
+            dampingratio: XPBD damping ratio
+        """
+        mu = params.get('mu', 1000.0)
+        lam = params.get('lam', 10000.0)
+        dampingratio = params.get('dampingratio', 0.0)
+        restmatrices, volumes, valid = self._batch_compute_tet_rest_matrices()
+
+        valid_indices = np.where(valid)[0]
+        constraints = []
+        for i in valid_indices:
+            tet = self.tet_np[i]
+            c = dict(
+                type=TETSNH,
+                pts=[int(tet[0]), int(tet[1]), int(tet[2]), int(tet[3])],
+                stiffness=mu,
+                dampingratio=dampingratio,
+                tetid=int(i),
+                L=[0.0, 0.0, 0.0],
+                restlength=float(volumes[i]),
+                restvector=[0.0, 0.0, 0.0, 1.0],  # rotation quaternion (warm start)
+                restdir=[float(lam), 0.0, 0.0],    # restdir[0] = lambda
+                compressionstiffness=-1.0,
+            )
+            constraints.append(c)
+        return constraints
+
+    def create_attach_constraints(self, params):
+        constraints = []
+        target_path = params.get('target_path')
+        mask_name = params.get('mask_name')
+        mask_threshold = params.get('mask_threshold', 0.75)
+        stiffness = params.get('stiffness', 1e10)
+        dampingratio = params.get('dampingratio', 0.0)
+
+        self.bone_geo, self.bone_pos = self.load_bone_geo(target_path)
+
+        mask = np.asarray(getattr(self.geo, mask_name), dtype=np.float32) if hasattr(self.geo, mask_name) else None
+        if mask is None:
+            warnings.warn(f"mask '{mask_name}' not found in geometry.")
+            return []
+
+        valid_src_indices = np.where(mask > mask_threshold)[0].astype(np.int32)
+        if len(valid_src_indices) == 0:
+            warnings.warn(f"No vertices with mask > {mask_threshold}")
+            return []
+
+        src_positions = self.pos0_np[valid_src_indices]
+        valid_src_indices, _, dists, tgt_indices = self._query_bone_targets(
+            valid_src_indices,
+            src_positions,
+            params,
+        )
+        if len(valid_src_indices) == 0:
+            print(f"Warning: No valid attach sources remain for mask '{mask_name}' after group filtering.")
+            return []
+
+        if not hasattr(self, 'pt2tet'):
+            self.pt2tet = self.map_pts2tets(self.tet_np)
+
+        for j, src_idx in enumerate(valid_src_indices):
+            tgt_idx = int(tgt_indices[j])
+            target_pos = self.bone_pos[tgt_idx]
+            tetid = self.pt2tet.get(src_idx, [-1])[0]
+            restlength = float(dists[j])
+            c = dict(
+                type=ATTACH,
+                pts=[int(src_idx), -1, int(tgt_idx), -1],
+                stiffness=stiffness,
+                dampingratio=dampingratio,
+                tetid=tetid,
+                L=[0.0, 0.0, 0.0],
+                restlength=restlength,
+                restvector=[float(target_pos[0]), float(target_pos[1]), float(target_pos[2]), 1.0],
+                restdir=[0.0, 0.0, 0.0],
+                compressionstiffness=-1.0,
+            )
+            constraints.append(c)
+        return constraints
+
+    def create_pintotarget_constraints(self, params):
+        """Hard pin: pos[src] = bone_pos[tgt] + rest_offset every iter.
+
+        No XPBD stiffness — direct overwrite (matches realtimeMuscle's
+        pintotarget_kernel). rest_offset = pos0[src] - bone_pos0[tgt] is
+        captured at build time and stored in restdir.
+
+        Tet-coherent boundary handling: a vert is hard-pinned only when ALL
+        tets containing it are "interior" (all 4 verts pass mask threshold).
+        Mask-passing verts that share at least one tet with a non-pinned vert
+        become FREE (no bone constraint) — they get carried by ARAP through
+        the interior pin tets, keeping the kinematic / elastic boundary on
+        tet faces (no shear inside any tet). Set
+        params['boundary_attach_stiffness'] > 0 to instead emit a soft ATTACH
+        on those boundary verts (legacy behavior).
+        """
+        constraints = []
+        target_path = params.get('target_path')
+        mask_name = params.get('mask_name')
+        mask_threshold = params.get('mask_threshold', 0.75)
+        boundary_stiffness = params.get('boundary_attach_stiffness', 0.0)
+        boundary_damping = params.get('boundary_attach_dampingratio', 0.1)
+
+        self.bone_geo, self.bone_pos = self.load_bone_geo(target_path)
+
+        mask = np.asarray(getattr(self.geo, mask_name), dtype=np.float32) if hasattr(self.geo, mask_name) else None
+        if mask is None:
+            print(f"Warning: mask '{mask_name}' not found in geometry.")
+            return []
+
+        candidate_indices = np.where(mask > mask_threshold)[0].astype(np.int32)
+        if len(candidate_indices) == 0:
+            print(f"Warning: No vertices with mask > {mask_threshold}")
+            return []
+
+        src_positions = self.pos0_np[candidate_indices]
+        candidate_indices, src_positions, dists, tgt_indices = self._query_bone_targets(
+            candidate_indices,
+            src_positions,
+            params,
+        )
+        if len(candidate_indices) == 0:
+            print(f"Warning: No valid pintotarget sources remain for mask '{mask_name}' after group filtering.")
+            return []
+
+        if not hasattr(self, 'pt2tet'):
+            self.pt2tet = self.map_pts2tets(self.tet_np)
+
+        # Tet-coherent split: interior verts (all containing tets fully
+        # pinned) → PINTOTARGET; boundary verts (share a tet with non-pinned
+        # vert) → ATTACH. Note: the in_pin set is the post-group-filter set,
+        # because pintotarget itself only applies inside that subset.
+        in_pin = np.zeros(self.pos0_np.shape[0], dtype=bool)
+        in_pin[candidate_indices] = True
+        tet_pin_count = in_pin[self.tet_np].sum(axis=1)        # (NT,)
+        interior_tet = (tet_pin_count == 4)                    # (NT,) bool
+
+        if not hasattr(self, 'vert_to_tets'):
+            from collections import defaultdict
+            v2t = defaultdict(list)
+            for t_idx, tet in enumerate(self.tet_np):
+                for v in tet:
+                    v2t[int(v)].append(t_idx)
+            self.vert_to_tets = v2t
+
+        is_interior_pin = np.zeros(self.pos0_np.shape[0], dtype=bool)
+        for v in candidate_indices:
+            v = int(v)
+            v_tets = self.vert_to_tets.get(v, [])
+            if v_tets and all(interior_tet[t] for t in v_tets):
+                is_interior_pin[v] = True
+
+        rest_offsets = src_positions - self.bone_pos[tgt_indices]
+        n_pin = 0
+        n_attach = 0
+        for j, src_idx in enumerate(candidate_indices):
+            src_idx = int(src_idx)
+            tgt_idx = int(tgt_indices[j])
+            target_pos = self.bone_pos[tgt_idx]
+            tetid = self.pt2tet.get(src_idx, [-1])[0]
+            if is_interior_pin[src_idx]:
+                offset = rest_offsets[j]
+                c = dict(
+                    type=PINTOTARGET,
+                    pts=[src_idx, -1, tgt_idx, -1],
+                    stiffness=1.0,  # unused — solver overwrites pos directly
+                    dampingratio=0.0,
+                    tetid=tetid,
+                    L=[0.0, 0.0, 0.0],
+                    restlength=0.0,
+                    restvector=[float(target_pos[0]), float(target_pos[1]), float(target_pos[2]), 1.0],
+                    restdir=[float(offset[0]), float(offset[1]), float(offset[2])],
+                    compressionstiffness=-1.0,
+                )
+                n_pin += 1
+                constraints.append(c)
+            elif boundary_stiffness > 0.0:
+                c = dict(
+                    type=ATTACH,
+                    pts=[src_idx, -1, tgt_idx, -1],
+                    stiffness=float(boundary_stiffness),
+                    dampingratio=float(boundary_damping),
+                    tetid=tetid,
+                    L=[0.0, 0.0, 0.0],
+                    restlength=float(dists[j]),
+                    restvector=[float(target_pos[0]), float(target_pos[1]), float(target_pos[2]), 1.0],
+                    restdir=[0.0, 0.0, 0.0],
+                    compressionstiffness=-1.0,
+                )
+                n_attach += 1
+                constraints.append(c)
+            else:
+                n_attach += 1  # counted as "skipped boundary"
+        n_int_tets = int(interior_tet.sum())
+        boundary_kind = "soft-attach" if boundary_stiffness > 0.0 else "free (ARAP-carried)"
+        import logging
+        logging.getLogger(__name__).info(
+            f"pintotarget tet-coherent split: {n_pin} hard-pin, "
+            f"{n_attach} boundary→{boundary_kind} (interior tets: {n_int_tets}/{self.tet_np.shape[0]})"
+        )
+        return constraints
+
+    def create_distance_line_constraints(self, params):
+        constraints = []
+        target_path = params.get('target_path')
+        mask_name = params.get('mask_name')
+        mask_threshold = params.get('mask_threshold', 0.75)
+        stiffness = params.get('stiffness', 1e10)
+        dampingratio = params.get('dampingratio', 0.0)
+
+        self.bone_geo, self.bone_pos = self.load_bone_geo(target_path)
+
+        mask = np.asarray(getattr(self.geo, mask_name), dtype=np.float32) if hasattr(self.geo, mask_name) else None
+        if mask is None:
+            warnings.warn(f"mask '{mask_name}' not found in geometry.")
+            return []
+
+        valid_src_indices = np.where(mask > mask_threshold)[0].astype(np.int32)
+        if len(valid_src_indices) == 0:
+            warnings.warn(f"No vertices with mask > {mask_threshold}")
+            return []
+
+        src_positions = self.pos0_np[valid_src_indices]
+        valid_src_indices, src_positions, dists, tgt_indices = self._query_bone_targets(
+            valid_src_indices,
+            src_positions,
+            params,
+        )
+        if len(valid_src_indices) == 0:
+            print(f"Warning: No valid distanceline sources remain for mask '{mask_name}' after group filtering.")
+            return []
+
+        target_positions = self.bone_pos[tgt_indices]
+        directions = target_positions - src_positions
+        norms = np.linalg.norm(directions, axis=1, keepdims=True)
+        if np.any(norms < 1e-9):
+            bad = np.where(norms.ravel() < 1e-9)[0]
+            raise ValueError(f"source and target points too close at indices: {valid_src_indices[bad]}")
+        directions = directions / norms
+
+        if not hasattr(self, 'pt2tet'):
+            self.pt2tet = self.map_pts2tets(self.tet_np)
+
+        for j, src_idx in enumerate(valid_src_indices):
+            tgt_idx = int(tgt_indices[j])
+            target_pos = target_positions[j]
+            direction = directions[j]
+            tetid = self.pt2tet.get(src_idx, [-1])[0]
+            c = dict(
+                type=DISTANCELINE,
+                pts=[int(src_idx), -1, int(tgt_idx), -1],
+                stiffness=stiffness,
+                dampingratio=dampingratio,
+                tetid=tetid,
+                L=[0.0, 0.0, 0.0],
+                restlength=0.0,
+                restvector=[float(target_pos[0]), float(target_pos[1]), float(target_pos[2]), 1.0],
+                restdir=[float(direction[0]), float(direction[1]), float(direction[2])],
+                compressionstiffness=-1.0,
+            )
+            constraints.append(c)
+        return constraints
+
+    def create_tet_arap_constraints(self, params):
+        stiffness = params.get('stiffness', 1e10)
+        dampingratio = params.get('dampingratio', 0.0)
+        restmatrices, volumes, valid = self._batch_compute_tet_rest_matrices()
+
+        valid_indices = np.where(valid)[0]
+        constraints = []
+        for i in valid_indices:
+            tet = self.tet_np[i]
+            c = dict(
+                type=TETARAP,
+                pts=[int(tet[0]), int(tet[1]), int(tet[2]), int(tet[3])],
+                stiffness=stiffness,
+                dampingratio=dampingratio,
+                tetid=int(i),
+                L=[0.0, 0.0, 0.0],
+                restlength=float(volumes[i]),
+                restvector=[0.0, 0.0, 0.0, 1.0],
+                restdir=[0.0, 0.0, 0.0],
+                compressionstiffness=-1.0,
+            )
+            constraints.append(c)
+        return constraints
+
+    def _collect_raw_constraints(self):
+        """Dispatch constraint_configs -> create_* methods, return all_constraints list."""
+        self.attach_constraints = []
+        self.distanceline_constraints = []
+        self.pintotarget_constraints = []
+
+        all_constraints = []
+        _t_total = time.perf_counter()
+        for params in self.constraint_configs:
+            ctype = params['type'].lower()
+            new_constraints = []
+            if ctype == 'volume':
+                new_constraints = self.create_tet_volume_constraint(params)
+            elif ctype == 'fiber':
+                new_constraints = self.create_tet_fiber_constraint(params)
+            elif ctype == 'attach':
+                new_constraints = self.create_attach_constraints(params)
+                self.attach_constraints.extend(new_constraints)
+            elif ctype == 'pintotarget':
+                new_constraints = self.create_pintotarget_constraints(params)
+                self.pintotarget_constraints.extend(new_constraints)
+            elif ctype == 'distanceline':
+                new_constraints = self.create_distance_line_constraints(params)
+                self.distanceline_constraints.extend(new_constraints)
+            elif ctype == 'tetarap':
+                new_constraints = self.create_tet_arap_constraints(params)
+            elif ctype == 'fiberdgf':
+                new_constraints = self.create_tet_fiber_dgf_constraint(params)
+            elif ctype == 'fibermillard':
+                new_constraints = self.create_tet_fiber_millard_constraint(params)
+            elif ctype == 'snh':
+                new_constraints = self.create_tet_snh_constraint(params)
+
+            if new_constraints:
+                all_constraints.extend(new_constraints)
+                print(f"  {params.get('name', ctype)} ({ctype}): {len(new_constraints)} constraints")
+
+        self.raw_constraints = all_constraints.copy()
+        _dt_total = time.perf_counter() - _t_total
+        return all_constraints, _dt_total
+
+
+def build_constraint_color_groups(all_constraints):
+    """Build graph-colored constraint groups for parallel Gauss-Seidel.
+
+    Two constraints that share any vertex (pts[i] >= 0) are adjacent in the
+    dual graph and cannot be in the same color group. Returns a list of
+    np.ndarray, each containing constraint indices of one color.
+    """
+    import warp as wp
+    from collections import defaultdict
+    from newton._src.sim.graph_coloring import ColoringAlgorithm, color_graph
+
+    n_cons = len(all_constraints)
+    if n_cons == 0:
+        return []
+
+    # vertex -> constraint id inverted index
+    vertex_to_cons = defaultdict(list)
+    for cid, c in enumerate(all_constraints):
+        for v in c['pts']:
+            if v >= 0:
+                vertex_to_cons[v].append(cid)
+
+    # build dual graph edges
+    edge_set = set()
+    for cids in vertex_to_cons.values():
+        for i in range(len(cids)):
+            for j in range(i + 1, len(cids)):
+                a, b = cids[i], cids[j]
+                edge_set.add((min(a, b), max(a, b)))
+
+    if not edge_set:
+        return [np.arange(n_cons, dtype=np.int32)]
+
+    edges = np.array(sorted(edge_set), dtype=np.int32)
+    edge_wp = wp.array(edges, dtype=int, device="cpu")
+    color_groups = color_graph(
+        n_cons, edge_wp,
+        balance_colors=True,
+        target_max_min_color_ratio=1.1,
+        algorithm=ColoringAlgorithm.MCS,
+    )
+    return color_groups
+
+
+# ===========================================================================
+# Millard 2012 curves (moved from millard_curves.py)
+# ===========================================================================
+
+def scale_curviness(curviness: float) -> float:
+    """Map user curviness [0,1] to internal [0.1,0.9].
+
+    Ports: SmoothSegmentedFunctionFactory::scaleCurviness
+    """
+    return 0.1 + 0.8 * curviness
+
+
+def quintic_bezier_corner_control_points(
+    x0: float, y0: float, dydx0: float,
+    x1: float, y1: float, dydx1: float,
+    curviness: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute 6 quintic Bezier control points for a C-shaped corner.
+
+    Ports: SegmentedQuinticBezierToolkit::calcQuinticBezierCornerControlPoints
+
+    Returns:
+        (xPts[6], yPts[6]) control point arrays.
+    """
+    root_eps = math.sqrt(2.220446049250313e-16)  # sqrt(machine eps)
+
+    # Tangent line intersection
+    if abs(dydx0 - dydx1) > root_eps:
+        xC = (y1 - y0 - x1 * dydx1 + x0 * dydx0) / (dydx0 - dydx1)
+    else:
+        xC = (x1 + x0) / 2.0
+    yC = (xC - x1) * dydx1 + y1
+
+    # C-shape check (triangle inequality)
+    a = (xC - x0) ** 2 + (yC - y0) ** 2
+    b = (xC - x1) ** 2 + (yC - y1) ** 2
+    c = (x1 - x0) ** 2 + (y1 - y0) ** 2
+    assert c > a and c > b, (
+        f"Tangent intersection inconsistent with C-shaped corner: "
+        f"a={a:.6f}, b={b:.6f}, c={c:.6f}"
+    )
+
+    # Intermediate control points (doubled for C1 continuity)
+    x0_mid = x0 + curviness * (xC - x0)
+    y0_mid = y0 + curviness * (yC - y0)
+    x1_mid = x1 + curviness * (xC - x1)
+    y1_mid = y1 + curviness * (yC - y1)
+
+    xPts = np.array([x0, x0_mid, x0_mid, x1_mid, x1_mid, x1], dtype=np.float64)
+    yPts = np.array([y0, y0_mid, y0_mid, y1_mid, y1_mid, y1], dtype=np.float64)
+    return xPts, yPts
+
+
+# ---------------------------------------------------------------------------
+# 2. Millard curve factories (matching OpenSim defaults)
+# ---------------------------------------------------------------------------
+
+def build_active_fl_bezier(
+    x0: float = 0.4441,
+    x1: float = 0.73,
+    x2: float = 1.0,
+    x3: float = 1.8123,
+    ylow: float = 0.1,
+    dydx: float = 0.8616,
+    curviness: float = 1.0,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Build active force-length curve: 5 quintic Bezier segments.
+
+    Ports: SmoothSegmentedFunctionFactory::createFiberActiveForceLengthCurve
+
+    Returns:
+        List of 5 (xPts[6], yPts[6]) control point pairs.
+    """
+    c = scale_curviness(curviness)
+    xDelta = 0.05 * x2
+    xs = x2 - xDelta
+
+    # Ascending limb
+    y0_val = 0.0
+    dydx0_val = 0.0
+    y1_val = 1.0 - dydx * (xs - x1)
+    dydx01 = 1.25 * (y1_val - y0_val) / (x1 - x0)
+    x01 = x0 + 0.5 * (x1 - x0)
+    y01 = y0_val + 0.5 * (y1_val - y0_val)
+
+    # Shallow ascending plateau
+    x1s = x1 + 0.5 * (xs - x1)
+    y1s = y1_val + 0.5 * (1.0 - y1_val)
+    dydx1s = dydx
+
+    # Peak
+    y2 = 1.0
+    dydx2 = 0.0
+
+    # Descending limb
+    y3 = 0.0
+    dydx3 = 0.0
+    x23 = (x2 + xDelta) + 0.5 * (x3 - (x2 + xDelta))
+    y23 = y2 + 0.5 * (y3 - y2)
+    dydx23 = (y3 - y2) / ((x3 - xDelta) - (x2 + xDelta))
+
+    # 5 segments
+    segments = [
+        quintic_bezier_corner_control_points(x0, ylow, dydx0_val, x01, y01, dydx01, c),
+        quintic_bezier_corner_control_points(x01, y01, dydx01, x1s, y1s, dydx1s, c),
+        quintic_bezier_corner_control_points(x1s, y1s, dydx1s, x2, y2, dydx2, c),
+        quintic_bezier_corner_control_points(x2, y2, dydx2, x23, y23, dydx23, c),
+        quintic_bezier_corner_control_points(x23, y23, dydx23, x3, ylow, dydx3, c),
+    ]
+    return segments
+
+
+def build_passive_fpe_bezier(
+    e_zero: float = 0.0,
+    e_iso: float = 0.7,
+    k_low: float = 0.2,
+    k_iso: float = 2.0 / 0.7,  # ~2.857
+    curviness: float = 0.75,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Build passive fiber force-length curve: 2 quintic Bezier segments.
+
+    Ports: SmoothSegmentedFunctionFactory::createFiberForceLengthCurve
+
+    Note: x-axis is normalized fiber length (not strain). xZero = 1+eZero, xIso = 1+eIso.
+
+    Returns:
+        List of 2 (xPts[6], yPts[6]) control point pairs.
+    """
+    c = scale_curviness(curviness)
+    xZero = 1.0 + e_zero
+    yZero = 0.0
+    xIso = 1.0 + e_iso
+    yIso = 1.0
+
+    deltaX = min(0.1 / k_iso, 0.1 * (xIso - xZero))
+    xLow = xZero + deltaX
+    xfoot = xZero + 0.5 * (xLow - xZero)
+    yfoot = 0.0
+    yLow = yfoot + k_low * (xLow - xfoot)
+
+    segments = [
+        quintic_bezier_corner_control_points(xZero, yZero, 0.0, xLow, yLow, k_low, c),
+        quintic_bezier_corner_control_points(xLow, yLow, k_low, xIso, yIso, k_iso, c),
+    ]
+    return segments
+
+
+# ---------------------------------------------------------------------------
+# 3. Symbolic derivation: Bernstein → power basis → integral
+# ---------------------------------------------------------------------------
+
+def _bernstein_to_power_basis(ctrl_pts: np.ndarray) -> np.ndarray:
+    """Convert 6 quintic Bernstein control points to power-basis coefficients.
+
+    Given control points P[0..5], the quintic Bezier is:
+        B(u) = Σ P[j] * C(5,j) * u^j * (1-u)^(5-j)
+
+    Returns coefficients c[0..5] such that B(u) = c[0] + c[1]*u + ... + c[5]*u^5.
+
+    Uses the exact conversion matrix (Bernstein-to-power) for degree 5.
+    """
+    P = ctrl_pts.astype(np.float64)
+
+    # Bernstein-to-power conversion for degree 5:
+    # B_j^5(u) = C(5,j) * u^j * (1-u)^(5-j) = Σ_k M[k,j] * u^k
+    # where M[k,j] = C(5,j) * C(5-j, k-j) * (-1)^(k-j)  for k >= j, else 0
+    #
+    # Power basis: B(u) = Σ_j P[j] * Σ_k M[k,j] * u^k = Σ_k (Σ_j P[j]*M[k,j]) * u^k
+    #
+    # Precomputed conversion matrix M (row=power degree k, col=control point j):
+    M = np.array([
+        [  1,   0,   0,   0,   0,  0],  # u^0
+        [ -5,   5,   0,   0,   0,  0],  # u^1
+        [ 10, -20,  10,   0,   0,  0],  # u^2
+        [-10,  30, -30,  10,   0,  0],  # u^3
+        [  5, -20,  30, -20,   5,  0],  # u^4
+        [ -1,   5, -10,  10,  -5,  1],  # u^5
+    ], dtype=np.float64)
+
+    coeffs = M @ P  # c[k] = Σ_j M[k,j] * P[j]
+    return coeffs  # [c0, c1, c2, c3, c4, c5] where B(u) = c0 + c1*u + ... + c5*u^5
+
+
+def _compute_integral_coeffs(x_coeffs: np.ndarray, y_coeffs: np.ndarray) -> np.ndarray:
+    """Compute F(u) = ∫₀ᵘ y(t)·x'(t) dt as a degree-10 polynomial.
+
+    Given x(u) = Σ x_c[k]*u^k (degree 5) and y(u) = Σ y_c[k]*u^k (degree 5),
+    the integrand y(u)·x'(u) is degree 9. Its antiderivative F(u) is degree 10.
+
+    Returns coefficients F[0..10] such that F(u) = F[1]*u + F[2]*u^2 + ... + F[10]*u^10.
+    (F[0] = 0 since F(0) = 0.)
+    """
+    # x'(u) = Σ_{k=1}^{5} k * x_c[k] * u^{k-1}  (degree 4)
+    xp_coeffs = np.array([k * x_coeffs[k] for k in range(1, 6)], dtype=np.float64)
+    # xp_coeffs[j] is coefficient of u^j for j=0..4
+
+    # y(u) · x'(u) = polynomial multiplication (degree 5 * degree 4 = degree 9)
+    product = np.convolve(y_coeffs, xp_coeffs)  # length = 6+5-1 = 10, indices 0..9
+
+    # F(u) = ∫₀ᵘ product(t) dt: antiderivative with F(0)=0
+    # If product = Σ p[k]*u^k, then F(u) = Σ p[k]/(k+1) * u^{k+1}
+    F_coeffs = np.zeros(11, dtype=np.float64)  # indices 0..10
+    for k in range(len(product)):
+        F_coeffs[k + 1] = product[k] / (k + 1)
+
+    return F_coeffs
+
+
+# ---------------------------------------------------------------------------
+# 4. Data classes for compiled curves
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MillardSegment:
+    """One quintic Bezier segment with exact polynomial representation."""
+    # Bezier control points (for reference / validation)
+    ctrl_x: np.ndarray  # (6,) Bezier control points in x
+    ctrl_y: np.ndarray  # (6,) Bezier control points in y
+
+    # Power-basis coefficients: f(u) = c[0] + c[1]*u + ... + c[5]*u^5
+    x_coeffs: np.ndarray  # (6,) x(u) polynomial
+    y_coeffs: np.ndarray  # (6,) y(u) polynomial
+
+    # Energy integral: F(u) = F[1]*u + F[2]*u^2 + ... + F[10]*u^10
+    F_coeffs: np.ndarray  # (11,) ∫₀ᵘ y(t)·x'(t) dt
+
+    # Domain in x-space: [x(0), x(1)]
+    x_start: float = 0.0
+    x_end: float = 0.0
+
+
+@dataclass
+class MillardCurve:
+    """Complete Millard curve = multiple quintic Bezier segments."""
+    segments: list[MillardSegment] = field(default_factory=list)
+
+    # Domain boundaries (for extrapolation)
+    x_lo: float = 0.0
+    x_hi: float = 0.0
+    y_lo: float = 0.0
+    y_hi: float = 0.0
+    dydx_lo: float = 0.0
+    dydx_hi: float = 0.0
+
+    def eval(self, x: float | np.ndarray) -> float | np.ndarray:
+        """Evaluate y(x) on CPU (vectorized)."""
+        x = np.asarray(x, dtype=np.float64)
+        scalar = x.ndim == 0
+        x = np.atleast_1d(x)
+        y = np.empty_like(x)
+        for i, xi in enumerate(x):
+            y[i] = self._eval_scalar(xi)
+        return float(y[0]) if scalar else y
+
+    def eval_scalar(self, x: float) -> float:
+        """Evaluate y(x) for a single scalar (no numpy overhead)."""
+        return self._eval_scalar(float(x))
+
+    def eval_integral(self, x: float | np.ndarray) -> float | np.ndarray:
+        """Evaluate ∫_{x_lo}^{x} y(s) ds on CPU."""
+        x = np.asarray(x, dtype=np.float64)
+        scalar = x.ndim == 0
+        x = np.atleast_1d(x)
+        result = np.empty_like(x)
+        for i, xi in enumerate(x):
+            result[i] = self._eval_integral_scalar(xi)
+        return float(result[0]) if scalar else result
+
+    def _eval_scalar(self, x: float) -> float:
+        """Evaluate y at a single x value."""
+        # Linear extrapolation outside domain
+        if x < self.x_lo:
+            return self.y_lo + self.dydx_lo * (x - self.x_lo)
+        if x > self.x_hi:
+            return self.y_hi + self.dydx_hi * (x - self.x_hi)
+
+        # Find segment
+        seg = self.segments[0]
+        for s in self.segments:
+            if x <= s.x_end + 1e-14:
+                seg = s
+                break
+            seg = s  # use last if x is at boundary
+
+        u = _newton_find_u(x, seg.x_coeffs)
+        return _horner_eval(u, seg.y_coeffs)
+
+    def _eval_integral_scalar(self, x: float) -> float:
+        """Evaluate cumulative integral from x_lo to x."""
+        if x <= self.x_lo:
+            # Quadratic extrapolation: y_lo*(x-x_lo) + 0.5*dydx_lo*(x-x_lo)^2
+            dx = x - self.x_lo
+            return self.y_lo * dx + 0.5 * self.dydx_lo * dx * dx
+
+        total = 0.0
+        for seg in self.segments:
+            if x <= seg.x_start:
+                break
+            if x >= seg.x_end:
+                # Full segment contribution: F(1)
+                total += _horner_eval(1.0, seg.F_coeffs)
+            else:
+                # Partial segment
+                u = _newton_find_u(x, seg.x_coeffs)
+                total += _horner_eval(u, seg.F_coeffs)
+                break
+
+        # Linear extrapolation beyond domain
+        if x > self.x_hi:
+            dx = x - self.x_hi
+            total += self.y_hi * dx + 0.5 * self.dydx_hi * dx * dx
+
+        return total
+
+
+# ---------------------------------------------------------------------------
+# 5. Numerical helpers
+# ---------------------------------------------------------------------------
+
+def _horner_eval(u: float, coeffs: np.ndarray) -> float:
+    """Evaluate polynomial using Horner's method: c[0] + c[1]*u + ... + c[n]*u^n."""
+    result = 0.0
+    for k in range(len(coeffs) - 1, -1, -1):
+        result = result * u + coeffs[k]
+    return result
+
+
+def _horner_eval_deriv(u: float, coeffs: np.ndarray) -> tuple[float, float]:
+    """Evaluate polynomial and its derivative simultaneously."""
+    n = len(coeffs) - 1
+    val = coeffs[n]
+    dval = 0.0
+    for k in range(n - 1, -1, -1):
+        dval = dval * u + val
+        val = val * u + coeffs[k]
+    return val, dval
+
+
+def _newton_find_u(x_target: float, x_coeffs: np.ndarray,
+                   tol: float = 1e-12, max_iter: int = 20) -> float:
+    """Newton iteration to find u such that x(u) = x_target.
+
+    x(u) is monotonic for well-formed Bezier, so convergence is guaranteed.
+    Initial guess: linear interpolation.
+    """
+    x0 = x_coeffs[0]  # x(0) = c[0]
+    x1 = sum(x_coeffs)  # x(1) = c[0]+c[1]+...+c[5]
+    if abs(x1 - x0) < 1e-20:
+        return 0.5
+
+    # Linear initial guess
+    u = (x_target - x0) / (x1 - x0)
+    u = max(0.0, min(1.0, u))
+
+    for _ in range(max_iter):
+        xu, dxu = _horner_eval_deriv(u, x_coeffs)
+        err = xu - x_target
+        if abs(err) < tol:
+            break
+        if abs(dxu) < 1e-20:
+            break
+        u -= err / dxu
+        u = max(-0.05, min(1.05, u))  # allow slight overshoot for robustness
+
+    return u
+
+
+# ---------------------------------------------------------------------------
+# 6. Curve compilation: Bezier control points → MillardCurve
+# ---------------------------------------------------------------------------
+
+def _compile_curve(
+    bezier_segments: list[tuple[np.ndarray, np.ndarray]],
+    x_lo: float, x_hi: float,
+    y_lo: float, y_hi: float,
+    dydx_lo: float, dydx_hi: float,
+) -> MillardCurve:
+    """Compile Bezier control points into MillardCurve with exact polynomial coefficients."""
+    segments = []
+    for ctrl_x, ctrl_y in bezier_segments:
+        x_coeffs = _bernstein_to_power_basis(ctrl_x)
+        y_coeffs = _bernstein_to_power_basis(ctrl_y)
+        F_coeffs = _compute_integral_coeffs(x_coeffs, y_coeffs)
+
+        x_start = float(x_coeffs[0])  # x(0)
+        x_end = float(sum(x_coeffs))  # x(1)
+
+        segments.append(MillardSegment(
+            ctrl_x=ctrl_x,
+            ctrl_y=ctrl_y,
+            x_coeffs=x_coeffs,
+            y_coeffs=y_coeffs,
+            F_coeffs=F_coeffs,
+            x_start=x_start,
+            x_end=x_end,
+        ))
+
+    return MillardCurve(
+        segments=segments,
+        x_lo=x_lo, x_hi=x_hi,
+        y_lo=y_lo, y_hi=y_hi,
+        dydx_lo=dydx_lo, dydx_hi=dydx_hi,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. Public API: build default Millard curves
+# ---------------------------------------------------------------------------
+
+class MillardCurves:
+    """Container for default Millard 2012 muscle curves.
+
+    Usage:
+        mc = MillardCurves()
+        fl_val = mc.fl.eval(0.8)        # active force-length at lambda=0.8
+        fpe_val = mc.fpe.eval(1.3)      # passive force-length at lambda=1.3
+        psi_pe = mc.fpe.eval_integral(1.3)  # passive energy integral
+    """
+
+    def __init__(self, **kwargs):
+        # Active force-length
+        fl_bezier = build_active_fl_bezier(**{
+            k: v for k, v in kwargs.items()
+            if k in ('x0', 'x1', 'x2', 'x3', 'ylow', 'dydx', 'curviness')
+        })
+        fl_x0 = kwargs.get('x0', 0.4441)
+        fl_x3 = kwargs.get('x3', 1.8123)
+        fl_ylow = kwargs.get('ylow', 0.1)
+        self.fl = _compile_curve(
+            fl_bezier,
+            x_lo=fl_x0, x_hi=fl_x3,
+            y_lo=fl_ylow, y_hi=fl_ylow,
+            dydx_lo=0.0, dydx_hi=0.0,
+        )
+
+        # Passive fiber force-length
+        fpe_bezier = build_passive_fpe_bezier(**{
+            k: v for k, v in kwargs.items()
+            if k in ('e_zero', 'e_iso', 'k_low', 'k_iso', 'curviness')
+        })
+        e_zero = kwargs.get('e_zero', 0.0)
+        e_iso = kwargs.get('e_iso', 0.7)
+        k_iso = kwargs.get('k_iso', 2.0 / 0.7)
+        self.fpe = _compile_curve(
+            fpe_bezier,
+            x_lo=1.0 + e_zero, x_hi=1.0 + e_iso,
+            y_lo=0.0, y_hi=1.0,
+            dydx_lo=0.0, dydx_hi=k_iso,
+        )
+
+    def get_gpu_arrays(self) -> dict:
+        """Package curve coefficients for GPU upload.
+
+        Returns dict with flat numpy arrays ready for wp.from_numpy().
+        """
+        return {
+            'fl': _curve_to_gpu_arrays(self.fl),
+            'fpe': _curve_to_gpu_arrays(self.fpe),
+        }
+
+
+def _curve_to_gpu_arrays(curve: MillardCurve) -> dict:
+    """Flatten curve data for GPU consumption."""
+    n_seg = len(curve.segments)
+    x_coeffs = np.zeros((n_seg, 6), dtype=np.float32)
+    y_coeffs = np.zeros((n_seg, 6), dtype=np.float32)
+    F_coeffs = np.zeros((n_seg, 11), dtype=np.float32)
+
+    for i, seg in enumerate(curve.segments):
+        x_coeffs[i] = seg.x_coeffs.astype(np.float32)
+        y_coeffs[i] = seg.y_coeffs.astype(np.float32)
+        F_coeffs[i] = seg.F_coeffs.astype(np.float32)
+
+    return {
+        'n_segments': n_seg,
+        'x_coeffs': x_coeffs.flatten(),  # (n_seg*6,)
+        'y_coeffs': y_coeffs.flatten(),  # (n_seg*6,)
+        'F_coeffs': F_coeffs.flatten(),  # (n_seg*11,)
+        'x_lo': np.float32(curve.x_lo),
+        'x_hi': np.float32(curve.x_hi),
+        'y_lo': np.float32(curve.y_lo),
+        'y_hi': np.float32(curve.y_hi),
+        'dydx_lo': np.float32(curve.dydx_lo),
+        'dydx_hi': np.float32(curve.dydx_hi),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 8. Equilibrium solver (CPU-side, per-step)
+# ---------------------------------------------------------------------------
+
+def millard_equilibrium_fiber_length(
+    activation: float,
+    normalized_load: float,
+    fl_curve: MillardCurve,
+    search_range: tuple[float, float] | None = None,
+) -> float:
+    """Find fiber length where a*f_L(lm) + f_PE(lm) = normalized_load.
+
+    Searches ascending limb for intersection. Uses bisection for robustness.
+
+    Args:
+        activation: Muscle activation [0, 1].
+        normalized_load: F_external / F_max (normalized).
+        fl_curve: Active force-length MillardCurve.
+        search_range: Optional (lm_min, lm_max) to search. Default: ascending limb.
+
+    Returns:
+        Equilibrium normalized fiber length.
+    """
+    if search_range is None:
+        search_range = (fl_curve.x_lo, 1.0)  # ascending limb
+
+    lo, hi = search_range
+    target = normalized_load / max(activation, 1e-8)
+
+    # Bisection on ascending limb: f_L is monotonically increasing from lo to 1.0
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        val = fl_curve.eval(mid)
+        if val < target:
+            lo = mid
+        else:
+            hi = mid
+        if (hi - lo) < 1e-12:
+            break
+
+    lm_eq = 0.5 * (lo + hi)
+    return lm_eq
+
+
+# ---------------------------------------------------------------------------
+# 9. Quick validation / demo
+# ---------------------------------------------------------------------------
+
+def _quick_validate():
+    """Quick sanity check: print curve values at key points."""
+    mc = MillardCurves()
+
+    print("=== Active force-length (f_L) ===")
+    print(f"  Segments: {len(mc.fl.segments)}")
+    for lm in [0.4, 0.4441, 0.6, 0.8, 1.0, 1.2, 1.5, 1.8123, 2.0]:
+        print(f"  f_L({lm:.4f}) = {mc.fl.eval(lm):.6f}")
+
+    print("\n=== Passive force-length (f_PE) ===")
+    print(f"  Segments: {len(mc.fpe.segments)}")
+    for lm in [0.8, 1.0, 1.1, 1.3, 1.5, 1.7, 1.9]:
+        print(f"  f_PE({lm:.4f}) = {mc.fpe.eval(lm):.6f}")
+
+    print("\n=== Energy integrals ===")
+    for lm in [0.6, 0.8, 1.0, 1.2, 1.5]:
+        psi_l = mc.fl.eval_integral(lm)
+        print(f"  Psi_L({lm:.1f}) = {psi_l:.6f}")
+    for lm in [1.0, 1.2, 1.5, 1.7]:
+        psi_pe = mc.fpe.eval_integral(lm)
+        print(f"  Psi_PE({lm:.1f}) = {psi_pe:.6f}")
+
+    # Verify integral consistency: F'(x) ≈ f(x)
+    print("\n=== Integral derivative check (should match f_L) ===")
+    eps = 1e-7
+    for lm in [0.6, 0.8, 1.0, 1.2, 1.5]:
+        F_plus = mc.fl.eval_integral(lm + eps)
+        F_minus = mc.fl.eval_integral(lm - eps)
+        numerical_deriv = (F_plus - F_minus) / (2 * eps)
+        analytical = mc.fl.eval(lm)
+        print(f"  lm={lm:.1f}: F'={numerical_deriv:.6f}, f_L={analytical:.6f}, "
+              f"err={abs(numerical_deriv - analytical):.2e}")
+
+
+if __name__ == "__main__":
+    _quick_validate()
+
+
+# ===========================================================================
+# Warp renderer (moved from vis_warp.py)
+# ===========================================================================
+
+class WarpRenderer:
+    """Wraps wp.render.OpenGLRenderer or wp.render.UsdRenderer."""
+
+    def __init__(self, mode: str = "human", stage_path: str = "muscle_sim.usd"):
+        self.mode = mode
+        self.renderer = None
+        if mode == "human":
+            self.renderer = wp.render.OpenGLRenderer(vsync=True)
+        elif mode == "usd":
+            self.renderer = wp.render.UsdRenderer(stage_path)
+        self.sim_time = 0.0
+
+    def is_running(self) -> bool:
+        if self.renderer is None:
+            return True
+        if self.mode == "human":
+            return self.renderer.is_running()
+        return True
+
+    def update(self, sim_time: float, pos_np: np.ndarray, tri_indices: np.ndarray,
+               bone_pos_np: np.ndarray = None, bone_indices: np.ndarray = None):
+        if self.renderer is None:
+            return
+        self.sim_time = sim_time
+
+        self.renderer.begin_frame(sim_time)
+        self.renderer.render_mesh(
+            name="muscle",
+            points=pos_np,
+            indices=tri_indices,
+            colors=(0.8, 0.3, 0.2),
+        )
+        if bone_pos_np is not None and bone_indices is not None and len(bone_indices) > 0:
+            self.renderer.render_mesh(
+                name="bone",
+                points=bone_pos_np,
+                indices=bone_indices,
+                colors=(0.9, 0.9, 0.85),
+            )
+        self.renderer.end_frame()
+
+    def save(self):
+        if self.renderer is not None and self.mode == "usd":
+            self.renderer.save()
+
+    def register_key_press_callback(self, callback):
+        if self.mode == "human" and self.renderer is not None:
+            self.renderer.register_key_press_callback(callback)
+
+
+# ===========================================================================
+# MuscleSim core
+# ===========================================================================
 
 def activation_ramp(t: float) -> float:
     """Piecewise activation over normalized time [0,1]: 0→0.5→1.0→0.7→0.3→0."""
@@ -2160,7 +3486,7 @@ class MuscleSim(ConstraintBuilderMixin):
     def _debug_check_substep(self, sub_i, n_sub):
         """Per-substep mesh-quality + state logging. cfg.debug_per_substep."""
         import logging
-        from muscle.couple.mesh_utils import (
+        from muscle.util.mesh_utils import (
             check_mesh_quality, MeshDistortionError,
         )
         log = logging.getLogger(__name__)
@@ -2471,7 +3797,6 @@ class MuscleSim(ConstraintBuilderMixin):
 
     def _init_millard_curves(self):
         """Initialize Millard 2012 curve coefficient arrays for GPU evaluation."""
-        from muscle.millard_curves import MillardCurves
 
         mc = MillardCurves()
         self._millard_curves = mc  # keep reference for CPU-side equilibrium solve
@@ -2538,7 +3863,6 @@ class MuscleSim(ConstraintBuilderMixin):
 
     def _build_colored_gs(self, all_constraints):
         """Reorder constraints by (color, type) and build per-color dispatch ranges."""
-        from .constraints import build_constraint_color_groups
         import time
 
         t0 = time.perf_counter()
