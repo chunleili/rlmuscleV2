@@ -17,7 +17,7 @@
   "gui": true,
   "render_mode": "usd",
   "dt": 0.041666666666666664,
-  "nsteps": 300,
+  "nframes": 300,
   "num_substeps": 10,
   "gravity": 0.0,
   "density": 1000.0,

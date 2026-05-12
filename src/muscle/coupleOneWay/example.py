@@ -34,12 +34,10 @@ def main():
     p = argparse.ArgumentParser(description="One-way bone-driven muscle.")
     p.add_argument("--config", default=DEFAULT_CONFIG)
     p.add_argument("--auto", action="store_true", help="Headless run.")
-    p.add_argument("--steps", type=int, default=None, help="Override cfg.nsteps.")
     p.add_argument("--frames", type=int, default=None,
-                   help="Number of *motion* frames to cover. Overrides --steps "
-                        "and cfg.nsteps. nsteps becomes round(frames / "
-                        "(bone_speed_scale * dt * motion_fps)). Default: cfg.nframes "
-                        "if set, else fall back to nsteps.")
+                   help="Number of *output* frames to cover. Overrides "
+                        "cfg.nframes. Internal sim steps = round(frames / "
+                        "(bone_retime * dt * motion_fps)).")
     p.add_argument("--render", choices=["human", "usd", "none"], default=None)
     p.add_argument("--device", default="cpu")
     p.add_argument("--activation", type=float, default=None,
@@ -73,10 +71,6 @@ def main():
     cfg = load_config(args.config)
     cfg.gui = render_mode is not None
     cfg.render_mode = render_mode
-    if args.steps is not None:
-        cfg.nsteps = args.steps
-    if render_mode == "human" and not args.auto:
-        cfg.nsteps = 1_000_000
 
     if render_mode == "usd":
         if args.output:
@@ -123,16 +117,20 @@ def main():
     log.info(f"motion: {anim.n_frames} frames @ {anim.fps} fps "
              f"(span {anim.time_seconds_range[1]:.2f}s)")
 
-    speed = float(getattr(cfg, "bone_speed_scale", 1.0))
-    motion_per_step = max(speed * cfg.dt * anim.fps, 1e-9)
+    retime = float(getattr(cfg, "bone_retime", 1.0))
+    motion_per_step = max(retime * cfg.dt * anim.fps, 1e-9)
 
-    # Frame-based run length: --frames > cfg.nframes > existing nsteps.
-    # nsteps = round(nframes / motion_per_step) so output covers `nframes`
-    # motion frames regardless of bone_speed_scale.
+    # Run length: configs/CLI only specify nframes (output frames). Internal
+    # cfg.nsteps is derived so output cadence is independent of bone_retime.
     nframes = args.frames if args.frames is not None else getattr(cfg, "nframes", None)
-    if nframes is not None:
-        cfg.nsteps = max(1, int(round(nframes / motion_per_step)))
-        log.info(f"nframes={nframes} → nsteps={cfg.nsteps} (motion_per_step={motion_per_step:.4f})")
+    if nframes is None:
+        raise ValueError(
+            "config must specify 'nframes' (number of output frames); "
+            "pass --frames to override.")
+    cfg.nsteps = max(1, int(round(nframes / motion_per_step)))
+    if render_mode == "human" and not args.auto:
+        cfg.nsteps = 1_000_000
+    log.info(f"nframes={nframes} → nsteps={cfg.nsteps} (motion_per_step={motion_per_step:.4f})")
 
     def frame_at(step: int) -> int:
         # Bone advances `motion_per_step` motion-frames per sim-step. Loop
@@ -140,7 +138,7 @@ def main():
         return int(round(step * motion_per_step)) % anim.n_frames
 
     # Render stride: emit one USD frame per *motion* frame, so the output
-    # timeline matches the original animation regardless of bone_speed_scale
+    # timeline matches the original animation regardless of bone_retime
     # (retime affects the solver only, not output cadence).
     render_stride = max(1, int(round(1.0 / motion_per_step)))
     log.info(f"render_stride={render_stride} (1 USD frame per {render_stride} sim-steps; "
@@ -169,11 +167,11 @@ def _make_substep_hooks(sim, anim, cfg, step_index: int, lbs, lbs_blend: float):
     refreshes attach targets. ``post`` (only if ``lbs`` is provided) skins the
     muscle pos toward an LBS prediction from the same fractional frame so the
     constraint solve corrects from a bone-driven shape rather than from
-    inertia drift. cfg.bone_speed_scale (default 1.0) scales playback speed.
+    inertia drift. cfg.bone_retime (default 1.0) scales playback speed.
     """
-    speed = float(getattr(cfg, "bone_speed_scale", 1.0))
-    f_a = (step_index - 1) * cfg.dt * anim.fps * speed
-    f_b = step_index * cfg.dt * anim.fps * speed
+    retime = float(getattr(cfg, "bone_retime", 1.0))
+    f_a = (step_index - 1) * cfg.dt * anim.fps * retime
+    f_b = step_index * cfg.dt * anim.fps * retime
     state = {"f": f_b}  # mutated by pre, read by post
 
     def pre(sub_i, n_sub):
@@ -244,7 +242,7 @@ def _run_auto(sim, anim, cfg, args, frame_at, render_stride=1, lbs=None, lbs_ble
         _step_with_bone_hooks(sim, pre, post)
         if step % render_stride == 0:
             # Stamp USD at motion-frame time (step/stride * dt) so playback
-            # matches original motion fps regardless of bone_speed_scale.
+            # matches original motion fps regardless of bone_retime.
             saved = sim.step_cnt
             sim.step_cnt = step // render_stride
             sim.render()
@@ -264,8 +262,8 @@ def _run_auto(sim, anim, cfg, args, frame_at, render_stride=1, lbs=None, lbs_ble
 
 def _run_lbs_only(sim, anim, cfg, args, frame_at, render_stride, lbs):
     """Pure-LBS baseline: pos = pos0 @ T_rel[bone] each step. No solver at all."""
-    speed = float(getattr(cfg, "bone_speed_scale", 1.0))
-    motion_per_step = max(speed * cfg.dt * anim.fps, 1e-9)
+    retime = float(getattr(cfg, "bone_retime", 1.0))
+    motion_per_step = max(retime * cfg.dt * anim.fps, 1e-9)
     log.info(f"Running {cfg.nsteps} steps (LBS-ONLY: no integrate, no constraints)...")
     vertex_bone_field = lbs.vertex_bone_field(sim)
     for step in range(1, cfg.nsteps + 1):
