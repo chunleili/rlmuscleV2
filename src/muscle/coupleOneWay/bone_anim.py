@@ -3,7 +3,7 @@
 Consumes:
 - Human.usd Ragdoll bones (rest geometry, SNU naming)
 - otto_motion.json: per-frame world transforms of every Otto joint after
-  Houdini FBIK retargeting (see data/Human/export_otto_motion.py)
+  Houdini FBIK retargeting (see data/Human/config/export_otto_motion.py)
 
 For each Ragdoll bone we look up its joint by name (1:1, no ancestor
 fallback needed since every Ragdoll bone has a matching Otto joint after
@@ -43,7 +43,7 @@ class BoneAnimation:
         Static SNU rig + bone meshes. Reads ``/Human/Ragdoll/Bones`` for
         rest geometry (mesh-local verts and rest world xform).
     motion_json : Path or str
-        JSON produced by ``data/Human/export_otto_motion.py``. Contains
+        JSON produced by ``data/Human/config/export_otto_motion.py``. Contains
         ``joint_names``, ``rest_transforms`` and per-frame ``transforms``
         (all row-major 4x4, row-vector convention).
     bone_root : str

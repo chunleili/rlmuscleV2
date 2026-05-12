@@ -101,7 +101,7 @@ def main():
         lbs_blend = 1.0
     lbs = None
     if lbs_blend > 0.0 or args.lbs_only:
-        cache_path = os.path.join("data", "Human", f"lbs_weights_{cfg.name}.json")
+        cache_path = os.path.join("data", "Human", "config", f"lbs_weights_{cfg.name}.json")
         lbs = LBSDriver(sim.pos0_np, anim, cache_path=cache_path)
         log.info(f"LBS enabled: blend={lbs_blend} "
                  f"(only={args.lbs_only}, cache={cache_path})")

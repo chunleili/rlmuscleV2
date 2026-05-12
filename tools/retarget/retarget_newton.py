@@ -116,9 +116,9 @@ def main() -> int:
     parser.add_argument("--source", type=Path,
                         default=ROOT.parent / "RLMuscle/output/walk_snu_ysy_v2.usd")
     parser.add_argument("--human-usd", type=Path,
-                        default=ROOT / "data/Human/Human.usd")
+                        default=ROOT / "data/Human/model/Human.usd")
     parser.add_argument("--joint-mapping", type=Path,
-                        default=ROOT / "data/Human/joint_mapping.json")
+                        default=ROOT / "data/Human/config/joint_mapping.json")
     parser.add_argument("--out", type=Path,
                         default=ROOT / "output/Human/walk_snu_ysy_v2_newton.usd")
     parser.add_argument("--rot-weight", type=float, default=1.0)

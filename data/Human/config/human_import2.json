@@ -5,7 +5,7 @@
     "created": "2026-02-10"
   },
   "name": "human",
-  "usd_path": "data/Human/Human.usd",
+  "usd_path": "data/Human/model/Human.usd",
   "contraction_ratio": 0.4,
   "fiber_stiffness_scale": 10000.0,
   "arch": "cpu",
