@@ -40,24 +40,16 @@
       "dampingratio": 0.1
     },
     {
-      "type": "tetarap",
+      "type": "tetarapsvd",
       "name": "tetarap",
       "stiffness": 10000000000.0,
       "dampingratio": 0.1
     },
     {
-      "type": "fiber",
-      "name": "tetfibernorm",
-      "stiffness": 10000000000.0,
-      "dampingratio": 0.1
-    },
-    {
-      "type": "attach",
-      "name": "muscleToBonesAttach",
+      "type": "pintotarget",
+      "name": "muscleToBonesPin",
       "mask_name": "muscletobonemask",
-      "mask_threshold": 0.75,
-      "stiffness": 10000000000.0,
-      "dampingratio": 0.1
+      "mask_threshold": 0.75
     },
     {
       "type": "pintotarget",
