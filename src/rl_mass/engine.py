@@ -259,6 +259,9 @@ class MuJoCoEngine(PhysicsEngine):
         self.model.opt.timestep = timestep
         self.data = mujoco.MjData(self.model)
 
+        # Reusable buffer for get_linear_jacobian (avoids per-call np.zeros).
+        self._jacp_buf = np.zeros((3, self.model.nv), dtype=np.float64)
+
     # ------------------------------------------------------------------
     # Dimensions
     # ------------------------------------------------------------------
@@ -380,10 +383,12 @@ class MuJoCoEngine(PhysicsEngine):
     # ------------------------------------------------------------------
 
     def get_linear_jacobian(self, point: np.ndarray, bid: int) -> np.ndarray:
-        nv = self.model.nv
-        jacp = np.zeros((3, nv), dtype=np.float64)
-        jacr = np.zeros((3, nv), dtype=np.float64)
-        self._mj.mj_jac(self.model, self.data, jacp, jacr, point, bid)
+        # Reuse a single buffer; mj_jac fully overwrites jacp every call.
+        # jacr=None skips the (unused) rotational Jacobian.
+        # NOTE: returns a shared buffer — copy if you must retain it past
+        # the next call.
+        jacp = self._jacp_buf
+        self._mj.mj_jac(self.model, self.data, jacp, None, point, bid)
         return jacp
 
     def get_com_jacobian(self, bid: int) -> np.ndarray:

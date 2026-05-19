@@ -147,6 +147,9 @@ class MassEnv:
         self.activation_levels = np.zeros(len(self.muscles), dtype=np.float64)
         self.average_activation_levels = np.zeros(len(self.muscles), dtype=np.float64)
         self.muscle_tuples: list[MuscleTuple] = []
+        # Lazily-built gather index for the related-DOF JtA tuple field.
+        self._jta_gather_dof: Optional[np.ndarray] = None
+        self._jta_gather_mus: Optional[np.ndarray] = None
 
         # Desired torques (full nv-space)
         self.desired_torque = np.zeros(self.engine.nv, dtype=np.float64)
@@ -383,6 +386,21 @@ class MassEnv:
         JtA_full = np.zeros((nv, n_muscles), dtype=np.float64)
         Jtp = np.zeros(nv, dtype=np.float64)
 
+        # --- Vectorized per-anchor force directions (all anchors at once) ---
+        # Bit-identical to the old per-muscle loop: each anchor accumulates
+        # its outgoing segment unit dir (forward pass) then its incoming
+        # segment unit dir (backward pass = negated outgoing dir of the
+        # previous segment). Segments are within-muscle only, so every anchor
+        # appears at most once in seg_a and once in seg_b.
+        diff = ms.anchor_world_pos[ms.seg_b] - ms.anchor_world_pos[ms.seg_a]
+        seg_norm = np.linalg.norm(diff, axis=1)
+        seg_dir = diff.copy()
+        nz = seg_norm > 1e-12
+        seg_dir[nz] = diff[nz] / seg_norm[nz, None]
+        force_dir_all = np.zeros((ms.total_anchors, 3), dtype=np.float64)
+        np.add.at(force_dir_all, ms.seg_a, seg_dir)   # forward: outgoing dir
+        np.add.at(force_dir_all, ms.seg_b, -seg_dir)  # backward: incoming dir
+
         for m_i in range(n_muscles):
             start = ms.muscle_anchor_start[m_i]
             n_anc = ms.muscle_n_anchors[m_i]
@@ -396,21 +414,7 @@ class MassEnv:
                 jacp = self.engine.get_linear_jacobian(point, bid)
                 Jt[:, a_i * 3 : (a_i + 1) * 3] = jacp.T
 
-            # Force directions
-            positions = ms.anchor_world_pos[start : start + n_anc]
-            force_dir = np.zeros((n_anc, 3), dtype=np.float64)
-            for k in range(n_anc - 1):
-                d = positions[k + 1] - positions[k]
-                norm = np.linalg.norm(d)
-                if norm > 1e-12:
-                    d /= norm
-                force_dir[k] += d
-            for k in range(1, n_anc):
-                d = positions[k - 1] - positions[k]
-                norm = np.linalg.norm(d)
-                if norm > 1e-12:
-                    d /= norm
-                force_dir[k] += d
+            force_dir = force_dir_all[start : start + n_anc]
 
             l_m_norm = ms.l_m[m_i] / ms.l_m0[m_i]
             f_a = ms.f0[m_i] * np.exp(-((l_m_norm - 1.0) ** 2) / 0.5)
@@ -429,8 +433,19 @@ class MassEnv:
             JtA_full[:, m_i] = Jt @ A
             Jtp += Jt @ p
 
-        # JtA = concatenated related JtA (uses MuscleSystem)
-        JtA = ms.get_all_muscle_torques(self.engine)
+        # JtA = concatenated related JtA. Identical to get_all_muscle_torques()
+        # (same Jt, same A => same Jt@A): gather the related-DOF rows straight
+        # out of JtA_full instead of recomputing every Jacobian.
+        if self._jta_gather_dof is None:
+            dof_list: list[int] = []
+            mus_list: list[int] = []
+            for m_i in range(n_muscles):
+                for d in ms.related_dof_indices[m_i]:
+                    dof_list.append(int(d))
+                    mus_list.append(m_i)
+            self._jta_gather_dof = np.array(dof_list, dtype=np.intp)
+            self._jta_gather_mus = np.array(mus_list, dtype=np.intp)
+        JtA = JtA_full[self._jta_gather_dof, self._jta_gather_mus]
 
         # L = non-root rows of JtA_full, vectorized row-by-row
         L_matrix = JtA_full[self.root_joint_dof:, :]  # (50, 284)
