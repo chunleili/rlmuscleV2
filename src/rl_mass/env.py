@@ -87,6 +87,22 @@ class MassEnv:
         self.w_ee: float = rp.get("w_ee", 0.15)
         self.w_com: float = rp.get("w_com", 0.1)
 
+        # Terminate episodes when the root drops below a standing height.
+        # Disable for tasks with no ground/gravity (e.g. swimming), where the
+        # reference pose is not upright and the root height is meaningless.
+        self.height_termination: bool = cfg.get("height_termination", True)
+
+        # Terminate when the joint-pose tracking error exceeds this squared
+        # norm (||p_diff||^2 over BVH-mapped joints). This is the divergence
+        # cutoff for tasks without a height check (e.g. swimming): it plays
+        # the same role "falling over" does for locomotion, ending hopeless
+        # episodes before they feed garbage muscle tuples to the optimizer.
+        # None disables the check.
+        pet = cfg.get("pose_error_threshold", None)
+        self.pose_error_threshold: Optional[float] = (
+            float(pet) if pet is not None else None
+        )
+
         # SPD parameters
         kp = cfg.get("spd", {}).get("kp", 300.0)
 
@@ -592,11 +608,36 @@ class MassEnv:
     # IsEndOfEpisode
     # ------------------------------------------------------------------
 
+    def _pose_error_sq(self) -> float:
+        """Squared norm of the joint-pose tracking error (BVH-mapped joints).
+
+        Same p_diff used by get_reward's r_q term: the SO(3) geodesic
+        difference between the current pose and the BVH target, restricted
+        to BVH-mapped (non-root) joints.
+        """
+        cur_pos_dart = mujoco_qpos_to_dart(
+            self.engine.get_qpos(), root_offset=DART_ROOT_OFFSET
+        )
+        target_pos_dart = mujoco_qpos_to_dart(
+            self.target_positions_mj, root_offset=DART_ROOT_OFFSET
+        )
+        p_diff_all = dart_position_differences(target_pos_dart, cur_pos_dart)
+
+        err = 0.0
+        for _, _, dart_idx, dart_ndof in self._bvh_reward_info:
+            seg = p_diff_all[dart_idx : dart_idx + dart_ndof]
+            err += float(np.dot(seg, seg))
+        return err
+
     def is_end_of_episode(self) -> bool:
         """Check termination conditions. Port of Environment::IsEndOfEpisode.
 
         Terminal if:
-        - Root body height < 1.3 (relative to ground COM y)
+        - Root body height < 1.3 (relative to ground COM y), unless
+          height_termination is disabled (e.g. swimming task)
+        - Joint-pose tracking error ||p_diff||^2 > pose_error_threshold,
+          when that threshold is configured (divergence cutoff for tasks
+          with no height check, e.g. swimming)
         - NaN in positions or velocities
         - Simulation time > 10.0
 
@@ -604,10 +645,15 @@ class MassEnv:
             True if episode should terminate.
         """
         # Root body height relative to ground COM
-        root_y = self.engine.get_body_xpos(self._root_bid)[1] - _GROUND_COM_Y
+        if self.height_termination:
+            root_y = self.engine.get_body_xpos(self._root_bid)[1] - _GROUND_COM_Y
+            if root_y < 1.3:
+                return True
 
-        if root_y < 1.3:
-            return True
+        # Joint-pose divergence cutoff
+        if self.pose_error_threshold is not None:
+            if self._pose_error_sq() > self.pose_error_threshold:
+                return True
 
         qpos = self.engine.get_qpos()
         qvel = self.engine.get_qvel()

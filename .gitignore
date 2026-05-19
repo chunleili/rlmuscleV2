@@ -33,3 +33,4 @@ muscle_sim.usd
 /tmp/
 src/rl_mass/verify/
 
+MUJOCO_LOG.TXT
