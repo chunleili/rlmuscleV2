@@ -18,6 +18,7 @@ runs/
 wandb/
 tb_logs/
 muscle_sim.usd
+nn/
 
 # Editor / OS
 .DS_Store
