@@ -653,6 +653,9 @@ plot = [
 video = [
     { name = "imageio", extra = ["ffmpeg"] },
 ]
+warp = [
+    { name = "mujoco-warp" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -660,6 +663,7 @@ requires-dist = [
     { name = "matplotlib", marker = "extra == 'plot'", specifier = ">=3.7" },
     { name = "meshio", marker = "extra == 'mesh-export'", specifier = ">=5.3" },
     { name = "mujoco", specifier = ">=3.1" },
+    { name = "mujoco-warp", marker = "extra == 'warp'", specifier = ">=3.5.0.2" },
     { name = "newton", extras = ["sim"], git = "https://github.com/newton-physics/newton.git?branch=main" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "pymeshlab", marker = "extra == 'mesh-coarsen'", specifier = ">=2025.7" },
@@ -670,7 +674,7 @@ requires-dist = [
     { name = "usd-core-arm64", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'", specifier = ">=26.3" },
     { name = "warp-lang", specifier = ">=1.12.0", index = "https://pypi.nvidia.com/" },
 ]
-provides-extras = ["plot", "mesh-export", "mesh-coarsen", "video"]
+provides-extras = ["plot", "mesh-export", "mesh-coarsen", "video", "warp"]
 
 [[package]]
 name = "scipy"

@@ -21,6 +21,8 @@ plot = ["matplotlib>=3.7"]
 mesh-export = ["meshio>=5.3"]
 mesh-coarsen = ["pymeshlab>=2025.7", "tetgen>=0.8"]
 video = ["imageio[ffmpeg]>=2.37.3"]
+# GPU vectorized env via mujoco_warp + NVIDIA Warp. Requires CUDA.
+warp = ["mujoco-warp>=3.5.0.2"]
 
 [build-system]
 requires = ["hatchling"]

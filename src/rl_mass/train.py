@@ -562,9 +562,10 @@ if __name__ == "__main__":
         "--vec_env_mode",
         type=str,
         default="subproc",
-        choices=["serial", "subproc"],
-        help="VecEnv backend: 'serial' (in-process) or 'subproc' (multi-process, uses packed "
-             "run_control_step when muscles are on)",
+        choices=["serial", "subproc", "warp"],
+        help="VecEnv backend: 'serial' (in-process), 'subproc' (multi-process, uses packed "
+             "run_control_step when muscles are on), or 'warp' (bootstrap path for the upcoming "
+             "GPU backend)",
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed (default: time-based)")
     parser.add_argument("--max_iter", type=int, default=None, help="Override max iterations (debug)")

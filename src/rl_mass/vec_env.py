@@ -1,10 +1,11 @@
 """Vectorized MassEnv for parallel rollout collection.
 
-Mirrors MASS EnvManager (external/MASS/python/EnvManager.cpp) with two
+Mirrors MASS EnvManager (external/MASS/python/EnvManager.cpp) with three
 implementations:
 
   - SerialVecEnv: in-process for-loop (debug / bit-level regression baseline).
   - SubprocVecEnv: multiprocessing workers with Pipe command dispatch.
+  - WarpVecEnv: bootstrap wrapper for the upcoming GPU backend.
 
 Both expose the batch API described in docs/specs/2026-04-24-rl-mass-vecenv-spec.md.
 
@@ -498,12 +499,19 @@ def make_vec_env(
     mode: str = "subproc",
     seed: Optional[int] = None,
 ) -> MassVecEnv:
-    """Factory. mode: 'serial' | 'subproc'."""
+    """Factory. mode: 'serial' | 'subproc' | 'warp'."""
     if num_envs < 1:
         raise ValueError(f"num_envs must be >= 1, got {num_envs}")
+    if mode == "warp":
+        from rl_mass.warp import WarpVecEnv
+
+        return WarpVecEnv(config_path, num_envs, seed=seed)
     if mode == "serial" or num_envs == 1:
         return SerialVecEnv(config_path, num_envs)
     elif mode == "subproc":
         return SubprocVecEnv(config_path, num_envs, seed=seed)
     else:
-        raise ValueError(f"Unknown vec_env mode: {mode!r} (choose 'serial' or 'subproc')")
+        raise ValueError(
+            f"Unknown vec_env mode: {mode!r} "
+            "(choose 'serial', 'subproc', or 'warp')"
+        )

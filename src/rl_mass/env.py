@@ -71,9 +71,15 @@ class MassEnv:
         config_path: Path to config JSON file.
     """
 
-    def __init__(self, config_path: str = "data/rl_mass/config.json"):
+    def __init__(
+        self,
+        config_path: str = "data/rl_mass/config.json",
+        engine=None,
+        vectorized_muscles: bool = True,
+    ):
         with open(config_path) as f:
             cfg = json.load(f)
+        self.vectorized_muscles = vectorized_muscles
 
         # Hz settings
         self.control_hz: int = cfg.get("control_hz", 30)
@@ -108,11 +114,16 @@ class MassEnv:
 
         # Create physics engine
         skel_file = cfg["skeleton_file"]
-        self.engine = MuJoCoEngine(skel_file, timestep=1.0 / self.simulation_hz)
+        self.engine = engine or MuJoCoEngine(
+            skel_file, timestep=1.0 / self.simulation_hz
+        )
 
-        # Convenience aliases for backward compatibility (used by eval.py, train.py)
+        # Convenience aliases for backward compatibility (used by eval.py, train.py).
+        # WarpWorldView has no single-world `.data` (the property raises),
+        # so hasattr returns False there and `self.data` stays unset.
         self.model = self.engine.model
-        self.data = self.engine.data
+        if hasattr(self.engine, "data"):
+            self.data = self.engine.data
 
         # Character (BVH + SPD)
         self.character = Character(self.engine, kp=kp)
@@ -150,8 +161,8 @@ class MassEnv:
             for m in self.muscles:
                 m.update(self.engine)
                 self.num_total_related_dofs += m.num_related_dofs
-            # Build vectorized muscle system
-            self.muscle_system = MuscleSystem(self.muscles)
+            if self.vectorized_muscles:
+                self.muscle_system = MuscleSystem(self.muscles)
 
         # Muscle tuple storage
         self.current_muscle_tuple: Optional[MuscleTuple] = None
@@ -288,7 +299,7 @@ class MassEnv:
         )
         self.action = a * 0.1
 
-        t = self.data.time
+        t = self.engine.get_time()
         dt_ctrl = 1.0 / self.control_hz
         mj_q, mj_v = self.character.get_target_pos_and_vel_mujoco(t, dt_ctrl)
         self.target_positions_mj = mj_q.copy()
@@ -347,8 +358,17 @@ class MassEnv:
             Concatenated JtA vector of shape (num_total_related_dofs,).
         """
         ms = self.muscle_system
-        ms.update_all(self.engine)
-        return ms.get_all_muscle_torques(self.engine)
+        if ms is not None:
+            ms.update_all(self.engine)
+            return ms.get_all_muscle_torques(self.engine)
+
+        out = []
+        for muscle in self.muscles:
+            muscle.update(self.engine)
+            out.append(muscle.get_related_jta(self.engine))
+        if not out:
+            return np.zeros((0,), dtype=np.float64)
+        return np.concatenate(out)
 
     # ------------------------------------------------------------------
     # Step
@@ -365,11 +385,14 @@ class MassEnv:
             # Clear external forces before applying muscles
             self.engine.clear_applied_forces()
 
-            # Vectorized: update all anchor positions + l_mt + l_m
-            ms.update_all(self.engine)
-
-            # Vectorized: compute and apply all muscle forces
-            ms.apply_forces_all(self.engine, self.activation_levels)
+            if ms is not None:
+                ms.update_all(self.engine)
+                ms.apply_forces_all(self.engine, self.activation_levels)
+            else:
+                for muscle, activation in zip(self.muscles, self.activation_levels):
+                    muscle.activation = float(activation)
+                    muscle.update(self.engine)
+                    muscle.apply_force_to_body(self.engine)
 
             # At random step, collect muscle tuple
             if self.sim_count == self.random_sample_index:
@@ -391,6 +414,36 @@ class MassEnv:
         """
         ms = self.muscle_system
         nv = self.engine.nv
+        if ms is None:
+            n_muscles = len(self.muscles)
+            JtA_full = np.zeros((nv, n_muscles), dtype=np.float64)
+            Jtp = np.zeros(nv, dtype=np.float64)
+
+            for m_i, muscle in enumerate(self.muscles):
+                Jt = muscle.get_jacobian_transpose(self.engine)
+                A, p = muscle.get_force_jacobian_and_passive()
+                JtA_full[:, m_i] = Jt @ A
+                Jtp += Jt @ p
+
+            jta_parts = []
+            for m_i, muscle in enumerate(self.muscles):
+                for d in muscle.related_dof_indices:
+                    jta_parts.append(JtA_full[int(d), m_i])
+            JtA = np.asarray(jta_parts, dtype=np.float64)
+
+            L_matrix = JtA_full[self.root_joint_dof:, :]
+            L_vectorized = L_matrix.ravel()
+            b = Jtp[self.root_joint_dof:]
+            tau_des = self.desired_torque[self.root_joint_dof:]
+            self.current_muscle_tuple = MuscleTuple(
+                JtA=JtA.copy(),
+                L=L_vectorized.copy(),
+                b=b.copy(),
+                tau_des=tau_des.copy(),
+            )
+            self.muscle_tuples.append(self.current_muscle_tuple)
+            return
+
         n_muscles = ms.n_muscles
 
         # Compute full JtA matrix and Jtp using MuscleSystem cached data
@@ -730,61 +783,83 @@ class MassEnv:
             f_a: (num_muscles,) active force scalar f0 * g_al(l_m_norm)
             f_p: (num_muscles,) passive force scalar f0 * g_pl(l_m_norm)
         """
-        ms = self.muscle_system
-        assert ms is not None, "compute_diagnostics requires use_muscle=True"
         nv = self.engine.nv
-        n_muscles = ms.n_muscles
+        ms = self.muscle_system
+        if ms is None:
+            n_muscles = len(self.muscles)
+            R_full = np.zeros((nv, n_muscles), dtype=np.float64)
+            L_full = np.zeros((nv, n_muscles), dtype=np.float64)
+            Jtp_full = np.zeros(nv, dtype=np.float64)
+            f_a_arr = np.zeros(n_muscles, dtype=np.float64)
+            f_p_arr = np.zeros(n_muscles, dtype=np.float64)
+            l_m_norm_arr = np.zeros(n_muscles, dtype=np.float64)
 
-        ms.update_all(self.engine)
+            for m_i, muscle in enumerate(self.muscles):
+                muscle.update(self.engine)
+                Jt = muscle.get_jacobian_transpose(self.engine)
+                A, p = muscle.get_force_jacobian_and_passive()
+                f_a = muscle.get_f_A()
+                f_p = muscle.get_f_p()
+                if abs(f_a) > 1e-12:
+                    R_full[:, m_i] = Jt @ (A / f_a)
+                L_full[:, m_i] = Jt @ A
+                Jtp_full += Jt @ p
+                f_a_arr[m_i] = f_a
+                f_p_arr[m_i] = f_p
+                l_m_norm_arr[m_i] = muscle.l_m / muscle.l_m0
+        else:
+            n_muscles = ms.n_muscles
 
-        R_full = np.zeros((nv, n_muscles), dtype=np.float64)
-        L_full = np.zeros((nv, n_muscles), dtype=np.float64)
-        Jtp_full = np.zeros(nv, dtype=np.float64)
-        f_a_arr = np.zeros(n_muscles, dtype=np.float64)
-        f_p_arr = np.zeros(n_muscles, dtype=np.float64)
-        l_m_norm_arr = np.zeros(n_muscles, dtype=np.float64)
+            ms.update_all(self.engine)
 
-        for m_i in range(n_muscles):
-            start = ms.muscle_anchor_start[m_i]
-            n_anc = ms.muscle_n_anchors[m_i]
-            positions = ms.anchor_world_pos[start : start + n_anc]
+            R_full = np.zeros((nv, n_muscles), dtype=np.float64)
+            L_full = np.zeros((nv, n_muscles), dtype=np.float64)
+            Jtp_full = np.zeros(nv, dtype=np.float64)
+            f_a_arr = np.zeros(n_muscles, dtype=np.float64)
+            f_p_arr = np.zeros(n_muscles, dtype=np.float64)
+            l_m_norm_arr = np.zeros(n_muscles, dtype=np.float64)
 
-            force_dir = np.zeros((n_anc, 3), dtype=np.float64)
-            for k in range(n_anc - 1):
-                d = positions[k + 1] - positions[k]
-                norm = np.linalg.norm(d)
-                if norm > 1e-12:
-                    d = d / norm
-                force_dir[k] = force_dir[k] + d
-            for k in range(1, n_anc):
-                d = positions[k - 1] - positions[k]
-                norm = np.linalg.norm(d)
-                if norm > 1e-12:
-                    d = d / norm
-                force_dir[k] = force_dir[k] + d
+            for m_i in range(n_muscles):
+                start = ms.muscle_anchor_start[m_i]
+                n_anc = ms.muscle_n_anchors[m_i]
+                positions = ms.anchor_world_pos[start : start + n_anc]
 
-            col_R = np.zeros(nv, dtype=np.float64)
-            for a_i in range(n_anc):
-                point = ms.anchor_world_pos[start + a_i]
-                bid = int(ms.anchor_primary_bid[start + a_i])
-                jacp = self.engine.get_linear_jacobian(point, bid)
-                col_R += jacp.T @ force_dir[a_i]
-            R_full[:, m_i] = col_R
+                force_dir = np.zeros((n_anc, 3), dtype=np.float64)
+                for k in range(n_anc - 1):
+                    d = positions[k + 1] - positions[k]
+                    norm = np.linalg.norm(d)
+                    if norm > 1e-12:
+                        d = d / norm
+                    force_dir[k] = force_dir[k] + d
+                for k in range(1, n_anc):
+                    d = positions[k - 1] - positions[k]
+                    norm = np.linalg.norm(d)
+                    if norm > 1e-12:
+                        d = d / norm
+                    force_dir[k] = force_dir[k] + d
 
-            l_m_norm = ms.l_m[m_i] / ms.l_m0[m_i]
-            f_a = ms.f0[m_i] * np.exp(-((l_m_norm - 1.0) ** 2) / 0.5)
-            if l_m_norm < 1.0:
-                f_p = 0.0
-            else:
-                f_p = ms.f0[m_i] * (
-                    np.exp(4.0 * (l_m_norm - 1.0) / 0.6) - 1.0
-                ) / (np.exp(4.0) - 1.0)
+                col_R = np.zeros(nv, dtype=np.float64)
+                for a_i in range(n_anc):
+                    point = ms.anchor_world_pos[start + a_i]
+                    bid = int(ms.anchor_primary_bid[start + a_i])
+                    jacp = self.engine.get_linear_jacobian(point, bid)
+                    col_R += jacp.T @ force_dir[a_i]
+                R_full[:, m_i] = col_R
 
-            L_full[:, m_i] = col_R * f_a
-            Jtp_full += col_R * f_p
-            f_a_arr[m_i] = f_a
-            f_p_arr[m_i] = f_p
-            l_m_norm_arr[m_i] = l_m_norm
+                l_m_norm = ms.l_m[m_i] / ms.l_m0[m_i]
+                f_a = ms.f0[m_i] * np.exp(-((l_m_norm - 1.0) ** 2) / 0.5)
+                if l_m_norm < 1.0:
+                    f_p = 0.0
+                else:
+                    f_p = ms.f0[m_i] * (
+                        np.exp(4.0 * (l_m_norm - 1.0) / 0.6) - 1.0
+                    ) / (np.exp(4.0) - 1.0)
+
+                L_full[:, m_i] = col_R * f_a
+                Jtp_full += col_R * f_p
+                f_a_arr[m_i] = f_a
+                f_p_arr[m_i] = f_p
+                l_m_norm_arr[m_i] = l_m_norm
 
         R = R_full[self.root_joint_dof :, :]
         L = L_full[self.root_joint_dof :, :]
