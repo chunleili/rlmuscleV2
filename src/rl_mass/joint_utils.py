@@ -87,6 +87,13 @@ MASS_BVH_MAP: dict[str, str] = {
     "HandL": "Character1_LeftHand",
 }
 
+# Identity map for BVH files that already use MASS-native body names (the same
+# names muscle284.xml and humanoid.xml use). Covers all 23 bodies, including
+# Torso / FootPinky{L,R} / FootThumb{L,R} / Head which have no Mixamo
+# counterpart in MASS_BVH_MAP. Pick this map when your retarget exports the
+# MASS skeleton directly (e.g. Houdini /obj/motion_retarget/OUT_MASS_*).
+MASS_NATIVE_BVH_MAP: dict[str, str] = {name: name for name in MASS_BODY_NAMES}
+
 # DART DOFs per joint type
 _DART_DOF = {"Free": 6, "Ball": 3, "Revolute": 1}
 # MuJoCo qpos size per joint type

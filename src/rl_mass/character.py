@@ -96,9 +96,19 @@ class Character:
         # Zero gains for root DOFs (first 6 for FreeJoint)
         # (applied in GetSPDForces by zeroing tau[0:6])
 
-    def load_bvh(self, filepath: str, cyclic: bool = True) -> None:
-        """Load and parse a BVH file."""
-        self.bvh = BVH()
+    def load_bvh(
+        self,
+        filepath: str,
+        cyclic: bool = True,
+        bvh_map: Optional[dict[str, str]] = None,
+    ) -> None:
+        """Load and parse a BVH file.
+
+        bvh_map: body_name -> BVH joint name. None uses the default Mixamo-style
+        MASS_BVH_MAP. Pass joint_utils.MASS_NATIVE_BVH_MAP for BVH files that
+        already use MASS body names (no Character1_* layer).
+        """
+        self.bvh = BVH(bvh_map=bvh_map)
         self.bvh.parse(filepath, cyclic)
 
     def reset(self) -> None:
