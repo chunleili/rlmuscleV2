@@ -1,8 +1,12 @@
 <?xml version='1.0' encoding='utf-8'?>
 <mujoco model="mass_humanoid_swim">
     <compiler angle="radian" eulerseq="XYZ" />
-    <!-- Swim task: zero gravity, no ground plane. Pose-only imitation. -->
-    <option gravity="0 0 0" integrator="Euler" solver="Newton" timestep="0.00166667" />
+    <!-- Swim task: zero gravity, no ground plane. Pose-only imitation.
+         Fluid drag (density + viscosity) damps the otherwise-conserved
+         angular momentum that lets a no-gravity character spin around its
+         long axis like a top. Density 1000 = water; tune viscosity to
+         control angular damping strength. -->
+    <option gravity="0 0 0" density="1000" viscosity="0.1" integrator="Euler" solver="Newton" timestep="0.00166667" />
     <default>
         <joint damping="0.4" />
         <geom condim="3" friction="0.8 0.005 0.0001" rgba="0.6 0.6 0.8 1" />
