@@ -1,0 +1,136 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujoco model="mass_humanoid_swim_ellipsoid">
+    <compiler angle="radian" eulerseq="XYZ" />
+    <!-- Swim task v2: micro-gravity + ellipsoid fluidshape.
+         Inertia-box fluid model was too weak on body long axis (cross-section
+         r derived from diagonal inertia is tiny -> r^4 angular drag negligible).
+         Per-geom ellipsoid fluidshape uses actual geom extents and adds a
+         buoyancy *moment* via center-of-buoyancy vs center-of-mass offset —
+         passive righting torque kills the top-like spin.
+         Micro-gravity (-0.5 m/s^2) supplies an absolute "up" so the CoB-CoG
+         moment has a direction to align with. Viscosity back to ~water (1e-3);
+         the ellipsoid model provides the strong drag now. -->
+    <option gravity="0 0 -0.5" density="1000" viscosity="0.001" integrator="Euler" solver="Newton" timestep="0.00166667" />
+    <default>
+        <joint damping="0.4" />
+        <geom condim="3" friction="0.8 0.005 0.0001" rgba="0.6 0.6 0.8 1" fluidshape="ellipsoid" />
+    </default>
+    <worldbody>
+        <light pos="0 3 3" dir="0 -1 -1" diffuse="1 1 1" />
+        <body name="Pelvis" pos="0 0.9809 -0.0308" quat="1 0 0 0">
+            <inertial pos="0 0 0" quat="1 0 0 0" mass="15" diaginertia="0.047357 0.075167 0.080663" />
+            <freejoint name="j_Pelvis" />
+            <geom name="g_Pelvis" type="box" size="0.10415 0.0727 0.0647" pos="0 0 0" quat="1 0 0 0" contype="0" conaffinity="0" />
+            <body name="FemurR" pos="-0.0903 -0.0472 0.0192" quat="1 0 0 0">
+                <inertial pos="-0.0056 -0.2096 -0.0111" quat="0.007477 0.994583 -0.007833 -0.103382" mass="7" diaginertia="0.106751 0.020824 0.104774" />
+                <joint name="j_FemurR" type="ball" range="0 2" limited="true" />
+                <geom name="g_FemurR" type="box" size="0.06355 0.20215 0.0699" pos="-0.0056 -0.2096 -0.0111" quat="0.007477 0.994583 -0.007833 -0.103382" contype="0" conaffinity="0" />
+                <body name="TibiaR" pos="-0.0092 -0.395 0.0013" quat="1 0 0 0">
+                    <inertial pos="0.0067 -0.2369 -0.0238" quat="-0.043634 0.998895 0.017436 -0.000762" mass="3" diaginertia="0.046436 0.006843 0.046769" />
+                    <joint name="j_TibiaR" type="hinge" axis="1 0 0" range="0 2.3" limited="true" />
+                    <geom name="g_TibiaR" type="box" size="0.0599 0.2078 0.05705" pos="0.0067 -0.2369 -0.0238" quat="-0.043634 0.998895 0.017436 -0.000762" contype="0" conaffinity="0" />
+                    <body name="TalusR" pos="0.0195 -0.4611 -0.0316" quat="1 0 0 0">
+                        <inertial pos="-0.0026 -0.0373 0.0177" quat="-0.013621 0.994378 0.011437 0.104386" mass="0.6" diaginertia="0.001356 0.001518 0.00041" />
+                        <joint name="j_TalusR" type="ball" range="0 1" limited="true" />
+                        <geom name="g_TalusR" type="box" size="0.0378 0.0249 0.0785" pos="-0.0026 -0.0373 0.0177" quat="-0.013621 0.994378 0.011437 0.104386" />
+                        <body name="FootThumbR" pos="0.0019 -0.0575 0.1111" quat="1 0 0 0">
+                            <inertial pos="0.0016 0.0067 0.0246" quat="-0.009337 0.996127 -0.005657 0.087242" mass="0.2" diaginertia="0.000064 0.00008 0.000039" />
+                            <joint name="j_FootThumbR" type="hinge" axis="1 0 0" range="-0.6 0.6" limited="true" />
+                            <geom name="g_FootThumbR" type="box" size="0.02035 0.0131 0.02815" pos="0.0016 0.0067 0.0246" quat="-0.009337 0.996127 -0.005657 0.087242" />
+                        </body>
+                        <body name="FootPinkyR" pos="-0.0427 -0.0634 0.0913" quat="1 0 0 0">
+                            <inertial pos="-0.0017 0.0127 0.0316" quat="-0.006258 0.984902 0.005312 0.172917" mass="0.2" diaginertia="0.000056 0.000076 0.000039" />
+                            <joint name="j_FootPinkyR" type="hinge" axis="1 0 0" range="-0.6 0.6" limited="true" />
+                            <geom name="g_FootPinkyR" type="box" size="0.0211 0.0119 0.02645" pos="-0.0017 0.0127 0.0316" quat="-0.006258 0.984902 0.005312 0.172917" />
+                        </body>
+                    </body>
+                </body>
+            </body>
+            <body name="FemurL" pos="0.0903 -0.0472 0.0192" quat="1 0 0 0">
+                <inertial pos="0.0056 -0.2096 -0.0111" quat="0.994583 -0.007477 -0.103382 0.007833" mass="7" diaginertia="0.106751 0.020824 0.104774" />
+                <joint name="j_FemurL" type="ball" range="0 2" limited="true" />
+                <geom name="g_FemurL" type="box" size="0.06355 0.20215 0.0699" pos="0.0056 -0.2096 -0.0111" quat="0.994583 -0.007477 -0.103382 0.007833" contype="0" conaffinity="0" />
+                <body name="TibiaL" pos="0.0092 -0.395 0.0013" quat="1 0 0 0">
+                    <inertial pos="-0.0067 -0.2369 -0.0238" quat="0.998895 0.043634 -0.000762 -0.017436" mass="3" diaginertia="0.046436 0.006843 0.046769" />
+                    <joint name="j_TibiaL" type="hinge" axis="1 0 0" range="0 2.3" limited="true" />
+                    <geom name="g_TibiaL" type="box" size="0.0599 0.2078 0.05705" pos="-0.0067 -0.2369 -0.0238" quat="0.998895 0.043634 -0.000762 -0.017436" contype="0" conaffinity="0" />
+                    <body name="TalusL" pos="-0.0195 -0.4611 -0.0316" quat="1 0 0 0">
+                        <inertial pos="0.0026 -0.0373 0.0177" quat="0.994378 0.013621 0.104386 -0.011437" mass="0.6" diaginertia="0.001356 0.001518 0.00041" />
+                        <joint name="j_TalusL" type="ball" range="0 1" limited="true" />
+                        <geom name="g_TalusL" type="box" size="0.0378 0.0249 0.0785" pos="0.0026 -0.0373 0.0177" quat="0.994378 0.013621 0.104386 -0.011437" />
+                        <body name="FootThumbL" pos="0.0415 -0.066 0.0913" quat="1 0 0 0">
+                            <inertial pos="0.0029 0.0153 0.0316" quat="0.984902 0.006258 0.172917 -0.005312" mass="0.2" diaginertia="0.000064 0.00008 0.000039" />
+                            <joint name="j_FootThumbL" type="hinge" axis="1 0 0" range="-0.6 0.6" limited="true" />
+                            <geom name="g_FootThumbL" type="box" size="0.02035 0.0131 0.02815" pos="0.0029 0.0153 0.0316" quat="0.984902 0.006258 0.172917 -0.005312" />
+                        </body>
+                        <body name="FootPinkyL" pos="-0.0044 -0.0658 0.1095" quat="1 0 0 0">
+                            <inertial pos="0.0009 0.015 0.0262" quat="0.996127 0.009337 0.087242 0.005657" mass="0.2" diaginertia="0.000056 0.000076 0.000039" />
+                            <joint name="j_FootPinkyL" type="hinge" axis="1 0 0" range="-0.6 0.6" limited="true" />
+                            <geom name="g_FootPinkyL" type="box" size="0.0211 0.0119 0.02645" pos="0.0009 0.015 0.0262" quat="0.996127 0.009337 0.087242 0.005657" />
+                        </body>
+                    </body>
+                </body>
+            </body>
+            <body name="Spine" pos="0 0.0866 -0.0126" quat="1 0 0 0">
+                <inertial pos="0 0.0529 0.0033" quat="1 0 0 0" mass="5" diaginertia="0.008003 0.009738 0.009673" />
+                <joint name="j_Spine" type="ball" range="0 0.4" limited="true" />
+                <geom name="g_Spine" type="box" size="0.0585 0.0488 0.0492" pos="0 0.0529 0.0033" quat="1 0 0 0" contype="0" conaffinity="0" />
+                <body name="Torso" pos="0 0.1086 -0.0064" quat="1 0 0 0">
+                    <inertial pos="0 0.1271 0.01" quat="0.999989 0.0046 0 0" mass="10" diaginertia="0.054536 0.041836 0.06658" />
+                    <joint name="j_Torso" type="ball" range="0 0.4" limited="true" />
+                    <geom name="g_Torso" type="box" size="0.0899 0.10905 0.06685" pos="0 0.1271 0.01" quat="0.999989 0.0046 0 0" contype="0" conaffinity="0" />
+                    <body name="Neck" pos="0 0.3083 0.0062" quat="1 0 0 0">
+                        <inertial pos="0 0.0453 0.0186" quat="0.99327 0.115826 0 0" mass="2" diaginertia="0.001592 0.001757 0.001931" />
+                        <joint name="j_Neck" type="ball" range="0 1.5" limited="true" />
+                        <geom name="g_Neck" type="box" size="0.03965 0.0364 0.0326" pos="0 0.0453 0.0186" quat="0.99327 0.115826 0 0" contype="0" conaffinity="0" />
+                        <body name="Head" pos="0 0.0808 0.035" quat="1 0 0 0">
+                            <inertial pos="0 0.0875 -0.0037" quat="0.997366 0.072539 0 0" mass="2" diaginertia="0.004447 0.00439 0.004306" />
+                            <joint name="j_Head" type="ball" range="0 1.5" limited="true" />
+                            <geom name="g_Head" type="box" size="0.05645 0.0572 0.0583" pos="0 0.0875 -0.0037" quat="0.997366 0.072539 0 0" contype="0" conaffinity="0" />
+                        </body>
+                    </body>
+                    <body name="ShoulderR" pos="-0.0147 0.2774 0.0117" quat="1 0 0 0">
+                        <inertial pos="-0.0834 0.0109 -0.001" quat="0.000466 0.99962 -0.002364 0.027459" mass="1" diaginertia="0.000682 0.002574 0.002563" />
+                        <joint name="j_ShoulderR" type="ball" range="0 0.5" limited="true" />
+                        <geom name="g_ShoulderR" type="box" size="0.08175 0.0317 0.03225" pos="-0.0834 0.0109 -0.001" quat="0.000466 0.99962 -0.002364 0.027459" contype="0" conaffinity="0" />
+                        <body name="ArmR" pos="-0.1848 -0.0185 0.0028" quat="1 0 0 0">
+                            <inertial pos="-0.1583 0.0172 0.0118" quat="0.592759 0.80415 -0.00958 -0.043437" mass="1" diaginertia="0.000452 0.009443 0.00948" />
+                            <joint name="j_ArmR" type="ball" range="0 2" limited="true" />
+                            <geom name="g_ArmR" type="box" size="0.16645 0.0271 0.02495" pos="-0.1583 0.0172 0.0118" quat="0.592759 0.80415 -0.00958 -0.043437" contype="0" conaffinity="0" />
+                            <body name="ForeArmR" pos="-0.3239 0.0257 0.0248" quat="1 0 0 0">
+                                <inertial pos="-0.144 0.0092 0.0046" quat="0.570358 0.81924 0.009342 -0.058741" mass="0.5" diaginertia="0.000216 0.002992 0.002989" />
+                                <joint name="j_ForeArmR" type="hinge" axis="0 1 0" range="0 2.3" limited="true" />
+                                <geom name="g_ForeArmR" type="box" size="0.1315 0.0253 0.02565" pos="-0.144 0.0092 0.0046" quat="0.570358 0.81924 0.009342 -0.058741" contype="0" conaffinity="0" />
+                                <body name="HandR" pos="-0.2868 0.0083 0.0299" quat="1 0 0 0">
+                                    <inertial pos="-0.0708 -0.0043 0.0121" quat="0.097231 0.987997 0.116397 -0.029334" mass="0.2" diaginertia="0.000121 0.000404 0.000286" />
+                                    <joint name="j_HandR" type="ball" range="0 0.7" limited="true" />
+                                    <geom name="g_HandR" type="box" size="0.0653 0.0052 0.0423" pos="-0.0708 -0.0043 0.0121" quat="0.097231 0.987997 0.116397 -0.029334" contype="0" conaffinity="0" />
+                                </body>
+                            </body>
+                        </body>
+                    </body>
+                    <body name="ShoulderL" pos="0.0147 0.2774 0.0117" quat="1 0 0 0">
+                        <inertial pos="0.0834 0.0109 -0.001" quat="0.99962 -0.000466 0.027459 0.002364" mass="1" diaginertia="0.000682 0.002574 0.002563" />
+                        <joint name="j_ShoulderL" type="ball" range="0 0.5" limited="true" />
+                        <geom name="g_ShoulderL" type="box" size="0.08175 0.0317 0.03225" pos="0.0834 0.0109 -0.001" quat="0.99962 -0.000466 0.027459 0.002364" contype="0" conaffinity="0" />
+                        <body name="ArmL" pos="0.1848 -0.0185 0.0028" quat="1 0 0 0">
+                            <inertial pos="0.1583 0.0172 0.0118" quat="0.80415 -0.592759 -0.043437 0.00958" mass="1" diaginertia="0.000452 0.009443 0.00948" />
+                            <joint name="j_ArmL" type="ball" range="0 2" limited="true" />
+                            <geom name="g_ArmL" type="box" size="0.16645 0.0271 0.02495" pos="0.1583 0.0172 0.0118" quat="0.80415 -0.592759 -0.043437 0.00958" contype="0" conaffinity="0" />
+                            <body name="ForeArmL" pos="0.3239 0.0257 0.0248" quat="1 0 0 0">
+                                <inertial pos="0.144 0.0092 0.0046" quat="0.81924 -0.570358 -0.058741 -0.009342" mass="0.5" diaginertia="0.000216 0.002992 0.002989" />
+                                <joint name="j_ForeArmL" type="hinge" axis="0 1 0" range="-2.3 0" limited="true" />
+                                <geom name="g_ForeArmL" type="box" size="0.1315 0.0253 0.02565" pos="0.144 0.0092 0.0046" quat="0.81924 -0.570358 -0.058741 -0.009342" contype="0" conaffinity="0" />
+                                <body name="HandL" pos="0.2868 0.0087 0.0299" quat="1 0 0 0">
+                                    <inertial pos="0.0711 -0.0054 0.0121" quat="0.987997 -0.097231 -0.029334 -0.116397" mass="0.2" diaginertia="0.000121 0.000404 0.000286" />
+                                    <joint name="j_HandL" type="ball" range="0 0.7" limited="true" />
+                                    <geom name="g_HandL" type="box" size="0.0653 0.0052 0.0423" pos="0.0711 -0.0054 0.0121" quat="0.987997 -0.097231 -0.029334 -0.116397" contype="0" conaffinity="0" />
+                                </body>
+                            </body>
+                        </body>
+                    </body>
+                </body>
+            </body>
+        </body>
+    </worldbody>
+</mujoco>
