@@ -360,6 +360,31 @@ class MuscleSystem:
         self.related_dof_indices = [m.related_dof_indices for m in muscles]
         self.num_related_dofs = [m.num_related_dofs for m in muscles]
 
+        # --- Body-grouped anchor index for batched mj_jacBodyCom path ---
+        # Each anchor lives on one primary body. Group anchors by body so we
+        # call mj_jacBodyCom once per unique body (~tens) instead of mj_jac
+        # per anchor (~thousands). Then reuse the (jacp_com, jacr) pair to
+        # project all anchors on that body via the wrench-at-COM identity.
+        anchor_muscle_id = np.zeros(total_anchors, dtype=np.int32)
+        for m_i in range(n_muscles):
+            s = muscle_anchor_start[m_i]
+            n = muscle_n_anchors[m_i]
+            anchor_muscle_id[s : s + n] = m_i
+        self.anchor_muscle_id = anchor_muscle_id
+
+        unique_bodies, inverse = np.unique(anchor_primary_bid, return_inverse=True)
+        self.unique_bodies = unique_bodies.astype(np.int32)
+        # body_anchor_lists[k] = anchor indices whose primary body == unique_bodies[k]
+        self.body_anchor_lists = [
+            np.where(inverse == k)[0].astype(np.int32)
+            for k in range(len(unique_bodies))
+        ]
+
+        # related_dof_indices_arr[m] as np.int32 array for fast fancy indexing
+        self.related_dof_indices_arr = [
+            np.asarray(idx, dtype=np.int32) for idx in self.related_dof_indices
+        ]
+
     def update_all(self, engine: PhysicsEngine) -> None:
         """Update all anchor world positions, l_mt, and l_m in batch."""
         data = engine.data  # type: ignore[attr-defined]
@@ -482,59 +507,64 @@ class MuscleSystem:
     ) -> np.ndarray:
         """Compute concatenated related JtA for all muscles.
 
-        This is equivalent to calling muscle.get_related_jta() for each muscle
-        and concatenating, but reuses the already-computed anchor positions.
-
-        Note: This still calls mj_jac per anchor (unavoidable with current
-        MuJoCo API), but avoids redundant update() calls.
+        Body-grouped fast path. For each unique primary body of all anchors,
+        call mj_jacBodyCom once (jacp at xipos, jacr). For any anchor at
+        world point p on body b with applied force w, the JtA contribution is
+            jac(p,b).T @ w  ==  jacp_com.T @ w + jacr.T @ (r × w)
+        where r = p - xipos[b]. This avoids the per-anchor mj_jac call (and
+        per-muscle explicit Jt matrix) of the old path. Reduces mj_jac-style
+        calls from O(total_anchors × muscle_substeps) to O(unique_bodies ×
+        muscle_substeps).
         """
-        total_related = sum(self.num_related_dofs)
-        result = np.zeros(total_related, dtype=np.float64)
+        data = engine.data  # type: ignore[attr-defined]
         nv = engine.nv
 
+        # --- Per-anchor force vector w_a = f_a[muscle(a)] * force_dir[a] ---
+        # f_a (active force coefficient) is per muscle, same formula as
+        # apply_forces_all / old get_all_muscle_torques.
+        l_m_norm = self.l_m / self.l_m0
+        f_a_muscle = self.f0 * np.exp(-((l_m_norm - 1.0) ** 2) / 0.5)
+
+        # Per-anchor accumulated unit direction (forward outgoing + backward
+        # incoming segment dirs). Same accumulation pattern as
+        # _collect_muscle_tuple.force_dir_all.
+        diff = self.anchor_world_pos[self.seg_b] - self.anchor_world_pos[self.seg_a]
+        seg_norm = np.linalg.norm(diff, axis=1)
+        seg_dir = diff.copy()
+        nz = seg_norm > 1e-12
+        seg_dir[nz] = diff[nz] / seg_norm[nz, None]
+        force_dir_all = np.zeros((self.total_anchors, 3), dtype=np.float64)
+        np.add.at(force_dir_all, self.seg_a, seg_dir)
+        np.add.at(force_dir_all, self.seg_b, -seg_dir)
+
+        f_a_per_anchor = f_a_muscle[self.anchor_muscle_id]
+        wrench_F = force_dir_all * f_a_per_anchor[:, None]  # (total_anchors, 3)
+
+        # --- Per-anchor torque about its primary body's COM (xipos) ---
+        # r = anchor_world_pos - xipos[primary_bid]; T = r × F
+        bids = self.anchor_primary_bid
+        r = self.anchor_world_pos - data.xipos[bids]
+        wrench_T = np.cross(r, wrench_F)  # (total_anchors, 3)
+
+        # --- Accumulate JtA per muscle by iterating over unique bodies ---
+        JtA_per_muscle = np.zeros((self.n_muscles, nv), dtype=np.float64)
+        for k, bid in enumerate(self.unique_bodies):
+            jacp_com, jacr = engine.get_body_com_jacobians(int(bid))  # (3, nv) each
+            anc_idx = self.body_anchor_lists[k]  # anchors on this body
+            # contrib[i,:] = wrench_F[anc].T @ jacp_com + wrench_T[anc].T @ jacr
+            # i.e. for each anchor row, project wrench through this body's
+            # jacobians. Vectorized over anchors on this body.
+            contribs = wrench_F[anc_idx] @ jacp_com + wrench_T[anc_idx] @ jacr  # (k, nv)
+            np.add.at(JtA_per_muscle, self.anchor_muscle_id[anc_idx], contribs)
+
+        # --- Flatten to concatenated related-DOF result ---
+        total_related = sum(self.num_related_dofs)
+        result = np.empty(total_related, dtype=np.float64)
         idx = 0
         for m_i in range(self.n_muscles):
-            start = self.muscle_anchor_start[m_i]
-            n_anc = self.muscle_n_anchors[m_i]
-
-            # Build Jacobian transpose
-            Jt = np.zeros((nv, 3 * n_anc), dtype=np.float64)
-            for a_i in range(n_anc):
-                flat_idx = start + a_i
-                point = self.anchor_world_pos[flat_idx]
-                bid = self.anchor_primary_bid[flat_idx]
-                jacp = engine.get_linear_jacobian(point, bid)
-                Jt[:, a_i * 3 : (a_i + 1) * 3] = jacp.T
-
-            # Force Jacobian (A vector)
-            l_m_norm = self.l_m[m_i] / self.l_m0[m_i]
-            f_a = self.f0[m_i] * np.exp(-((l_m_norm - 1.0) ** 2) / 0.5)
-
-            # Force directions (same logic as apply_force_to_body)
-            force_dir = np.zeros((n_anc, 3), dtype=np.float64)
-            positions = self.anchor_world_pos[start : start + n_anc]
-
-            for k in range(n_anc - 1):
-                d = positions[k + 1] - positions[k]
-                norm = np.linalg.norm(d)
-                if norm > 1e-12:
-                    d /= norm
-                force_dir[k] += d
-
-            for k in range(1, n_anc):
-                d = positions[k - 1] - positions[k]
-                norm = np.linalg.norm(d)
-                if norm > 1e-12:
-                    d /= norm
-                force_dir[k] += d
-
-            A = (force_dir * f_a).ravel()
-            JtA = Jt @ A
-
-            # Extract related DOFs
-            n_rel = self.num_related_dofs[m_i]
-            for i, dof_idx in enumerate(self.related_dof_indices[m_i]):
-                result[idx + i] = JtA[dof_idx]
+            rel = self.related_dof_indices_arr[m_i]
+            n_rel = rel.size
+            result[idx : idx + n_rel] = JtA_per_muscle[m_i, rel]
             idx += n_rel
 
         return result

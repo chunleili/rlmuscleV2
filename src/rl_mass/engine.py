@@ -261,6 +261,9 @@ class MuJoCoEngine(PhysicsEngine):
 
         # Reusable buffer for get_linear_jacobian (avoids per-call np.zeros).
         self._jacp_buf = np.zeros((3, self.model.nv), dtype=np.float64)
+        # Reusable buffers for body-COM jacobians (translational + rotational).
+        self._jacp_com_buf = np.zeros((3, self.model.nv), dtype=np.float64)
+        self._jacr_com_buf = np.zeros((3, self.model.nv), dtype=np.float64)
 
     # ------------------------------------------------------------------
     # Dimensions
@@ -396,6 +399,13 @@ class MuJoCoEngine(PhysicsEngine):
         jacp = np.zeros((3, nv), dtype=np.float64)
         self._mj.mj_jacBodyCom(self.model, self.data, jacp, None, bid)
         return jacp
+
+    def get_body_com_jacobians(self, bid: int) -> tuple[np.ndarray, np.ndarray]:
+        """Return (jacp, jacr) at body COM (xipos). Buffers reused — copy if retained."""
+        jacp = self._jacp_com_buf
+        jacr = self._jacr_com_buf
+        self._mj.mj_jacBodyCom(self.model, self.data, jacp, jacr, bid)
+        return jacp, jacr
 
     # ------------------------------------------------------------------
     # Forces
