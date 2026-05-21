@@ -1,17 +1,27 @@
 """Evaluation & rendering for trained MASS-MuJoCo policy.
 
 Loads a trained SimulationNN + MuscleNN, runs deterministic rollouts,
-prints statistics, and optionally renders video.
+prints statistics, and optionally renders video / saves a body trajectory
+that downstream `tools/bake_motion.py` turns into a SkelAnimation USD.
+
+DEFAULT OUTPUT CONVENTION: produce a USD (via `--save-traj` + `bake_motion.py`,
+or `tools/eval_and_bake.sh`), NOT an mp4. Only render mp4 when the user
+explicitly asks for video. The two-step USD pipeline is the canonical eval
+artifact for this project.
 
 Usage:
     # Stats only
     PYTHONPATH=. uv run python rl_mass/eval.py -d data/rl_mass/config.json -m nn/max
 
-    # With video
-    PYTHONPATH=. MUJOCO_GL=egl uv run python rl_mass/eval.py \
-        -d data/rl_mass/config.json -m nn/max --video
+    # USD (canonical): save trajectory NPZ, then bake SkelAnimation USD
+    MUJOCO_GL=egl PYTHONPATH=. uv run python -m rl_mass.eval \
+        -d data/rl_mass/config.json -m nn/max --save-traj output/anim/run_traj.npz
+    uv run python tools/bake_motion.py \
+        --traj output/anim/run_traj.npz --asset data/rl_mass/snuV2.usd \
+        -o output/anim/run
+    # ... or use tools/eval_and_bake.sh which wraps both steps.
 
-    # Specify output path
+    # mp4 (only on explicit request)
     PYTHONPATH=. MUJOCO_GL=egl uv run python rl_mass/eval.py \
         -d data/rl_mass/config.json -m nn/max --video -o output/eval.mp4
 """
