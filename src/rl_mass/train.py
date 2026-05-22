@@ -607,7 +607,25 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PPO training for MASS-MuJoCo")
     parser.add_argument("-d", "--meta", help="Config JSON file", default="data/rl_mass/config.json")
     parser.add_argument("-m", "--model", default=None, help="Model name to resume from (e.g. current)")
-    parser.add_argument("--num_envs", type=int, default=16, help="Parallel env count")
+    parser.add_argument(
+        "--num_envs",
+        type=int,
+        default=None,
+        help="Parallel env count. If unset, picks --num_envs_cpu for serial/subproc "
+             "and --num_envs_gpu for warp.",
+    )
+    parser.add_argument(
+        "--num_envs_cpu",
+        type=int,
+        default=64,
+        help="Default num_envs for serial/subproc backends (used when --num_envs is unset)",
+    )
+    parser.add_argument(
+        "--num_envs_gpu",
+        type=int,
+        default=16384,
+        help="Default num_envs for warp backend (used when --num_envs is unset)",
+    )
     parser.add_argument(
         "--vec_env_mode",
         type=str,
@@ -653,6 +671,10 @@ if __name__ == "__main__":
              "with -m current and an existing CSV to extend a prior run.",
     )
     args = parser.parse_args()
+
+    if args.num_envs is None:
+        args.num_envs = args.num_envs_gpu if args.vec_env_mode == "warp" else args.num_envs_cpu
+    print(f"[num_envs] {args.num_envs} (mode={args.vec_env_mode})")
 
     ppo = PPO(
         args.meta,
