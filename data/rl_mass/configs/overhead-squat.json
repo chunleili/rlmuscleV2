@@ -6,6 +6,7 @@
     "muscle_file": "data/rl_mass/muscle284.xml",
     "bvh_file": "data/rl_mass/motion/overhead-squat.bvh",
     "bvh_cyclic": false,
+    "height_termination": false,
     "reward_param": {
         "w_q": 0.75,
         "w_v": 0.1,
