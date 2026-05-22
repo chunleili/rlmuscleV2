@@ -87,6 +87,13 @@ class MassEnv:
         self.w_ee: float = rp.get("w_ee", 0.15)
         self.w_com: float = rp.get("w_com", 0.1)
 
+        # Track the root's SO(3) rotation in r_q (and the pose-error
+        # termination norm) while still ignoring root translation. Useful for
+        # motions whose reference root translates non-trivially (e.g. a kick
+        # with a preroll wind-up), where penalizing translation drift makes
+        # tracking infeasible but rotation drift is still a meaningful signal.
+        self.track_root_rotation: bool = cfg.get("track_root_rotation", False)
+
         # Terminate episodes when the root drops below a standing height.
         # Disable for tasks with no ground/gravity (e.g. swimming), where the
         # reference pose is not upright and the root height is meaningless.
@@ -574,6 +581,12 @@ class MassEnv:
         for body_name, jt, dart_idx, dart_ndof in self._bvh_reward_info:
             p_diff[dart_idx : dart_idx + dart_ndof] = p_diff_all[dart_idx : dart_idx + dart_ndof]
 
+        # Optionally include the root's SO(3) rotation diff (DART FreeJoint
+        # layout: [exp_map(3), translation(3), ...]). Indices 3:6 (root
+        # translation) stay zero so translation drift is not penalized.
+        if self.track_root_rotation:
+            p_diff[0:3] = p_diff_all[0:3]
+
         # v_diff is NOT filtered in the original code:
         # v_diff stays zero, so r_v = exp(0) = 1.0.
 
@@ -652,6 +665,9 @@ class MassEnv:
         err = 0.0
         for _, _, dart_idx, dart_ndof in self._bvh_reward_info:
             seg = p_diff_all[dart_idx : dart_idx + dart_ndof]
+            err += float(np.dot(seg, seg))
+        if self.track_root_rotation:
+            seg = p_diff_all[0:3]
             err += float(np.dot(seg, seg))
         return err
 
