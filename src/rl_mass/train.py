@@ -188,7 +188,15 @@ class PPO:
         if self._packed_path:
             self.env.update_muscle_nn(self.muscle_model.state_dict())
 
-        states = self.env.get_states()  # (num_envs, num_state)
+        states_tensor_api = (
+            not self._packed_path and hasattr(self.env, "get_states_tensor")
+        )
+        if states_tensor_api:
+            states_t = self.env.get_states_tensor()
+            states = states_t.detach().cpu().numpy().astype(np.float64, copy=False)
+        else:
+            states_t = None
+            states = self.env.get_states()  # (num_envs, num_state)
         local_step = 0
         counter = 0
 
@@ -198,7 +206,10 @@ class PPO:
                 print(f"SIM : {local_step}", end="\r")
 
             # Forward pass through policy
-            states_tensor = Tensor(states.astype(np.float32))
+            if states_t is not None:
+                states_tensor = states_t.to(dtype=torch.float32)
+            else:
+                states_tensor = Tensor(states.astype(np.float32))
             a_dist, v = self.model(states_tensor)
 
             actions = a_dist.sample().cpu().detach().numpy()
@@ -291,6 +302,11 @@ class PPO:
             # batch path gathers in a single round-trip.
             if self._packed_path:
                 states = next_states
+            elif states_tensor_api:
+                states_t = self.env.get_states_tensor()
+                states = states_t.detach().cpu().numpy().astype(
+                    np.float64, copy=False
+                )
             else:
                 states = self.env.get_states()
 

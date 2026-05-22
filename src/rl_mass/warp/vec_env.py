@@ -120,6 +120,12 @@ class WarpVecEnv(MassVecEnv):
         self._latest_acts_t: Optional[torch.Tensor] = None
         self._acts_synced = True
 
+        # Cached long tensors for batched gather in get_states_tensor.
+        self._non_root_body_ids_t = torch.as_tensor(
+            self._non_root_body_ids, device=self._engine.device, dtype=torch.long
+        )
+        self._max_time = float(self.envs[0].character.bvh.max_time)
+
         # Batched muscle system shared across all worlds (topology is identical
         # since model is shared). Built from one MassEnv's muscle list — this
         # also gives us a CPU MuscleSystem for any per-world fallback callers.
@@ -135,26 +141,42 @@ class WarpVecEnv(MassVecEnv):
             self._activations_buf = None
 
     def get_states(self) -> np.ndarray:
-        root_R = self._engine.data.xmat.numpy()[:, self._root_bid, :, :]
-        root_t = self._engine.data.xpos.numpy()[:, self._root_bid, :]
-        body_com = self._engine.data.xipos.numpy()[:, self._non_root_body_ids, :]
-        rel = body_com - root_t[:, None, :]
-        rel_root = np.einsum("wji,wbj->wbi", root_R, rel, optimize=True)
+        return self.get_states_tensor().detach().cpu().numpy().astype(
+            np.float64, copy=False
+        )
 
-        body_vel = self._engine.data.cvel.numpy()[:, self._non_root_body_ids, 3:]
-        root_vel = self._engine.data.cvel.numpy()[:, self._root_bid, 3:]
-        max_time = self.envs[0].character.bvh.max_time
-        phi = np.fmod(self._engine.get_time(), max_time) / max_time
+    def get_states_tensor(self) -> torch.Tensor:
+        """Device-resident obs assembly. Returns (num_envs, num_state) float32.
+
+        Replaces 4 separate `.numpy()` syncs (xmat/xpos/xipos/cvel×2) with a
+        pure-GPU gather + einsum. Caller is free to keep the tensor on device
+        for policy forward; the numpy wrapper falls back to a single sync.
+        """
+        import warp as wp
+
+        xmat = wp.to_torch(self._engine.data.xmat)
+        xpos = wp.to_torch(self._engine.data.xpos)
+        xipos = wp.to_torch(self._engine.data.xipos)
+        cvel = wp.to_torch(self._engine.data.cvel)
+        time_t = wp.to_torch(self._engine.data.time)
+
+        root_R = xmat[:, self._root_bid, :, :]
+        root_t = xpos[:, self._root_bid, :]
+        body_com = xipos.index_select(1, self._non_root_body_ids_t)
+        rel = body_com - root_t.unsqueeze(1)
+        # einsum("wji,wbj->wbi", R, rel) = (R^T @ rel^T)^T per world
+        rel_root = torch.einsum("wji,wbj->wbi", root_R, rel)
+
+        body_vel = cvel.index_select(1, self._non_root_body_ids_t)[..., 3:]
+        root_vel = cvel[:, self._root_bid, 3:]
+        phi = torch.fmod(time_t, self._max_time) / self._max_time
 
         p = rel_root.reshape(self.num_envs, -1) * 0.8
-        v = np.concatenate(
-            [
-                body_vel.reshape(self.num_envs, -1),
-                root_vel,
-            ],
-            axis=1,
+        v = torch.cat(
+            [body_vel.reshape(self.num_envs, -1), root_vel],
+            dim=1,
         ) * 0.2
-        return np.concatenate([p, v, phi[:, None]], axis=1).astype(np.float64, copy=False)
+        return torch.cat([p, v, phi.unsqueeze(1)], dim=1).to(dtype=torch.float32)
 
     def set_actions(self, acts: np.ndarray) -> None:
         acts = np.asarray(acts, dtype=np.float64)
