@@ -16,6 +16,7 @@ from rl_mass.joint_utils import (
     dart_qpos_batch_to_mujoco,
     dart_position_differences,
     mujoco_qpos_to_dart,
+    mujoco_qpos_batch_to_dart,
 )
 from rl_mass.muscle import MuscleSystem
 from rl_mass.vec_env import MassVecEnv
@@ -196,12 +197,21 @@ class WarpVecEnv(MassVecEnv):
         target_v[:, 3:6] = target_vel_dart[:, :3]
         self._target_positions_mj[:] = target_q
         self._target_velocities_mj[:] = target_v
-        for i, (env, action) in enumerate(zip(self.envs, acts)):
-            env.action = np.asarray(action, dtype=np.float64).ravel() * 0.1
-            env.target_positions_mj = target_q[i].copy()
-            env.target_velocities_mj = target_v[i].copy()
+
+        # Batched precompute to drop per-env Python work:
+        # - scale all actions in one numpy op
+        # - draw all random_sample_indices in one call
+        # - skip target_q[i].copy() — target_q is fresh per call and never
+        #   mutated in-place by env code paths (always reassigned), so handing
+        #   each env a view is safe.
+        scaled = (acts * 0.1).astype(np.float64, copy=False)
+        rsi = np.random.randint(0, self.num_steps, size=self.num_envs)
+        for i, env in enumerate(self.envs):
+            env.action = scaled[i].ravel()
+            env.target_positions_mj = target_q[i]
+            env.target_velocities_mj = target_v[i]
             env.sim_count = 0
-            env.random_sample_index = random.randint(0, self.num_steps - 1)
+            env.random_sample_index = int(rsi[i])
             env.average_activation_levels[:] = 0.0
         self._metrics_dirty = True
 
@@ -231,26 +241,27 @@ class WarpVecEnv(MassVecEnv):
         consistent for the upcoming substep step.
         """
         self._engine.forward_dynamics()
-        p_des_dart = np.empty((self.num_envs, self._engine.nv), dtype=np.float32)
-        qdqdt_dart = np.empty_like(p_des_dart)
         q_mj = self._engine.get_qpos()
         dq = self._engine.get_qvel()
         dt = self._engine.timestep
 
-        for i, env in enumerate(self.envs):
-            p_des_i = self._target_positions_dart[i].copy()
-            p_des_i[env.root_joint_dof :] += env.action
-            p_des_dart[i] = p_des_i.astype(np.float32, copy=False)
+        # Batched p_des: target + per-env action appended after root DOFs.
+        rjd = int(self._root_joint_dof)
+        p_des = self._target_positions_dart.copy()
+        # All envs share the same root_joint_dof (asserted by _root_joint_dof
+        # being a scalar in __init__); stack actions in a single op.
+        actions_batch = np.stack(
+            [env.action for env in self.envs], axis=0
+        )
+        p_des[:, rjd:] += actions_batch
+        p_des_dart = p_des.astype(np.float32, copy=False)
 
-            q_dart_i = mujoco_qpos_to_dart(
-                q_mj[i],
-                root_offset=DART_ROOT_OFFSET,
-            )
-            dq_i = dq[i]
-            dq_dart_i = dq_i.copy()
-            dq_dart_i[:3] = dq_i[3:6]
-            dq_dart_i[3:6] = dq_i[:3]
-            qdqdt_dart[i] = (q_dart_i + dq_dart_i * dt).astype(np.float32, copy=False)
+        # Batched q_dart + dq_dart (with first/second 3 swapped) + step.
+        q_dart = mujoco_qpos_batch_to_dart(q_mj, root_offset=DART_ROOT_OFFSET)
+        dq_dart = dq.copy()
+        dq_dart[:, :3] = dq[:, 3:6]
+        dq_dart[:, 3:6] = dq[:, :3]
+        qdqdt_dart = (q_dart + dq_dart * dt).astype(np.float32, copy=False)
 
         import warp as wp
 

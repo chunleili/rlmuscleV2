@@ -19,6 +19,14 @@ from pathlib import Path
 
 import numpy as np
 
+ENV_METRIC_ORDER = [
+    "get_states",
+    "get_muscle_torques",
+    "get_desired_torques",
+    "steps_2",
+    "steps_at_once",
+]
+
 
 @dataclass
 class Metric:
@@ -112,7 +120,28 @@ def time_block(name: str, fn, gpu_index: int) -> Metric:
     )
 
 
-def bench_env(config: str, num_envs: int, rounds: int, gpu_index: int) -> dict:
+def select_env_metric_names(names: list[str] | None) -> list[str]:
+    if not names:
+        return list(ENV_METRIC_ORDER)
+
+    unknown = sorted(set(names) - set(ENV_METRIC_ORDER))
+    if unknown:
+        raise ValueError(
+            f"unknown env metrics: {', '.join(unknown)}; "
+            f"valid choices: {', '.join(ENV_METRIC_ORDER)}"
+        )
+
+    chosen = set(names)
+    return [name for name in ENV_METRIC_ORDER if name in chosen]
+
+
+def bench_env(
+    config: str,
+    num_envs: int,
+    rounds: int,
+    gpu_index: int,
+    metric_names: list[str] | None = None,
+) -> dict:
     from rl_mass.warp.vec_env import WarpVecEnv
 
     env = WarpVecEnv(config, num_envs=num_envs, seed=0)
@@ -124,18 +153,21 @@ def bench_env(config: str, num_envs: int, rounds: int, gpu_index: int) -> dict:
         env.set_actions(actions)
         env.set_activation_levels(activations)
 
+        selected = select_env_metric_names(metric_names)
+        metric_fns = {
+            "get_states": lambda: env.get_states(),
+            "get_muscle_torques": lambda: env.get_muscle_torques(),
+            "get_desired_torques": lambda: env.get_desired_torques(),
+            "steps_2": lambda: [env.steps(2) for _ in range(rounds)],
+            "steps_at_once": lambda: [
+                env.steps_at_once() for _ in range(max(1, rounds // 2))
+            ],
+        }
         metrics: list[Metric] = []
-        metrics.append(time_block("get_states", lambda: env.get_states(), gpu_index))
-        metrics.append(time_block("get_muscle_torques", lambda: env.get_muscle_torques(), gpu_index))
-        metrics.append(time_block("get_desired_torques", lambda: env.get_desired_torques(), gpu_index))
-        metrics.append(time_block("steps_2", lambda: [env.steps(2) for _ in range(rounds)], gpu_index))
-        metrics.append(
-            time_block(
-                "steps_at_once",
-                lambda: [env.steps_at_once() for _ in range(max(1, rounds // 2))],
-                gpu_index,
-            )
-        )
+        for name in selected:
+            print(f"[env] num_envs={num_envs} metric={name} start", flush=True)
+            metrics.append(time_block(name, metric_fns[name], gpu_index))
+            print(f"[env] num_envs={num_envs} metric={name} done", flush=True)
         return {
             "num_envs": num_envs,
             "metrics": [asdict(m) for m in metrics],
@@ -185,6 +217,7 @@ def main() -> None:
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--buffer-size", type=int, default=256)
     parser.add_argument("--gpu-index", type=int, default=0)
+    parser.add_argument("--metric", action="append", dest="metrics", default=[])
     parser.add_argument("--skip-rollout", action="store_true")
     parser.add_argument("--json-out", type=str, default="")
     args = parser.parse_args()
@@ -198,7 +231,13 @@ def main() -> None:
     }
 
     for num_envs in args.num_envs:
-        env_row = bench_env(args.config, num_envs, args.rounds, args.gpu_index)
+        env_row = bench_env(
+            args.config,
+            num_envs,
+            args.rounds,
+            args.gpu_index,
+            metric_names=args.metrics,
+        )
         results["env_bench"].append(env_row)
         print(f"[env] num_envs={num_envs}")
         for metric in env_row["metrics"]:

@@ -428,6 +428,71 @@ def mujoco_qpos_to_dart(
     return dart_q
 
 
+def mujoco_qpos_batch_to_dart(
+    mj_q: np.ndarray,
+    joint_types: list[str] | None = None,
+    root_offset: np.ndarray | None = None,
+) -> np.ndarray:
+    """Vectorized MuJoCo->DART qpos conversion. Mirror of
+    `dart_qpos_batch_to_mujoco`. Returns (batch, dart_size)."""
+    if joint_types is None:
+        joint_types = MASS_JOINT_TYPES
+
+    mj_q = np.asarray(mj_q, dtype=np.float64)
+    if mj_q.ndim != 2:
+        raise ValueError(f"mj_q must be 2D, got shape {mj_q.shape}")
+
+    idx = _IDX if joint_types is MASS_JOINT_TYPES else _build_index_tables(joint_types)
+    n_ball = idx["n_ball"]
+    ball_ds = idx["ball_dart_starts"]
+    ball_ms = idx["ball_mj_starts"]
+    free_di = idx["free_dart_idx"]
+    free_mi = idx["free_mj_idx"]
+    rev_ds = idx["rev_dart_indices"]
+    rev_ms = idx["rev_mj_indices"]
+
+    batch = mj_q.shape[0]
+    dart_size = sum(_DART_DOF[jt] for jt in joint_types)
+    dart_q = np.zeros((batch, dart_size), dtype=np.float64)
+
+    if free_di >= 0:
+        trans = mj_q[:, free_mi : free_mi + 3]
+        quat_wxyz = mj_q[:, free_mi + 3 : free_mi + 7]
+        q_xyzw = np.empty_like(quat_wxyz)
+        q_xyzw[:, 0] = quat_wxyz[:, 1]
+        q_xyzw[:, 1] = quat_wxyz[:, 2]
+        q_xyzw[:, 2] = quat_wxyz[:, 3]
+        q_xyzw[:, 3] = quat_wxyz[:, 0]
+        q_xyzw = q_xyzw / np.linalg.norm(q_xyzw, axis=1, keepdims=True)
+        expmap = Rotation.from_quat(q_xyzw).as_rotvec()
+        dart_q[:, free_di : free_di + 3] = expmap
+        if root_offset is not None:
+            dart_q[:, free_di + 3 : free_di + 6] = trans - root_offset[None, :]
+        else:
+            dart_q[:, free_di + 3 : free_di + 6] = trans
+
+    if n_ball > 0:
+        # Gather (batch, n_ball, 4) in xyzw order from mujoco wxyz layout.
+        ball_quats = np.empty((batch, n_ball, 4), dtype=np.float64)
+        for k, mi in enumerate(ball_ms):
+            ball_quats[:, k, 0] = mj_q[:, mi + 1]
+            ball_quats[:, k, 1] = mj_q[:, mi + 2]
+            ball_quats[:, k, 2] = mj_q[:, mi + 3]
+            ball_quats[:, k, 3] = mj_q[:, mi]
+        norms = np.linalg.norm(ball_quats, axis=2, keepdims=True)
+        ball_quats /= norms
+        expmaps = Rotation.from_quat(
+            ball_quats.reshape(-1, 4)
+        ).as_rotvec().reshape(batch, n_ball, 3)
+        for k, s in enumerate(ball_ds):
+            dart_q[:, s : s + 3] = expmaps[:, k, :]
+
+    if len(rev_ds) > 0:
+        dart_q[:, rev_ds] = mj_q[:, rev_ms]
+
+    return dart_q
+
+
 # ---------------------------------------------------------------------------
 # DART-space arithmetic (for SPD controller fidelity)
 # ---------------------------------------------------------------------------
