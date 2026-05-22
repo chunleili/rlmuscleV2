@@ -35,3 +35,4 @@ nn/
 src/rl_mass/verify/
 
 MUJOCO_LOG.TXT
+.claude

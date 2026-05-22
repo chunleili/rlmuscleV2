@@ -215,7 +215,12 @@ class MassEnv:
         for body_name, bvh_name in MASS_BVH_MAP.items():
             dart_idx, dart_ndof, jt = dart_dof_map[body_name]
             if jt == "Free":
-                continue  # Skip root
+                # Include root orientation (exp_map DOFs 0..3) but skip root
+                # translation. DART FreeJoint layout: [exp_map(3), trans(3)].
+                # Without this, prone-target swim was tracked only in joint
+                # angles while the body stayed upright (see env r_q docstring).
+                info.append((body_name, jt, dart_idx, 3))
+                continue
             info.append((body_name, jt, dart_idx, dart_ndof))
         return info
 
