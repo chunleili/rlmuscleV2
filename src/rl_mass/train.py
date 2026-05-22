@@ -4,17 +4,20 @@ Ported from external/MASS/python/main.py.
 All hyperparameters and logic kept identical to the original.
 
 Usage:
-    PYTHONPATH=. uv run python rl_mass/train.py -d data/rl_mass/config.json
-    PYTHONPATH=. uv run python rl_mass/train.py -d data/rl_mass/config.json -m current  # resume
+    PYTHONPATH=. uv run python rl_mass/train.py -d data/rl_mass/config.json --outdir output/walk
+    PYTHONPATH=. uv run python rl_mass/train.py -d data/rl_mass/config.json --outdir output/walk --resume current
+    PYTHONPATH=. uv run python rl_mass/train.py -d data/rl_mass/config.json --resume output/walk/nn/max.pt
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import math
 import os
 import time
 from collections import deque, namedtuple
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -23,6 +26,9 @@ import torch.optim as optim
 
 from rl_mass.model import MuscleNN, SimulationNN, Tensor, use_cuda
 from rl_mass.vec_env import MassVecEnv, make_vec_env
+
+DEFAULT_REWARD_CSV_PATH = "output/rl_mass/train_rewards.csv"
+DEFAULT_NN_DIR = "nn"
 
 REWARD_CSV_COLUMNS = (
     "iter",
@@ -81,6 +87,67 @@ def ensure_reward_csv_header(path: str) -> bool:
             "duration stats enabled."
         )
     return False
+
+
+def normalize_checkpoint_prefix(path: str) -> str:
+    """Strip checkpoint file suffixes and return the shared prefix path."""
+    if path.endswith("_muscle.pt"):
+        return path[: -len("_muscle.pt")]
+    if path.endswith(".pt"):
+        return path[:-3]
+    return path
+
+
+def infer_resume_iter(path: str) -> int:
+    """Read the last recorded evaluation iteration from the reward CSV."""
+    if not os.path.exists(path):
+        return 0
+
+    ensure_reward_csv_header(path)
+    last_iter = 0
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            last_iter = int(row["iter"])
+    return last_iter
+
+
+def resolve_run_paths(
+    *,
+    outdir: Optional[str] = None,
+    resume: Optional[str] = None,
+) -> dict[str, Optional[str] | int]:
+    """Resolve output paths and optional resume metadata from CLI inputs."""
+    if outdir:
+        base_dir = Path(outdir)
+        resolved_reward_csv = str(base_dir / "train_rewards.csv")
+        resolved_nn_dir = str(base_dir / "nn")
+    else:
+        resolved_reward_csv = DEFAULT_REWARD_CSV_PATH
+        resolved_nn_dir = DEFAULT_NN_DIR
+
+    resume_prefix = None
+    resume_iter = 0
+    if resume:
+        normalized = normalize_checkpoint_prefix(resume)
+        normalized_path = Path(normalized)
+        if normalized_path.parent == Path(".") and not normalized_path.is_absolute():
+            resume_prefix = str(Path(resolved_nn_dir) / normalized)
+        else:
+            resume_prefix = str(normalized_path)
+            resolved_nn_dir = str(normalized_path.parent)
+            if normalized_path.parent.name == "nn":
+                resolved_reward_csv = str(
+                    normalized_path.parent.parent / "train_rewards.csv"
+                )
+
+        resume_iter = infer_resume_iter(resolved_reward_csv)
+
+    return {
+        "reward_csv_path": resolved_reward_csv,
+        "nn_dir": resolved_nn_dir,
+        "resume_prefix": resume_prefix,
+        "resume_iter": resume_iter,
+    }
 
 # ---------------------------------------------------------------------------
 # Data structures (identical to MASS main.py)
@@ -637,7 +704,18 @@ class PPO:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PPO training for MASS-MuJoCo")
     parser.add_argument("-d", "--meta", help="Config JSON file", default="data/rl_mass/config.json")
-    parser.add_argument("-m", "--model", default=None, help="Model name to resume from (e.g. current)")
+    parser.add_argument(
+        "--outdir",
+        type=str,
+        default=None,
+        help="Output directory; uses <outdir>/train_rewards.csv and <outdir>/nn/",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Checkpoint prefix or .pt path to resume from; auto-infers iter from reward CSV",
+    )
     parser.add_argument("--num_envs", type=int, default=16, help="Parallel env count")
     parser.add_argument(
         "--vec_env_mode",
@@ -654,27 +732,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable worker-internal muscle loop (P1 naive batch-API path, for benchmarking)",
     )
-    parser.add_argument(
-        "--reward_csv",
-        type=str,
-        default="output/rl_mass/train_rewards.csv",
-        help="Path to append per-iter reward curve CSV (empty string to disable)",
-    )
-    parser.add_argument(
-        "--nn_dir",
-        type=str,
-        default="nn",
-        help="Directory to save model checkpoints (current/max/<tag>.pt)",
-    )
-    parser.add_argument(
-        "--resume_iter",
-        type=int,
-        default=0,
-        help="Seed PPO.num_evaluation when resuming from a ckpt so the next "
-             "Evaluate() writes iter=resume_iter+1 into the reward CSV. Use "
-             "with -m current and an existing CSV to extend a prior run.",
-    )
     args = parser.parse_args()
+
+    run_paths = resolve_run_paths(
+        outdir=args.outdir,
+        resume=args.resume,
+    )
+    reward_csv_path = run_paths["reward_csv_path"]
+    nn_dir = str(run_paths["nn_dir"])
+    resume_prefix = run_paths["resume_prefix"]
+    resume_iter = int(run_paths["resume_iter"])
 
     ppo = PPO(
         args.meta,
@@ -682,24 +749,23 @@ if __name__ == "__main__":
         vec_env_mode=args.vec_env_mode,
         seed=args.seed,
         packed_muscle_loop=not args.no_packed,
-        reward_csv_path=args.reward_csv if args.reward_csv else None,
-        nn_dir=args.nn_dir,
+        reward_csv_path=reward_csv_path if reward_csv_path else None,
+        nn_dir=nn_dir,
     )
     if args.max_iter is not None:
         ppo.max_iteration = args.max_iter + 5  # loop runs max_iteration - 5
 
-    nn_dir = args.nn_dir
     if not os.path.exists(nn_dir):
         os.makedirs(nn_dir)
 
-    if args.model is not None:
-        ppo.LoadModel(args.model, nn_dir=nn_dir)
+    if resume_prefix is not None:
+        ppo.LoadModel(Path(resume_prefix).name, nn_dir=nn_dir)
     else:
         ppo.SaveModel(nn_dir=nn_dir)
 
-    if args.resume_iter > 0:
-        ppo.num_evaluation = args.resume_iter
-        ppo.max_return_epoch = args.resume_iter
+    if resume_iter > 0:
+        ppo.num_evaluation = resume_iter
+        ppo.max_return_epoch = resume_iter
 
     print(
         f"num states: {ppo.num_state}, num actions: {ppo.num_action}, "
