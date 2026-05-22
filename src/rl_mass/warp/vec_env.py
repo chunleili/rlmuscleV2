@@ -136,10 +136,16 @@ class WarpVecEnv(MassVecEnv):
             self._activations_buf = np.zeros(
                 (self.num_envs, self.num_muscles), dtype=np.float32
             )
+            self._muscle_tuple_chunks: list[dict[str, torch.Tensor]] = []
+            # CUDA graph for the inner muscle substep (clear+update+apply+step).
+            # Built lazily on first non-trap substep; replayed via capture_launch.
+            self._substep_graph = None
+            self._substep_warmup_done = False
         else:
             self._cpu_ms_template = None
             self._warp_ms = None
             self._activations_buf = None
+            self._muscle_tuple_chunks = []
 
     def get_states(self) -> np.ndarray:
         return self.get_states_tensor().detach().cpu().numpy().astype(
@@ -368,19 +374,71 @@ class WarpVecEnv(MassVecEnv):
             env.set_activation_levels(activation)
         self._acts_synced = True
 
+    def _collect_muscle_tuples_batched(self) -> None:
+        if self._warp_ms is None:
+            return
+        sample_idx = [
+            i for i, env in enumerate(self.envs)
+            if env.sim_count == env.random_sample_index
+        ]
+        if not sample_idx:
+            return
+
+        import warp as wp
+
+        related_jta_wp, jta_per_muscle_wp, passive_torque_wp = (
+            self._warp_ms.get_training_terms()
+        )
+        device = self._engine.device
+        idx_t = torch.as_tensor(sample_idx, device=device, dtype=torch.long)
+        rjd = int(self._root_joint_dof)
+
+        related_jta = wp.to_torch(related_jta_wp).index_select(0, idx_t)
+        jta_per_muscle = wp.to_torch(jta_per_muscle_wp).index_select(0, idx_t)
+        passive_torque = wp.to_torch(passive_torque_wp).index_select(0, idx_t)
+        tau = self._latest_tau_t
+        if tau is None:
+            tau = self._compute_tau_tensor()
+        tau_des = tau.index_select(0, idx_t)[:, rjd:]
+
+        # CPU trainer expects L flattened row-major from (num_action, n_muscles).
+        # Keep tensors on device; OptimizeMuscleNN reshapes them directly.
+        l = jta_per_muscle[:, :, rjd:].transpose(1, 2).contiguous()
+        self._muscle_tuple_chunks.append(
+            {
+                "JtA": related_jta.detach(),
+                "TauDes": tau_des.detach(),
+                "L": l.reshape(l.shape[0], -1).detach(),
+                "b": passive_torque[:, rjd:].detach(),
+            }
+        )
+
+    def _run_substep_physics(self) -> None:
+        """Pure-GPU substep kernels: safe to record into a CUDA graph.
+
+        The D->H NaN-guard lives in `_engine.recover_nan_if_any` and must be
+        called outside the captured graph.
+        """
+        self._engine.clear_applied_forces()
+        self._warp_ms.update_all()
+        self._warp_ms.apply_forces_all()
+        self._engine.step_physics_only()
+
     def _substep_batched(self) -> None:
         """One simulation substep, batched across all worlds via warp kernels.
 
-        Muscle path: clear xfrc, batched update + apply muscle forces, then
-        one batched physics step. Non-muscle path: per-world SPD qfrc (CPU
-        round-trip) then batched physics step.
+        Muscle path: pure GPU kernel sequence (CUDA-graph-captured after warmup).
+        Non-muscle path: per-world SPD qfrc (CPU round-trip) then batched step.
         """
+        import os
         if self._warp_ms is not None:
-            self._engine.clear_applied_forces()
-            self._warp_ms.update_all()
-            self._warp_ms.apply_forces_all()
-            import os
-            if os.environ.get("WARP_NAN_TRAP"):
+            trap = bool(os.environ.get("WARP_NAN_TRAP"))
+            if trap:
+                # Diagnostic path: bypass graph, run kernels eagerly, sample
+                # device state between forces and step to catch NaN/blowup.
+                self._engine.clear_applied_forces()
+                self._warp_ms.update_all()
+                self._warp_ms.apply_forces_all()
                 xfrc = self._engine.data.xfrc_applied.numpy()
                 xmax = np.max(np.linalg.norm(xfrc[:,:,:3], axis=2))
                 vmax = float(np.max(np.abs(self._engine.get_qvel())))
@@ -405,18 +463,7 @@ class WarpVecEnv(MassVecEnv):
                              muscle_force=self._warp_ms.muscle_force.numpy() if hasattr(self._warp_ms,'muscle_force') else np.zeros(1),
                              bad_world=bad_w_idx)
                     raise FloatingPointError(f"trip: max|F|={xmax:.3e} max|v|={vmax:.3e} max_lmn={lmn_max:.3f} world={bad_w_idx} m={bad_m} (dumped /tmp/warp_div_xfrc.npz)")
-            need_sync = any(
-                env.sim_count == env.random_sample_index for env in self.envs
-            )
-            if need_sync:
-                self._sync_desired_torque_to_envs()
-                self._sync_activation_levels_to_envs()
-            for env in self.envs:
-                if env.sim_count == env.random_sample_index:
-                    env._collect_muscle_tuple()
-                env.sim_count += 1
-            self._engine.step()
-            if os.environ.get("WARP_NAN_TRAP"):
+                self._engine.step()
                 q = self._engine.get_qpos()
                 v = self._engine.get_qvel()
                 if not (np.all(np.isfinite(q)) and np.all(np.isfinite(v))):
@@ -425,6 +472,31 @@ class WarpVecEnv(MassVecEnv):
                              xfrc=self._engine.data.xfrc_applied.numpy(),
                              acts=self._activations_buf)
                     raise FloatingPointError(f"qpos/qvel non-finite after warp step bad_worlds={bad_w.tolist()[:8]}")
+            else:
+                # Fast path: lazy capture of substep physics into a CUDA graph
+                # on call #2, replayed via wp.capture_launch on all subsequent
+                # calls. First call runs kernels eagerly to initialize any
+                # warp/mujoco_warp internal state used by capture.
+                import warp as wp
+                if not self._substep_warmup_done:
+                    self._run_substep_physics()
+                    self._substep_warmup_done = True
+                elif self._substep_graph is None:
+                    with wp.ScopedCapture() as cap:
+                        self._run_substep_physics()
+                    self._substep_graph = cap.graph
+                    wp.capture_launch(self._substep_graph)
+                else:
+                    wp.capture_launch(self._substep_graph)
+                # NaN guard lives outside the graph (D->H check + rollback).
+                self._engine.recover_nan_if_any()
+            need_sync = any(
+                env.sim_count == env.random_sample_index for env in self.envs
+            )
+            if need_sync:
+                self._collect_muscle_tuples_batched()
+            for env in self.envs:
+                env.sim_count += 1
         else:
             for env in self.envs:
                 env.get_desired_torques()
@@ -507,6 +579,15 @@ class WarpVecEnv(MassVecEnv):
         return state
 
     def gather_muscle_tuples(self) -> list:
+        if self._muscle_tuple_chunks:
+            out = {
+                key: torch.cat([chunk[key] for chunk in self._muscle_tuple_chunks], dim=0)
+                for key in ("JtA", "TauDes", "L", "b")
+            }
+            self._muscle_tuple_chunks.clear()
+            for env in self.envs:
+                env.muscle_tuples.clear()
+            return out
         out = []
         for env in self.envs:
             out.extend(env.muscle_tuples)

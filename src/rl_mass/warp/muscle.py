@@ -73,6 +73,7 @@ def _compute_muscle_force_kernel(
     activations: wp.array2d(dtype=wp.float32),
     out_muscle_force: wp.array2d(dtype=wp.float32),
     out_f_active: wp.array2d(dtype=wp.float32),
+    out_f_passive: wp.array2d(dtype=wp.float32),
 ):
     w, m = wp.tid()
     lmn = l_m[w, m] / l_m0[m]
@@ -82,8 +83,11 @@ def _compute_muscle_force_kernel(
     else:
         g_pl = 0.0
     f = f0[m]
-    out_muscle_force[w, m] = f * (g_al * activations[w, m] + g_pl)
-    out_f_active[w, m] = f * g_al
+    f_active = f * g_al
+    f_passive = f * g_pl
+    out_muscle_force[w, m] = f_active * activations[w, m] + f_passive
+    out_f_active[w, m] = f_active
+    out_f_passive[w, m] = f_passive
 
 
 @wp.kernel
@@ -165,6 +169,12 @@ def _zero_jta_kernel(jta: wp.array3d(dtype=wp.float32)):
 
 
 @wp.kernel
+def _zero_torque_kernel(torque: wp.array2d(dtype=wp.float32)):
+    w, dof = wp.tid()
+    torque[w, dof] = 0.0
+
+
+@wp.kernel
 def _gather_xipos_for_body_kernel(
     xipos: wp.array2d(dtype=wp.vec3),
     bid: wp.int32,
@@ -183,6 +193,51 @@ def _gather_related_jta_kernel(
 ):
     w, i = wp.tid()
     out[w, i] = jta_per_muscle[w, related_muscle[i], related_dof[i]]
+
+
+@wp.kernel
+def _compute_passive_wrenches_kernel(
+    force_dir: wp.array2d(dtype=wp.vec3),
+    f_passive: wp.array2d(dtype=wp.float32),
+    anchor_muscle_id: wp.array(dtype=wp.int32),
+    anchor_primary_bid: wp.array(dtype=wp.int32),
+    world_pos: wp.array2d(dtype=wp.vec3),
+    xipos: wp.array2d(dtype=wp.vec3),
+    wrench_F: wp.array2d(dtype=wp.vec3),
+    wrench_T: wp.array2d(dtype=wp.vec3),
+):
+    w, a = wp.tid()
+    m = anchor_muscle_id[a]
+    bid = anchor_primary_bid[a]
+    F = force_dir[w, a] * f_passive[w, m]
+    r = world_pos[w, a] - xipos[w, bid]
+    wrench_F[w, a] = F
+    wrench_T[w, a] = wp.cross(r, F)
+
+
+@wp.kernel
+def _accumulate_passive_body_kernel(
+    jacp: wp.array3d(dtype=wp.float32),
+    jacr: wp.array3d(dtype=wp.float32),
+    anc_idx_on_body: wp.array(dtype=wp.int32),
+    wrench_F: wp.array2d(dtype=wp.vec3),
+    wrench_T: wp.array2d(dtype=wp.vec3),
+    out_torque: wp.array2d(dtype=wp.float32),
+):
+    w, k, dof = wp.tid()
+    a = anc_idx_on_body[k]
+    F = wrench_F[w, a]
+    T = wrench_T[w, a]
+    fx = F[0]; fy = F[1]; fz = F[2]
+    tx = T[0]; ty = T[1]; tz = T[2]
+    jp0 = jacp[w, 0, dof]
+    jp1 = jacp[w, 1, dof]
+    jp2 = jacp[w, 2, dof]
+    jr0 = jacr[w, 0, dof]
+    jr1 = jacr[w, 1, dof]
+    jr2 = jacr[w, 2, dof]
+    contrib = fx * jp0 + fy * jp1 + fz * jp2 + tx * jr0 + ty * jr1 + tz * jr2
+    wp.atomic_add(out_torque, w, dof, contrib)
 
 
 @wp.kernel
@@ -293,12 +348,16 @@ class WarpMuscleSystem:
         self.activations = wp.zeros((nw, self.n_muscles), dtype=wp.float32)
         self.muscle_force = wp.zeros((nw, self.n_muscles), dtype=wp.float32)
         self.f_active = wp.zeros((nw, self.n_muscles), dtype=wp.float32)
+        self.f_passive = wp.zeros((nw, self.n_muscles), dtype=wp.float32)
         self.force_dir = wp.zeros((nw, self.total_anchors), dtype=wp.vec3)
         self.wrench_F = wp.zeros((nw, self.total_anchors), dtype=wp.vec3)
         self.wrench_T = wp.zeros((nw, self.total_anchors), dtype=wp.vec3)
+        self.passive_wrench_F = wp.zeros((nw, self.total_anchors), dtype=wp.vec3)
+        self.passive_wrench_T = wp.zeros((nw, self.total_anchors), dtype=wp.vec3)
 
         nv = self._engine.nv
         self.jta_per_muscle = wp.zeros((nw, self.n_muscles, nv), dtype=wp.float32)
+        self.passive_torque = wp.zeros((nw, nv), dtype=wp.float32)
         self.jacp_buf = wp.zeros((nw, 3, nv), dtype=wp.float32)
         self.jacr_buf = wp.zeros((nw, 3, nv), dtype=wp.float32)
 
@@ -380,7 +439,7 @@ class WarpMuscleSystem:
                 _compute_muscle_force_kernel,
                 dim=(self.num_worlds, self.n_muscles),
                 inputs=[self.l_m, self.l_m0, self.f0, self.activations],
-                outputs=[self.muscle_force, self.f_active],
+                outputs=[self.muscle_force, self.f_active, self.f_passive],
             )
             wp.launch(
                 _apply_segment_forces_kernel,
@@ -410,7 +469,7 @@ class WarpMuscleSystem:
                 _compute_muscle_force_kernel,
                 dim=(self.num_worlds, self.n_muscles),
                 inputs=[self.l_m, self.l_m0, self.f0, self.activations],
-                outputs=[self.muscle_force, self.f_active],
+                outputs=[self.muscle_force, self.f_active, self.f_passive],
             )
 
             wp.launch(
@@ -476,6 +535,113 @@ class WarpMuscleSystem:
             )
 
         return self.related_jta
+
+    def get_training_terms(self) -> tuple[wp.array, wp.array, wp.array]:
+        """Return `(related_jta, jta_per_muscle, passive_torque)` for training.
+
+        Shapes are `(nworld, total_related)`, `(nworld, n_muscles, nv)`, and
+        `(nworld, nv)`. Caller must have called `update_all()` for the current
+        substep. The active terms match `get_all_muscle_torques()`; passive
+        torque is the `Jtp` term used as `b` by `MassEnv._collect_muscle_tuple`.
+        """
+        import mujoco_warp
+
+        d = self._engine.data
+        m_dev = self._engine.model
+        nv = self._engine.nv
+
+        with wp.ScopedDevice(self.device):
+            wp.launch(
+                _compute_muscle_force_kernel,
+                dim=(self.num_worlds, self.n_muscles),
+                inputs=[self.l_m, self.l_m0, self.f0, self.activations],
+                outputs=[self.muscle_force, self.f_active, self.f_passive],
+            )
+            wp.launch(
+                _zero_force_dir_kernel,
+                dim=(self.num_worlds, self.total_anchors),
+                inputs=[self.force_dir],
+            )
+            wp.launch(
+                _accumulate_force_dir_kernel,
+                dim=(self.num_worlds, self.n_segments),
+                inputs=[self.anchor_world_pos, self.seg_a, self.seg_b],
+                outputs=[self.force_dir],
+            )
+            wp.launch(
+                _compute_wrenches_kernel,
+                dim=(self.num_worlds, self.total_anchors),
+                inputs=[
+                    self.force_dir, self.f_active,
+                    self.anchor_muscle_id, self.anchor_primary_bid,
+                    self.anchor_world_pos, d.xipos,
+                ],
+                outputs=[self.wrench_F, self.wrench_T],
+            )
+            wp.launch(
+                _compute_passive_wrenches_kernel,
+                dim=(self.num_worlds, self.total_anchors),
+                inputs=[
+                    self.force_dir, self.f_passive,
+                    self.anchor_muscle_id, self.anchor_primary_bid,
+                    self.anchor_world_pos, d.xipos,
+                ],
+                outputs=[self.passive_wrench_F, self.passive_wrench_T],
+            )
+            wp.launch(
+                _zero_jta_kernel,
+                dim=(self.num_worlds, self.n_muscles, nv),
+                inputs=[self.jta_per_muscle],
+            )
+            wp.launch(
+                _zero_torque_kernel,
+                dim=(self.num_worlds, nv),
+                inputs=[self.passive_torque],
+            )
+
+            for k, bid in enumerate(self.unique_bodies_np):
+                wp.launch(
+                    _gather_xipos_for_body_kernel,
+                    dim=self.num_worlds,
+                    inputs=[d.xipos, int(bid)],
+                    outputs=[self.body_point_bufs[k]],
+                )
+                mujoco_warp.jac(
+                    m_dev, d,
+                    self.jacp_buf, self.jacr_buf,
+                    self.body_point_bufs[k],
+                    self.body_bid_arrs[k],
+                )
+                anc_idx = self.body_anchor_arrs[k]
+                wp.launch(
+                    _accumulate_jta_body_kernel,
+                    dim=(self.num_worlds, int(anc_idx.shape[0]), nv),
+                    inputs=[
+                        self.jacp_buf, self.jacr_buf,
+                        anc_idx, self.anchor_muscle_id,
+                        self.wrench_F, self.wrench_T,
+                    ],
+                    outputs=[self.jta_per_muscle],
+                )
+                wp.launch(
+                    _accumulate_passive_body_kernel,
+                    dim=(self.num_worlds, int(anc_idx.shape[0]), nv),
+                    inputs=[
+                        self.jacp_buf, self.jacr_buf,
+                        anc_idx,
+                        self.passive_wrench_F, self.passive_wrench_T,
+                    ],
+                    outputs=[self.passive_torque],
+                )
+
+            wp.launch(
+                _gather_related_jta_kernel,
+                dim=(self.num_worlds, self.total_related),
+                inputs=[self.jta_per_muscle, self.related_dof, self.related_muscle],
+                outputs=[self.related_jta],
+            )
+
+        return self.related_jta, self.jta_per_muscle, self.passive_torque
 
     def set_activations(self, acts: np.ndarray) -> None:
         a = np.asarray(acts, dtype=np.float32)

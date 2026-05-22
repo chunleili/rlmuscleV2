@@ -26,6 +26,7 @@ ENV_METRIC_ORDER = [
     "steps_2",
     "steps_at_once",
 ]
+ROLLOUT_CONTROL_STEPS = 128
 
 
 @dataclass
@@ -135,6 +136,10 @@ def select_env_metric_names(names: list[str] | None) -> list[str]:
     return [name for name in ENV_METRIC_ORDER if name in chosen]
 
 
+def rollout_buffer_size(num_envs: int) -> int:
+    return ROLLOUT_CONTROL_STEPS * num_envs
+
+
 def bench_env(
     config: str,
     num_envs: int,
@@ -213,9 +218,8 @@ def bench_rollout(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="data/rl_mass/configs/swim.json")
-    parser.add_argument("--num-envs", type=int, nargs="+", default=[1, 4, 8, 16])
+    parser.add_argument("--num-envs", type=int, nargs="+", default=[1024])
     parser.add_argument("--rounds", type=int, default=4)
-    parser.add_argument("--buffer-size", type=int, default=256)
     parser.add_argument("--gpu-index", type=int, default=0)
     parser.add_argument("--metric", action="append", dest="metrics", default=[])
     parser.add_argument("--skip-rollout", action="store_true")
@@ -224,7 +228,7 @@ def main() -> None:
 
     results = {
         "config": args.config,
-        "buffer_size": args.buffer_size,
+        "rollout_control_steps": ROLLOUT_CONTROL_STEPS,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "env_bench": [],
         "rollout_bench": [],
@@ -248,11 +252,12 @@ def main() -> None:
             )
 
         if not args.skip_rollout:
-            rollout_row = bench_rollout(args.config, num_envs, args.buffer_size, args.gpu_index)
+            buffer_size = rollout_buffer_size(num_envs)
+            rollout_row = bench_rollout(args.config, num_envs, buffer_size, args.gpu_index)
             results["rollout_bench"].append(rollout_row)
             metric = rollout_row["metric"]
             print(
-                f"[rollout] num_envs={num_envs} buffer={args.buffer_size}"
+                f"[rollout] num_envs={num_envs} buffer={buffer_size}"
                 f"  {metric['seconds']:.3f}s"
                 f"  gpu_avg={metric['gpu_util_avg']}  gpu_max={metric['gpu_util_max']}"
                 f"  mem_max={metric['gpu_mem_mb_max']}"

@@ -210,3 +210,71 @@ isolated kernel:
 - `actions -> targets -> torques -> activations -> step`
 - minimizing `.cpu().numpy()` conversions
 - adding a packed warp rollout path comparable to CPU `subproc`
+
+## Phase 5: GPU muscle buffer + CUDA-graph substep (May 2026)
+
+Two changes landed together:
+
+1. **GPU-resident muscle buffer.** `gather_muscle_tuples()` now returns
+   `dict[str, torch.Tensor]` on the device (was: `list` of per-env dataclass).
+   `_collect_muscle_tuples_batched()` runs once per control step (was: 1024
+   Python iterations × per-env `.numpy()` round-trip). New
+   `WarpMuscleSystem.get_training_terms()` produces `(JtA, jta_per_muscle,
+   passive_torque)` in one batched device-resident pass.
+2. **CUDA graph capture of the substep.** The hot kernel sequence
+   `clear_forces → muscle update → muscle apply_forces → mujoco_warp.step`
+   is captured once via `wp.ScopedCapture()` and replayed by
+   `wp.capture_launch()` (pattern from `external/newton/.../example_robot_policy.py`).
+   The D→H NaN guard inside `engine.step()` was split into
+   `step_physics_only()` (graph-safe) and `recover_nan_if_any()`
+   (called outside the graph), preserving the per-substep NaN rollback
+   semantics.
+
+### Throughput (walk.json, 128 control steps = 1 PPO iter, random actions)
+
+| backend / num_envs | s/iter | ms/step | **trans/s** | GPU avg util | peak GPU mem |
+|---|---:|---:|---:|---:|---:|
+| CPU subproc, 64 envs (real training) | 4.73 | – | **1,730** | – | – |
+| Warp 1024 envs, no graph (phase 4) | ~80.0 | 625 | **1,640** | ~5–10% | – |
+| Warp 1024 envs + graph | 62.1 | 485 | **2,111** | 14.4% | 5.6 GB |
+| Warp 4096 envs + graph | 101.7 | 794 | **5,155** | 16.3% | 20.4 GB |
+| Warp 8192 envs + graph | 139.3 | 1,088 | **7,529** | 17.9% | ≥ 3 GB rolling, ~30 GB at gather (estimated) |
+
+Graph capture alone gives a **~6× wall-time speedup** at 1024 envs vs the
+no-graph build (from a separate 16-ctrl micro-bench: 80s → 13.5s); the
+1024-env 62.1s number above is from a 32-ctrl bench where random-action
+divergence inflates the per-step cost (see caveat below).
+
+### Caveat: random-action divergence
+
+The above are measured with random `~N(0, 0.1)` actions for 32+ control
+steps. The character drifts into deep contact penetration, which
+floods the constraint solver with `nefc overflow` fallbacks and slows
+per-substep time 3–5×. Trained-policy rollouts stay near upright and
+should be substantially faster — the actual training run is the
+authoritative measurement.
+
+### What CUDA graph removed
+
+The pre-graph profile (cProfile, 1024 envs, 4 ctrl steps) showed:
+
+| line | wall fraction |
+|---|---:|
+| `mujoco_warp.step` (incl. solver, narrowphase, fwd_position) | 79% |
+| `wp.launch` Python overhead (pack_arg / type check / dispatch) | 56% (overlaps with above) |
+| `_collect_muscle_tuples_batched` | 16% |
+
+CUDA graph capture collapses the `wp.launch` Python overhead into a single
+graph launch per substep. The mujoco_warp internal `wp.capture_while` is
+still nested correctly inside the outer `ScopedCapture`.
+
+### Knobs added
+
+- `WarpVecEnv._substep_graph` — lazy graph, built on the 2nd call to
+  `_substep_batched` and replayed thereafter. Reset when worlds change.
+- `WARP_NAN_TRAP=1` — bypasses the graph and runs eager kernels with
+  pre-step `xfrc`/`lmn` sampling for debugging blow-ups.
+- `train.py --max_steps N` — stop training once cumulative transitions
+  hits `N` (priority over `--max_iter`). 10M timesteps ≈ 5000 CPU iters.
+- `reward_csv` now records `total_transitions` per row.
+

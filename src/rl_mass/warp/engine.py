@@ -213,21 +213,24 @@ class WarpEngine:
     def com_pos(self) -> None:
         self._mujoco_warp.com_pos(self.model, self.data)
 
-    def step(self) -> None:
+    def step_physics_only(self) -> None:
+        """Pure-GPU substep: snapshot qpos/qvel, then mujoco_warp step.
+
+        Safe to record into a CUDA graph. Caller must invoke
+        `recover_nan_if_any` afterwards to roll back any world whose state
+        became non-finite (the host-side check forces a D->H sync, so it
+        cannot live inside the captured graph).
+        """
         import warp as wp
-        # Snapshot qpos/qvel on-device so we can roll back any world whose
-        # qacc/qvel/qpos becomes NaN inside mujoco_warp.step. Mirrors the
-        # behavior of CPU mujoco, which emits a "Nan, Inf or huge value in
-        # QACC" warning and continues with the previous state rather than
-        # propagating NaN.
         if not hasattr(self, "_qpos_snap"):
             self._qpos_snap = wp.zeros_like(self.data.qpos)
             self._qvel_snap = wp.zeros_like(self.data.qvel)
         wp.copy(self._qpos_snap, self.data.qpos)
         wp.copy(self._qvel_snap, self.data.qvel)
-
         self._mujoco_warp.step(self.model, self.data)
 
+    def recover_nan_if_any(self) -> None:
+        """Roll back worlds whose qpos/qvel went non-finite to their snapshot."""
         q_host = self.data.qpos.numpy()
         v_host = self.data.qvel.numpy()
         bad_q = ~np.all(np.isfinite(q_host), axis=1)
@@ -242,6 +245,10 @@ class WarpEngine:
             self.set_qpos(q_host)
             self.set_qvel(v_host)
             self.forward()
+
+    def step(self) -> None:
+        self.step_physics_only()
+        self.recover_nan_if_any()
 
     def reset(self) -> None:
         self.set_qpos(self._initial_qpos)

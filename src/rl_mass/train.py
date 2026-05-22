@@ -352,7 +352,10 @@ class PPO:
         # Collect muscle tuples from all envs
         all_tuples = self.env.gather_muscle_tuples()
 
-        if len(all_tuples) > 0:
+        if isinstance(all_tuples, dict):
+            self.muscle_buffer.update(all_tuples)
+            print(tuple(self.muscle_buffer["JtA"].shape))
+        elif len(all_tuples) > 0:
             self.muscle_buffer["JtA"] = np.stack(
                 [t.JtA for t in all_tuples]
             )
@@ -460,20 +463,35 @@ class PPO:
             )
 
             for minibatch in minibatches:
-                stack_JtA = self.muscle_buffer["JtA"][minibatch].astype(np.float32)
-                stack_tau_des = self.muscle_buffer["TauDes"][minibatch].astype(
-                    np.float32
-                )
-                stack_L = self.muscle_buffer["L"][minibatch].astype(np.float32)
-                stack_L = stack_L.reshape(
-                    self.muscle_batch_size, self.num_action, self.num_muscles
-                )
-                stack_b = self.muscle_buffer["b"][minibatch].astype(np.float32)
+                if torch.is_tensor(self.muscle_buffer["JtA"]):
+                    device = self.muscle_buffer["JtA"].device
+                    minibatch_t = torch.as_tensor(
+                        minibatch, device=device, dtype=torch.long
+                    )
+                    stack_JtA = self.muscle_buffer["JtA"].index_select(0, minibatch_t)
+                    stack_tau_des = self.muscle_buffer["TauDes"].index_select(
+                        0, minibatch_t
+                    )
+                    stack_L = self.muscle_buffer["L"].index_select(0, minibatch_t)
+                    stack_L = stack_L.reshape(
+                        self.muscle_batch_size, self.num_action, self.num_muscles
+                    )
+                    stack_b = self.muscle_buffer["b"].index_select(0, minibatch_t)
+                else:
+                    stack_JtA = self.muscle_buffer["JtA"][minibatch].astype(np.float32)
+                    stack_tau_des = self.muscle_buffer["TauDes"][minibatch].astype(
+                        np.float32
+                    )
+                    stack_L = self.muscle_buffer["L"][minibatch].astype(np.float32)
+                    stack_L = stack_L.reshape(
+                        self.muscle_batch_size, self.num_action, self.num_muscles
+                    )
+                    stack_b = self.muscle_buffer["b"][minibatch].astype(np.float32)
 
-                stack_JtA = Tensor(stack_JtA)
-                stack_tau_des = Tensor(stack_tau_des)
-                stack_L = Tensor(stack_L)
-                stack_b = Tensor(stack_b)
+                    stack_JtA = Tensor(stack_JtA)
+                    stack_tau_des = Tensor(stack_tau_des)
+                    stack_L = Tensor(stack_L)
+                    stack_b = Tensor(stack_b)
 
                 activation = self.muscle_model(stack_JtA, stack_tau_des)
                 tau = torch.einsum("ijk,ik->ij", (stack_L, activation)) + stack_b
@@ -565,11 +583,12 @@ class PPO:
             os.makedirs(os.path.dirname(self.reward_csv_path) or ".", exist_ok=True)
             with open(self.reward_csv_path, "a") as f:
                 if write_header:
-                    f.write("iter,elapsed_s,num_episode,num_tuple,avg_return,"
-                            "avg_reward_per_transition,max_return,loss_actor,loss_critic,loss_muscle\n")
+                    f.write("iter,elapsed_s,num_episode,num_tuple,total_transitions,"
+                            "avg_return,avg_reward_per_transition,max_return,"
+                            "loss_actor,loss_critic,loss_muscle\n")
                 f.write(
                     f"{self.num_evaluation},{int(elapsed)},{self.num_episode},"
-                    f"{self.num_tuple},{avg_return:.6f},"
+                    f"{self.num_tuple},{self.num_tuple_so_far},{avg_return:.6f},"
                     f"{self.sum_return / self.num_tuple:.6f},{self.max_return:.6f},"
                     f"{self.loss_actor:.6f},{self.loss_critic:.6f},{self.loss_muscle:.6f}\n"
                 )
@@ -600,6 +619,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed (default: time-based)")
     parser.add_argument("--max_iter", type=int, default=None, help="Override max iterations (debug)")
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=None,
+        help="Stop training when cumulative transitions (num_tuple_so_far) reaches this; "
+             "takes priority over --max_iter. Useful for fixed-budget comparisons "
+             "(e.g. --max_steps 10000000 for 10M timesteps)",
+    )
     parser.add_argument(
         "--no_packed",
         action="store_true",
@@ -666,3 +693,6 @@ if __name__ == "__main__":
     for i in range(ppo.max_iteration - 5):
         ppo.Train()
         rewards = ppo.Evaluate()
+        if args.max_steps is not None and ppo.num_tuple_so_far >= args.max_steps:
+            print(f"[max_steps] reached {ppo.num_tuple_so_far} >= {args.max_steps}, stopping.")
+            break
