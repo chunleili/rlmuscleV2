@@ -24,6 +24,64 @@ import torch.optim as optim
 from rl_mass.model import MuscleNN, SimulationNN, Tensor, use_cuda
 from rl_mass.vec_env import MassVecEnv, make_vec_env
 
+REWARD_CSV_COLUMNS = (
+    "iter",
+    "elapsed_s",
+    "num_episode",
+    "num_tuple",
+    "avg_return",
+    "avg_reward_per_transition",
+    "avg_episode_steps",
+    "avg_episode_seconds",
+    "max_episode_steps",
+    "max_episode_seconds",
+    "max_return",
+    "loss_actor",
+    "loss_critic",
+    "loss_muscle",
+)
+
+
+def summarize_episode_lengths(
+    episode_lengths: list[int], control_hz: int
+) -> dict[str, float | int]:
+    """Aggregate episode duration stats in control steps and seconds."""
+    if not episode_lengths:
+        return {
+            "avg_episode_steps": 0.0,
+            "avg_episode_seconds": 0.0,
+            "max_episode_steps": 0,
+            "max_episode_seconds": 0.0,
+        }
+
+    avg_steps = float(np.mean(episode_lengths))
+    max_steps = int(np.max(episode_lengths))
+    hz = float(control_hz)
+    return {
+        "avg_episode_steps": avg_steps,
+        "avg_episode_seconds": avg_steps / hz,
+        "max_episode_steps": max_steps,
+        "max_episode_seconds": max_steps / hz,
+    }
+
+
+def ensure_reward_csv_header(path: str) -> bool:
+    """Return True when the CSV header should be written for this path."""
+    if not os.path.exists(path):
+        return True
+
+    with open(path, "r") as f:
+        header = f.readline().strip()
+
+    expected = ",".join(REWARD_CSV_COLUMNS)
+    if header != expected:
+        raise RuntimeError(
+            f"Reward CSV schema mismatch for {path}. "
+            "Move/remove the old CSV before resuming training with episode "
+            "duration stats enabled."
+        )
+    return False
+
 # ---------------------------------------------------------------------------
 # Data structures (identical to MASS main.py)
 # ---------------------------------------------------------------------------
@@ -107,6 +165,10 @@ class PPO:
         self.num_tuple_so_far = 0
         self.num_episode = 0
         self.num_tuple = 0
+        self.avg_episode_steps = 0.0
+        self.avg_episode_seconds = 0.0
+        self.max_episode_steps = 0
+        self.max_episode_seconds = 0.0
         self.num_simulation_Hz: int = self.env.simulation_hz
         self.num_control_Hz: int = self.env.control_hz
         self.num_simulation_per_control: int = self.num_simulation_Hz // self.num_control_Hz
@@ -315,6 +377,14 @@ class PPO:
 
         self.num_episode = len(self.total_episodes)
         self.num_tuple = len(self.replay_buffer.buffer)
+        episode_lengths = [len(epi.GetData()) for epi in self.total_episodes]
+        episode_stats = summarize_episode_lengths(
+            episode_lengths, control_hz=self.num_control_Hz
+        )
+        self.avg_episode_steps = float(episode_stats["avg_episode_steps"])
+        self.avg_episode_seconds = float(episode_stats["avg_episode_seconds"])
+        self.max_episode_steps = int(episode_stats["max_episode_steps"])
+        self.max_episode_seconds = float(episode_stats["max_episode_seconds"])
         print(f"SIM : {self.num_tuple}")
         self.num_tuple_so_far += self.num_tuple
 
@@ -514,13 +584,22 @@ class PPO:
         print(f"||Num Transition           : {self.num_tuple}")
         print(f"||Num Episode              : {self.num_episode}")
         print(
+            f"||Avg Step per episode     : {self.avg_episode_steps:.1f}"
+        )
+        print(
+            f"||Avg Time per episode     : {self.avg_episode_seconds:.3f}s"
+        )
+        print(
+            f"||Max Step per episode     : {self.max_episode_steps}"
+        )
+        print(
+            f"||Max Time per episode     : {self.max_episode_seconds:.3f}s"
+        )
+        print(
             f"||Avg Return per episode   : {self.sum_return / self.num_episode:.3f}"
         )
         print(
             f"||Avg Reward per transition: {self.sum_return / self.num_tuple:.3f}"
-        )
-        print(
-            f"||Avg Step per episode     : {self.num_tuple / self.num_episode:.1f}"
         )
         print(
             f"||Max Avg Return So far    : {self.max_return:.3f} at #{self.max_return_epoch}"
@@ -530,16 +609,18 @@ class PPO:
 
         # Persist reward curve to CSV (append) — one row per evaluation.
         if self.reward_csv_path is not None:
-            write_header = not os.path.exists(self.reward_csv_path)
+            write_header = ensure_reward_csv_header(self.reward_csv_path)
             os.makedirs(os.path.dirname(self.reward_csv_path) or ".", exist_ok=True)
             with open(self.reward_csv_path, "a") as f:
                 if write_header:
-                    f.write("iter,elapsed_s,num_episode,num_tuple,avg_return,"
-                            "avg_reward_per_transition,max_return,loss_actor,loss_critic,loss_muscle\n")
+                    f.write(",".join(REWARD_CSV_COLUMNS) + "\n")
                 f.write(
                     f"{self.num_evaluation},{int(elapsed)},{self.num_episode},"
                     f"{self.num_tuple},{avg_return:.6f},"
-                    f"{self.sum_return / self.num_tuple:.6f},{self.max_return:.6f},"
+                    f"{self.sum_return / self.num_tuple:.6f},"
+                    f"{self.avg_episode_steps:.6f},{self.avg_episode_seconds:.6f},"
+                    f"{self.max_episode_steps},{self.max_episode_seconds:.6f},"
+                    f"{self.max_return:.6f},"
                     f"{self.loss_actor:.6f},{self.loss_critic:.6f},{self.loss_muscle:.6f}\n"
                 )
 
