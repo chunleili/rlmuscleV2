@@ -114,6 +114,12 @@ class WarpVecEnv(MassVecEnv):
         self._eoe_cache = np.zeros((self.num_envs,), dtype=bool)
         self._metrics_dirty = True
 
+        # Lazy CPU sync of SPD tau + activations — populated by tensor-API paths.
+        self._latest_tau_t: Optional[torch.Tensor] = None
+        self._tau_synced = True
+        self._latest_acts_t: Optional[torch.Tensor] = None
+        self._acts_synced = True
+
         # Batched muscle system shared across all worlds (topology is identical
         # since model is shared). Built from one MassEnv's muscle list — this
         # also gives us a CPU MuscleSystem for any per-world fallback callers.
@@ -185,7 +191,23 @@ class WarpVecEnv(MassVecEnv):
         self._warp_ms.update_all()
         return self._warp_ms.get_all_muscle_torques().numpy().astype(np.float32)
 
-    def get_desired_torques(self) -> np.ndarray:
+    def get_muscle_torques_tensor(self) -> torch.Tensor:
+        """Device-resident JtA — avoids host round-trip in the muscle loop."""
+        if self._warp_ms is None:
+            arr = self.get_muscle_torques()
+            return torch.as_tensor(arr, device=self._engine.device, dtype=torch.float32)
+        import warp as wp
+
+        self._warp_ms.update_all()
+        jta_wp = self._warp_ms.get_all_muscle_torques()
+        return wp.to_torch(jta_wp).to(dtype=torch.float32)
+
+    def _compute_tau_tensor(self) -> torch.Tensor:
+        """Run batched SPD on GPU. Returns full-DOF `tau` torch tensor (nworld, nv).
+
+        Side effect: leaves SPD intermediate state (kinematics+forward_dynamics)
+        consistent for the upcoming substep step.
+        """
         self._engine.forward_dynamics()
         p_des_dart = np.empty((self.num_envs, self._engine.nv), dtype=np.float32)
         qdqdt_dart = np.empty_like(p_des_dart)
@@ -237,16 +259,41 @@ class WarpVecEnv(MassVecEnv):
         )
         ddq = torch.linalg.solve(M, rhs.unsqueeze(-1)).squeeze(-1)
         tau = p_diff + v_diff - dt * kv_t * ddq
+        # Zero root-joint DOFs uniformly (root_joint_dof identical across worlds).
+        rjd = int(self._root_joint_dof)
+        if rjd > 0:
+            tau[:, :rjd] = 0.0
+        self._latest_tau_t = tau
+        self._tau_synced = False
+        return tau
 
-        out = np.empty((self.num_envs, self.num_action), dtype=np.float32)
-        tau_cpu = tau.detach().cpu().numpy().astype(np.float64, copy=False)
+    def _sync_desired_torque_to_envs(self) -> None:
+        """Copy latest tau tensor down to each MassEnv.desired_torque (CPU)."""
+        if self._tau_synced or self._latest_tau_t is None:
+            return
+        tau_cpu = (
+            self._latest_tau_t.detach().cpu().numpy().astype(np.float64, copy=False)
+        )
         for i, env in enumerate(self.envs):
-            tau_i = tau_cpu[i]
-            tau_i[: env.root_joint_dof] = 0.0
-            env.desired_torque = tau_i.copy()
-            out[i] = tau_i[env.root_joint_dof :].astype(np.float32, copy=False)
+            env.desired_torque = tau_cpu[i].copy()
+        self._tau_synced = True
 
-        return out
+    def get_desired_torques(self) -> np.ndarray:
+        tau = self._compute_tau_tensor()
+        self._sync_desired_torque_to_envs()
+        rjd = int(self._root_joint_dof)
+        tau_cpu = tau.detach().cpu().numpy()
+        return tau_cpu[:, rjd:].astype(np.float32, copy=False)
+
+    def get_desired_torques_tensor(self) -> torch.Tensor:
+        """Device-resident desired torques sized (nworld, num_action).
+
+        Defers CPU sync of `env.desired_torque` until something needs it
+        (e.g. muscle-tuple collection in `_substep_batched`).
+        """
+        tau = self._compute_tau_tensor()
+        rjd = int(self._root_joint_dof)
+        return tau[:, rjd:].contiguous()
 
     def set_activation_levels(self, acts: np.ndarray) -> None:
         if self._warp_ms is None:
@@ -260,6 +307,33 @@ class WarpVecEnv(MassVecEnv):
         # (compute_diagnostics, muscle tuple sampler) see the same numbers.
         for env, activation in zip(self.envs, acts):
             env.set_activation_levels(activation)
+        self._latest_acts_t = None
+        self._acts_synced = True
+
+    def set_activation_levels_tensor(self, acts) -> None:
+        """Device-to-device activation upload from torch tensor.
+
+        Skips per-env CPU mirror until `_sync_activation_levels_to_envs` is
+        triggered (only needed when a muscle-tuple sample is about to be
+        collected).
+        """
+        if self._warp_ms is None:
+            arr = acts.detach().cpu().numpy().astype(np.float32, copy=False)
+            for env, activation in zip(self.envs, arr):
+                env.set_activation_levels(activation)
+            return
+        self._warp_ms.set_activations_tensor(acts)
+        self._latest_acts_t = acts.detach()
+        self._acts_synced = False
+
+    def _sync_activation_levels_to_envs(self) -> None:
+        if self._acts_synced or self._latest_acts_t is None:
+            return
+        a = self._latest_acts_t.cpu().numpy().astype(np.float32, copy=False)
+        self._activations_buf[:] = a
+        for env, activation in zip(self.envs, a):
+            env.set_activation_levels(activation)
+        self._acts_synced = True
 
     def _substep_batched(self) -> None:
         """One simulation substep, batched across all worlds via warp kernels.
@@ -298,6 +372,12 @@ class WarpVecEnv(MassVecEnv):
                              muscle_force=self._warp_ms.muscle_force.numpy() if hasattr(self._warp_ms,'muscle_force') else np.zeros(1),
                              bad_world=bad_w_idx)
                     raise FloatingPointError(f"trip: max|F|={xmax:.3e} max|v|={vmax:.3e} max_lmn={lmn_max:.3f} world={bad_w_idx} m={bad_m} (dumped /tmp/warp_div_xfrc.npz)")
+            need_sync = any(
+                env.sim_count == env.random_sample_index for env in self.envs
+            )
+            if need_sync:
+                self._sync_desired_torque_to_envs()
+                self._sync_activation_levels_to_envs()
             for env in self.envs:
                 if env.sim_count == env.random_sample_index:
                     env._collect_muscle_tuple()

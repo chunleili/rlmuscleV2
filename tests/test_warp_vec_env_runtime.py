@@ -132,5 +132,62 @@ class WarpVecEnvBatchedMuscleTests(unittest.TestCase):
             env.close()
 
 
+class WarpVecEnvTensorApiTests(unittest.TestCase):
+    """Tensor-API rollout path must produce same numbers as numpy-API path."""
+
+    def test_muscle_and_desired_torques_tensor_match_numpy(self):
+        import torch
+
+        env = WarpVecEnv("data/rl_mass/configs/swim.json", num_envs=3, seed=0)
+        try:
+            env.reset(rsi=False)
+            acts = np.random.default_rng(7).normal(
+                size=(3, env.num_action)
+            ).astype(np.float32) * 0.05
+            env.set_actions(acts)
+
+            jta_np = env.get_muscle_torques()
+            jta_t = env.get_muscle_torques_tensor()
+            self.assertIsInstance(jta_t, torch.Tensor)
+            np.testing.assert_allclose(
+                jta_t.detach().cpu().numpy(), jta_np, atol=1e-5, rtol=1e-5
+            )
+
+            tau_np = env.get_desired_torques()
+            tau_t = env.get_desired_torques_tensor()
+            self.assertIsInstance(tau_t, torch.Tensor)
+            np.testing.assert_allclose(
+                tau_t.detach().cpu().numpy(), tau_np, atol=1e-4, rtol=1e-4
+            )
+        finally:
+            env.close()
+
+    def test_activation_tensor_upload_matches_numpy(self):
+        import torch
+
+        env = WarpVecEnv("data/rl_mass/configs/swim.json", num_envs=2, seed=0)
+        try:
+            env.reset(rsi=False)
+            acts = np.random.default_rng(11).uniform(
+                0.0, 0.3, (2, env.num_muscles)
+            ).astype(np.float32)
+            env.set_actions(np.zeros((2, env.num_action), dtype=np.float32))
+
+            env.set_activation_levels(acts)
+            np_buf = env._warp_ms.activations.numpy().copy()
+
+            zero = np.zeros_like(acts)
+            env.set_activation_levels(zero)
+            self.assertTrue(np.all(env._warp_ms.activations.numpy() == 0))
+
+            t = torch.as_tensor(acts, device=env._engine.device, dtype=torch.float32)
+            env.set_activation_levels_tensor(t)
+            np.testing.assert_allclose(
+                env._warp_ms.activations.numpy(), np_buf, atol=1e-7
+            )
+        finally:
+            env.close()
+
+
 if __name__ == "__main__":
     unittest.main()

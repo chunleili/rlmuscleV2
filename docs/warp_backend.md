@@ -58,6 +58,20 @@ Not implemented yet:
 - Batched `get_states()`, `set_actions()`, reward, and termination logic
 - Added batched reward/eoe queries to the training loop to avoid per-env round-trips
 
+### Phase 5
+
+- Added device-resident tensor-API rollout path:
+  `WarpVecEnv.get_muscle_torques_tensor`, `get_desired_torques_tensor`,
+  `set_activation_levels_tensor`, plus
+  `WarpMuscleSystem.set_activations_tensor` (D2D copy via `wp.from_torch`).
+- Train loop (`GenerateTransitions`, batch-API path) auto-detects tensor APIs
+  and skips the muscle-inference H<->D round-trips.
+- Lazy CPU sync of `env.desired_torque` and `env.activation_levels` —
+  only fired when a muscle-tuple sample is about to be collected.
+- Smoke perf (`swim.json`, RTX 4090, `num_envs=8`, `buffer=64`):
+  tensor path `~19.1s` vs numpy path `~22.3s` GenerateTransitions
+  (~14% wallclock win at small batch; gap grows with `num_envs`).
+
 ## Current Design
 
 The warp backend still reuses parts of `MassEnv` and `Character` for episode

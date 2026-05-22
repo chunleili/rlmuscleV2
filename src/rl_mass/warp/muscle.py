@@ -485,3 +485,22 @@ class WarpMuscleSystem:
                 f"({self.num_worlds}, {self.n_muscles})"
             )
         self.activations.assign(a)
+
+    def set_activations_tensor(self, t) -> None:
+        """Device-to-device activation copy from a torch tensor on self.device.
+
+        Avoids the H<->D round-trip incurred by numpy `assign()`.
+        """
+        import torch
+
+        if not isinstance(t, torch.Tensor):
+            raise TypeError("set_activations_tensor expects a torch.Tensor")
+        if t.shape != (self.num_worlds, self.n_muscles):
+            raise ValueError(
+                f"activations tensor shape {tuple(t.shape)} != "
+                f"({self.num_worlds}, {self.n_muscles})"
+            )
+        t32 = t.detach().to(dtype=torch.float32).contiguous()
+        with wp.ScopedDevice(self.device):
+            src = wp.from_torch(t32, dtype=wp.float32)
+            wp.copy(self.activations, src)

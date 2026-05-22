@@ -223,12 +223,25 @@ class PPO:
                 # P0/P1 batch-API path: main process drives MuscleNN, workers step.
                 self.env.set_actions(actions)
                 if self.use_muscle:
-                    mt = Tensor(self.env.get_muscle_torques())
-                    for _ in range(self.num_simulation_per_control // 2):
-                        dt = Tensor(self.env.get_desired_torques())
-                        activations = self.muscle_model(mt, dt).cpu().detach().numpy()
-                        self.env.set_activation_levels(activations)
-                        self.env.steps(2)
+                    tensor_api = (
+                        hasattr(self.env, "get_muscle_torques_tensor")
+                        and hasattr(self.env, "get_desired_torques_tensor")
+                        and hasattr(self.env, "set_activation_levels_tensor")
+                    )
+                    if tensor_api:
+                        mt = self.env.get_muscle_torques_tensor()
+                        for _ in range(self.num_simulation_per_control // 2):
+                            dt = self.env.get_desired_torques_tensor()
+                            activations = self.muscle_model(mt, dt)
+                            self.env.set_activation_levels_tensor(activations)
+                            self.env.steps(2)
+                    else:
+                        mt = Tensor(self.env.get_muscle_torques())
+                        for _ in range(self.num_simulation_per_control // 2):
+                            dt = Tensor(self.env.get_desired_torques())
+                            activations = self.muscle_model(mt, dt).cpu().detach().numpy()
+                            self.env.set_activation_levels(activations)
+                            self.env.steps(2)
                 else:
                     self.env.steps_at_once()
                 next_states = None  # computed after episode bookkeeping
