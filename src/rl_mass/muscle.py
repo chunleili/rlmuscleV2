@@ -14,6 +14,8 @@ Usage:
 
 from __future__ import annotations
 
+import copy
+import os
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from math import exp, sqrt
@@ -723,6 +725,18 @@ def _finalize_anchor(muscle: Muscle, engine: PhysicsEngine) -> None:
             muscle.related_dof_indices.append(i)
 
 
+_PARSE_MUSCLE_CACHE: dict[tuple, list[Muscle]] = {}
+
+
+def _engine_cache_key(engine: PhysicsEngine):
+    # Use the id of the underlying model object — shared across worlds for
+    # WarpEngine + WarpWorldView, and across reuses of the same MuJoCoEngine.
+    model = getattr(engine, "model", None)
+    if model is None:
+        return None
+    return id(model)
+
+
 def parse_muscle_xml(xml_path: str, engine: PhysicsEngine) -> list[Muscle]:
     """Parse muscle definitions from MASS muscle XML.
 
@@ -734,7 +748,32 @@ def parse_muscle_xml(xml_path: str, engine: PhysicsEngine) -> list[Muscle]:
 
     Returns:
         List of Muscle objects with anchors, l_mt0, and related DOFs computed.
+
+    Results are cached per (xml_path mtime, engine.model identity). Repeated
+    calls against the same engine model (e.g. batched WarpVecEnv constructing
+    N MassEnvs over a single shared WarpEngine) reuse the parse and return a
+    deep-copy so each caller still owns mutable per-world muscle state.
     """
+    if os.environ.get("RL_MASS_DISABLE_MUSCLE_PARSE_CACHE"):
+        return _do_parse_muscle_xml(xml_path, engine)
+    try:
+        mtime = os.path.getmtime(xml_path)
+    except OSError:
+        mtime = None
+    key = (os.path.abspath(xml_path), mtime, _engine_cache_key(engine))
+    cached = _PARSE_MUSCLE_CACHE.get(key)
+    if cached is None:
+        cached = _do_parse_muscle_xml(xml_path, engine)
+        # Pre-update once against the (shared) initial engine state so cached
+        # muscles already have cached_anchor_positions, l_mt and l_m filled.
+        # Subsequent MassEnv constructions skip the per-env update loop.
+        for m in cached:
+            m.update(engine)
+        _PARSE_MUSCLE_CACHE[key] = cached
+    return [copy.deepcopy(m) for m in cached]
+
+
+def _do_parse_muscle_xml(xml_path: str, engine: PhysicsEngine) -> list[Muscle]:
     tree = ET.parse(xml_path)
     root = tree.getroot()
 

@@ -22,10 +22,25 @@ Usage:
 from __future__ import annotations
 
 import math
+import os
 from typing import Optional
 
 import numpy as np
 from scipy.spatial.transform import Rotation
+
+
+# Module-level cache for parsed BVH + motion_dart_cache.
+# Key: (abs_path, mtime, cyclic, id(bvh_map))
+# Value: (BVH, motion_dart_cache, T0_y0, T0_inv, cycle_transform, cycle_cache)
+_BVH_CACHE: dict[tuple, tuple] = {}
+
+
+def _bvh_cache_key(filepath: str, cyclic: bool, bvh_map) -> tuple:
+    try:
+        mtime = os.path.getmtime(filepath)
+    except OSError:
+        mtime = None
+    return (os.path.abspath(filepath), mtime, bool(cyclic), id(bvh_map))
 
 from rl_mass.bvh import (
     BVH,
@@ -113,10 +128,41 @@ class Character:
         bvh_map: body_name -> BVH joint name. None uses the default Mixamo-style
         MASS_BVH_MAP. Pass joint_utils.MASS_NATIVE_BVH_MAP for BVH files that
         already use MASS body names (no Character1_* layer).
+
+        Parse + motion cache are memoized per (filepath, mtime, cyclic, bvh_map
+        identity) at module level. Subsequent Characters loading the same file
+        reuse the parsed BVH object and the precomputed motion_dart_cache.
         """
-        self.bvh = BVH(bvh_map=bvh_map)
-        self.bvh.parse(filepath, cyclic)
-        self._build_motion_cache()
+        cache_key = _bvh_cache_key(filepath, cyclic, bvh_map)
+        cached = _BVH_CACHE.get(cache_key)
+        if cached is None:
+            bvh = BVH(bvh_map=bvh_map)
+            bvh.parse(filepath, cyclic)
+            self.bvh = bvh
+            self._build_motion_cache()
+            _BVH_CACHE[cache_key] = (
+                bvh,
+                self._motion_dart_cache,
+                self._T0_y0,
+                self._T0_inv,
+                self._cycle_transform,
+                self._cycle_transform_cache,
+            )
+            return
+        (
+            bvh,
+            motion_dart_cache,
+            T0_y0,
+            T0_inv,
+            cycle_transform,
+            cycle_transform_cache,
+        ) = cached
+        self.bvh = bvh
+        self._motion_dart_cache = motion_dart_cache
+        self._T0_y0 = T0_y0.copy()
+        self._T0_inv = T0_inv
+        self._cycle_transform = cycle_transform
+        self._cycle_transform_cache = dict(cycle_transform_cache)
 
     def reset(self) -> None:
         """Reset Tc to T0 with y-translation zeroed. Port of Character::Reset."""
