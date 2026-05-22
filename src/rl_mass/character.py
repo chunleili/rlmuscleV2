@@ -39,6 +39,7 @@ from rl_mass.joint_utils import (
     DART_ROOT_OFFSET,
     MASS_BODY_NAMES,
     MASS_JOINT_TYPES,
+    dart_qpos_batch_to_mujoco,
     dart_qpos_to_mujoco,
     expmap_to_quat_wxyz,
     mujoco_qpos_to_dart,
@@ -86,6 +87,11 @@ class Character:
 
         # Tc: cumulative root transform for cyclic motion (4x4 homogeneous)
         self.Tc = np.eye(4, dtype=np.float64)
+        self._T0_y0 = np.eye(4, dtype=np.float64)
+        self._T0_inv = np.eye(4, dtype=np.float64)
+        self._cycle_transform = np.eye(4, dtype=np.float64)
+        self._cycle_transform_cache: dict[int, np.ndarray] = {0: self._T0_y0.copy()}
+        self._motion_dart_cache: Optional[np.ndarray] = None
 
         # SPD parameters (DART dof-space, nv = 56)
         nv = engine.nv
@@ -110,12 +116,12 @@ class Character:
         """
         self.bvh = BVH(bvh_map=bvh_map)
         self.bvh.parse(filepath, cyclic)
+        self._build_motion_cache()
 
     def reset(self) -> None:
         """Reset Tc to T0 with y-translation zeroed. Port of Character::Reset."""
         assert self.bvh is not None, "Load BVH first"
-        self.Tc = self.bvh.T0.copy()
-        self.Tc[1, 3] = 0.0  # translation[1] = 0 (y = height)
+        self.Tc = self._T0_y0.copy()
 
     def get_target_positions_dart(self, t: float, dt: float) -> np.ndarray:
         """Compute target positions in DART qpos space.
@@ -131,9 +137,8 @@ class Character:
             DART qpos vector (56,).
         """
         assert self.bvh is not None
-
-        # 1. Get raw BVH motion in DART format
-        p = self.bvh.get_motion_dart(t)
+        p = self._get_raw_motion_dart(t).copy()
+        Tc = self._get_cycle_tc(t)
 
         # 2. Extract root transform from p[0:6]
         #    DART FreeJoint: [logMap(3), translation(3)]
@@ -142,11 +147,10 @@ class Character:
         T_current = _make_transform(R_current, t_current)
 
         # 3. Remove T0: T_current = T0^-1 * T_current
-        T0_inv = _transform_inv(self.bvh.T0)
-        T_current = T0_inv @ T_current
+        T_current = self._T0_inv @ T_current
 
         # 4. Apply Tc: T_head = Tc * T_current
-        T_head = self.Tc @ T_current
+        T_head = Tc @ T_current
 
         # 5. Write back root transform to p
         R_head = T_head[:3, :3]
@@ -168,20 +172,58 @@ class Character:
                 delta *= ratio
                 p[5] += delta  # p[5] = DART root trans z
 
-            # 7. Cycle wrap: update Tc when t+dt wraps
+            # 7. Keep Tc consistent with the next control-step state.
+            self.Tc = self._get_cycle_tc(t + dt)
+
+        return p
+
+    def _get_target_positions_dart_uncached(
+        self, t: float, dt: float, Tc: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Reference implementation of the original stateful target sampler."""
+        assert self.bvh is not None
+        p = self.bvh.get_motion_dart(t)
+
+        R_current = _expmap_to_rotmat(p[:3])
+        t_current = p[3:6].copy()
+        T_current = _make_transform(R_current, t_current)
+
+        T0_inv = _transform_inv(self.bvh.T0)
+        T_current = T0_inv @ T_current
+        T_head = Tc @ T_current
+
+        R_head = T_head[:3, :3]
+        t_head = T_head[:3, 3]
+        p = p.copy()
+        p[:3] = _logmap(R_head)
+        p[3:6] = t_head
+
+        Tc_next = Tc.copy()
+        if self.bvh.cyclic:
+            max_time = self.bvh.max_time
+            t_mod = math.fmod(t, max_time)
+            t_mod_ratio = t_mod / max_time
+
+            r = 0.95
+            if t_mod_ratio > r:
+                ratio = 1.0 / (r - 1.0) * t_mod_ratio - 1.0 / (r - 1.0)
+                T01 = self.bvh.T1 @ _transform_inv(self.bvh.T0)
+                delta = T01[1, 3]
+                delta *= ratio
+                p[5] += delta
+
             tdt_mod = math.fmod(t + dt, max_time)
             if tdt_mod - dt < 0.0:
                 T01 = self.bvh.T1 @ _transform_inv(self.bvh.T0)
-                # Extract axis-angle of T01 rotation, zero x and z
                 p01 = _logmap(T01[:3, :3])
                 p01[0] = 0.0
                 p01[2] = 0.0
                 T01[:3, :3] = _expmap_to_rotmat(p01)
 
-                self.Tc = T01 @ self.Tc
-                self.Tc[1, 3] = 0.0  # translation[1] = 0
+                Tc_next = T01 @ Tc_next
+                Tc_next[1, 3] = 0.0
 
-        return p
+        return p, Tc_next
 
     def get_target_positions_mujoco(self, t: float, dt: float) -> np.ndarray:
         """Get target positions in MuJoCo qpos format."""
@@ -230,6 +272,141 @@ class Character:
         mj_vel[3:6] = v_dart[:3]   # MuJoCo angular ← DART rotation
 
         return mj_q, mj_vel
+
+    def get_target_pos_and_vel_mujoco_batch(
+        self,
+        times: np.ndarray,
+        dt: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Vectorized target sampler for many environments sharing one motion."""
+        p_dart, v_dart = self.get_target_pos_and_vel_dart_batch(times, dt)
+        mj_q = dart_qpos_batch_to_mujoco(
+            p_dart,
+            root_offset=DART_ROOT_OFFSET,
+        )
+        mj_vel = v_dart.copy()
+        mj_vel[:, :3] = v_dart[:, 3:6]
+        mj_vel[:, 3:6] = v_dart[:, :3]
+        return mj_q, mj_vel
+
+    def get_target_pos_and_vel_dart_batch(
+        self,
+        times: np.ndarray,
+        dt: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Vectorized DART-space target sampler for many environments."""
+        times = np.asarray(times, dtype=np.float64).reshape(-1)
+        p_dart = self._get_target_positions_dart_batch(times)
+        p1_dart = self._get_target_positions_dart_batch(times + dt)
+        v_dart = (p1_dart - p_dart) / dt
+        return p_dart, v_dart
+
+    def _build_motion_cache(self) -> None:
+        assert self.bvh is not None
+        frames = [
+            self.bvh.get_motion_dart_frame(i)
+            for i in range(self.bvh.num_total_frames)
+        ]
+        self._motion_dart_cache = np.asarray(frames, dtype=np.float64)
+        self._T0_y0 = self.bvh.T0.copy()
+        self._T0_y0[1, 3] = 0.0
+        self._T0_inv = _transform_inv(self.bvh.T0)
+
+        T01 = self.bvh.T1 @ self._T0_inv
+        p01 = _logmap(T01[:3, :3])
+        p01[0] = 0.0
+        p01[2] = 0.0
+        T01[:3, :3] = _expmap_to_rotmat(p01)
+        T01[1, 3] = 0.0
+        self._cycle_transform = T01
+        self._cycle_transform_cache = {0: self._T0_y0.copy()}
+
+    def _get_raw_motion_dart(self, t: float) -> np.ndarray:
+        assert self.bvh is not None
+        assert self._motion_dart_cache is not None
+        k = int(math.floor(t / self.bvh.time_step))
+        if self.bvh.cyclic:
+            k %= self.bvh.num_total_frames
+        k = max(0, min(k, self.bvh.num_total_frames - 1))
+        return self._motion_dart_cache[k]
+
+    def _get_cycle_tc(self, t: float) -> np.ndarray:
+        assert self.bvh is not None
+        if not self.bvh.cyclic:
+            return self._T0_y0
+        cycles = max(0, int(math.floor(t / self.bvh.max_time)))
+        if cycles not in self._cycle_transform_cache:
+            Tc = self._T0_y0.copy()
+            for _ in range(cycles):
+                Tc = self._cycle_transform @ Tc
+                Tc[1, 3] = 0.0
+            self._cycle_transform_cache[cycles] = Tc
+        return self._cycle_transform_cache[cycles]
+
+    def _get_cycle_tc_batch(self, times: np.ndarray) -> np.ndarray:
+        assert self.bvh is not None
+        times = np.asarray(times, dtype=np.float64).reshape(-1)
+        if not self.bvh.cyclic:
+            return np.broadcast_to(
+                self._T0_y0,
+                (times.shape[0], 4, 4),
+            ).copy()
+
+        cycles = np.maximum(
+            0,
+            np.floor(times / self.bvh.max_time).astype(np.int64),
+        )
+        out = np.empty((times.shape[0], 4, 4), dtype=np.float64)
+        for cycle in np.unique(cycles):
+            cyc = int(cycle)
+            if cyc not in self._cycle_transform_cache:
+                Tc = self._T0_y0.copy()
+                for _ in range(cyc):
+                    Tc = self._cycle_transform @ Tc
+                    Tc[1, 3] = 0.0
+                self._cycle_transform_cache[cyc] = Tc
+            out[cycles == cyc] = self._cycle_transform_cache[cyc]
+        return out
+
+    def _get_target_positions_dart_batch(self, times: np.ndarray) -> np.ndarray:
+        assert self.bvh is not None
+        assert self._motion_dart_cache is not None
+
+        times = np.asarray(times, dtype=np.float64).reshape(-1)
+        k = np.floor(times / self.bvh.time_step).astype(np.int64)
+        if self.bvh.cyclic:
+            k %= self.bvh.num_total_frames
+        k = np.clip(k, 0, self.bvh.num_total_frames - 1)
+
+        p = self._motion_dart_cache[k].copy()
+        Tc = self._get_cycle_tc_batch(times)
+
+        R_current = Rotation.from_rotvec(p[:, :3]).as_matrix()
+        t_current = p[:, 3:6]
+        T0_inv_R = self._T0_inv[:3, :3]
+        T0_inv_t = self._T0_inv[:3, 3]
+        R_rel = np.einsum("ij,bjk->bik", T0_inv_R, R_current, optimize=True)
+        t_rel = np.einsum("ij,bj->bi", T0_inv_R, t_current, optimize=True) + T0_inv_t
+
+        Tc_R = Tc[:, :3, :3]
+        Tc_t = Tc[:, :3, 3]
+        R_head = np.einsum("bij,bjk->bik", Tc_R, R_rel, optimize=True)
+        t_head = np.einsum("bij,bj->bi", Tc_R, t_rel, optimize=True) + Tc_t
+
+        p[:, :3] = Rotation.from_matrix(R_head).as_rotvec()
+        p[:, 3:6] = t_head
+
+        if self.bvh.cyclic:
+            t_mod = np.fmod(times, self.bvh.max_time)
+            t_mod_ratio = t_mod / self.bvh.max_time
+            r = 0.95
+            mask = t_mod_ratio > r
+            if np.any(mask):
+                ratio = 1.0 / (r - 1.0) * t_mod_ratio[mask] - 1.0 / (r - 1.0)
+                delta = (self.bvh.T1 @ _transform_inv(self.bvh.T0))[1, 3] * ratio
+                p[mask, 5] += delta
+
+        return p
 
     def get_spd_forces(
         self,

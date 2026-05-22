@@ -57,6 +57,26 @@ class WarpEngineTests(unittest.TestCase):
         finally:
             engine.close()
 
+    def test_device_mass_matrix_matches_cpu_fullm(self):
+        engine = WarpEngine("data/rl_mass/humanoid_swim.xml", timestep=1.0 / 600.0, num_worlds=2)
+        try:
+            engine.forward_dynamics()
+            mass = engine.mass_matrix_tensor().detach().cpu().numpy()
+            np.testing.assert_allclose(
+                mass[0],
+                engine.get_mass_matrix_world(0),
+                atol=1e-5,
+                rtol=1e-5,
+            )
+            np.testing.assert_allclose(
+                mass[1],
+                engine.get_mass_matrix_world(1),
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        finally:
+            engine.close()
+
 
 if __name__ == "__main__":
     unittest.main()

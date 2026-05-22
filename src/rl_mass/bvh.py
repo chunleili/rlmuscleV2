@@ -363,7 +363,10 @@ class BVH:
         if self.cyclic:
             k = k % self.num_total_frames
         k = max(0, min(k, self.num_total_frames - 1))
+        return self.get_motion_dart_frame(k)
 
+    def get_motion_dart_frame(self, k: int) -> np.ndarray:
+        """Get motion for an exact frame index in DART qpos format."""
         m_t = self.motions[k]
 
         # Set all BVH nodes from frame data

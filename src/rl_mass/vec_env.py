@@ -69,6 +69,16 @@ class MassVecEnv:
     # Per-index queries
     def is_end_of_episode(self, idx: int) -> bool: raise NotImplementedError
     def get_reward(self, idx: int) -> float: raise NotImplementedError
+    def get_end_of_episodes(self) -> np.ndarray:
+        return np.array(
+            [self.is_end_of_episode(i) for i in range(self.num_envs)],
+            dtype=bool,
+        )
+    def get_rewards(self) -> np.ndarray:
+        return np.array(
+            [self.get_reward(i) for i in range(self.num_envs)],
+            dtype=np.float64,
+        )
     def reset(self, rsi: bool = True, idx: Optional[int] = None):
         """Reset env(s). Returns fresh state if idx is given, else None."""
         raise NotImplementedError
@@ -141,6 +151,12 @@ class SerialVecEnv(MassVecEnv):
 
     def get_reward(self, idx: int) -> float:
         return self.envs[idx].get_reward()
+
+    def get_end_of_episodes(self) -> np.ndarray:
+        return np.array([e.is_end_of_episode() for e in self.envs], dtype=bool)
+
+    def get_rewards(self) -> np.ndarray:
+        return np.array([e.get_reward() for e in self.envs], dtype=np.float64)
 
     def reset(self, rsi: bool = True, idx: Optional[int] = None):
         if idx is None:
@@ -417,6 +433,12 @@ class SubprocVecEnv(MassVecEnv):
     def get_reward(self, idx: int) -> float:
         self.parents[idx].send(("get_reward", None))
         return float(self._recv_checked(self.parents[idx]))
+
+    def get_end_of_episodes(self) -> np.ndarray:
+        return np.array(self._broadcast_same("is_end_of_episode"), dtype=bool)
+
+    def get_rewards(self) -> np.ndarray:
+        return np.array(self._broadcast_same("get_reward"), dtype=np.float64)
 
     def reset(self, rsi: bool = True, idx: Optional[int] = None):
         if idx is None:

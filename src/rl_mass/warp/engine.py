@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
+import torch
 
 
 def _patch_mujoco_warp_tendon_compat() -> None:
@@ -124,6 +125,10 @@ class WarpEngine:
             )
             for bid in range(self.cpu_model.nbody)
         ]
+        qM_rows, qM_cols = self._build_qm_scatter_indices()
+        self._qM_rows = torch.as_tensor(qM_rows, device=self.device, dtype=torch.long)
+        self._qM_cols = torch.as_tensor(qM_cols, device=self.device, dtype=torch.long)
+        self._torch_diag_idx = torch.arange(self.nv, device=self.device, dtype=torch.long)
 
     @property
     def nq(self) -> int:
@@ -198,6 +203,10 @@ class WarpEngine:
     def forward(self) -> None:
         self._mujoco_warp.forward(self.model, self.data)
 
+    def forward_dynamics(self) -> None:
+        """Refresh device-side dynamics buffers for the current state."""
+        self.forward()
+
     def kinematics(self) -> None:
         self._mujoco_warp.kinematics(self.model, self.data)
 
@@ -205,7 +214,34 @@ class WarpEngine:
         self._mujoco_warp.com_pos(self.model, self.data)
 
     def step(self) -> None:
+        import warp as wp
+        # Snapshot qpos/qvel on-device so we can roll back any world whose
+        # qacc/qvel/qpos becomes NaN inside mujoco_warp.step. Mirrors the
+        # behavior of CPU mujoco, which emits a "Nan, Inf or huge value in
+        # QACC" warning and continues with the previous state rather than
+        # propagating NaN.
+        if not hasattr(self, "_qpos_snap"):
+            self._qpos_snap = wp.zeros_like(self.data.qpos)
+            self._qvel_snap = wp.zeros_like(self.data.qvel)
+        wp.copy(self._qpos_snap, self.data.qpos)
+        wp.copy(self._qvel_snap, self.data.qvel)
+
         self._mujoco_warp.step(self.model, self.data)
+
+        q_host = self.data.qpos.numpy()
+        v_host = self.data.qvel.numpy()
+        bad_q = ~np.all(np.isfinite(q_host), axis=1)
+        bad_v = ~np.all(np.isfinite(v_host), axis=1)
+        bad = bad_q | bad_v
+        if bad.any():
+            snap_q = self._qpos_snap.numpy()
+            snap_v = self._qvel_snap.numpy()
+            for w in np.where(bad)[0]:
+                q_host[w] = snap_q[w]
+                v_host[w] = 0.0
+            self.set_qpos(q_host)
+            self.set_qvel(v_host)
+            self.forward()
 
     def reset(self) -> None:
         self.set_qpos(self._initial_qpos)
@@ -220,6 +256,34 @@ class WarpEngine:
 
     def get_constraint_forces(self) -> np.ndarray:
         return self.data.qfrc_constraint.numpy().copy()
+
+    def qpos_tensor(self) -> torch.Tensor:
+        return self._warp_to_torch(self.data.qpos)
+
+    def qvel_tensor(self) -> torch.Tensor:
+        return self._warp_to_torch(self.data.qvel)
+
+    def coriolis_gravity_tensor(self) -> torch.Tensor:
+        return self._warp_to_torch(self.data.qfrc_bias)
+
+    def constraint_forces_tensor(self) -> torch.Tensor:
+        return self._warp_to_torch(self.data.qfrc_constraint)
+
+    def mass_matrix_tensor(self) -> torch.Tensor:
+        qM = self._warp_to_torch(self.data.qM).squeeze(1)
+        M = torch.zeros(
+            (self.num_worlds, self.nv, self.nv),
+            device=qM.device,
+            dtype=qM.dtype,
+        )
+        row_idx = self._qM_rows.unsqueeze(0).expand(self.num_worlds, -1)
+        col_idx = self._qM_cols.unsqueeze(0).expand(self.num_worlds, -1)
+        world_idx = torch.arange(
+            self.num_worlds, device=qM.device, dtype=torch.long
+        ).unsqueeze(1).expand_as(row_idx)
+        M[world_idx, row_idx, col_idx] = qM
+        M[world_idx, col_idx, row_idx] = qM
+        return M
 
     def get_mass_matrix_world(self, world_id: int) -> np.ndarray:
         self._sync_world_to_cpu(world_id)
@@ -385,6 +449,21 @@ class WarpEngine:
 
     def close(self) -> None:
         pass
+
+    def _warp_to_torch(self, arr):
+        return self._wp.to_torch(arr)
+
+    def _build_qm_scatter_indices(self) -> tuple[np.ndarray, np.ndarray]:
+        """Build compact-qM -> dense-(row,col) mapping for MuJoCo sparse M."""
+        rows = np.empty((self.cpu_model.nM,), dtype=np.int64)
+        cols = np.empty_like(rows)
+        for row in range(self.nv):
+            adr = int(self.cpu_model.M_rowadr[row])
+            for k in range(int(self.cpu_model.M_rownnz[row])):
+                cols[adr + k] = int(self.cpu_model.M_colind[adr + k])
+                rows[adr + k] = row
+        compact = np.asarray(self.cpu_model.mapM2M, dtype=np.int64)
+        return rows[compact], cols[compact]
 
 
 class WarpWorldView:

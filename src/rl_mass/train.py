@@ -234,6 +234,8 @@ class PPO:
                 next_states = None  # computed after episode bookkeeping
                 step_rewards = None
                 step_eoes = None
+                batch_eoes = self.env.get_end_of_episodes()
+                batch_rewards = self.env.get_rewards()
 
             # Check for episode end, collect rewards
             for j in range(self.num_envs):
@@ -248,12 +250,12 @@ class PPO:
                 ):
                     nan_occur = True
                 else:
-                    eoe = step_eoes[j] if step_eoes is not None else self.env.is_end_of_episode(j)
+                    eoe = step_eoes[j] if step_eoes is not None else batch_eoes[j]
                     if not eoe:
                         terminated_state = False
                         reward = (
                             step_rewards[j] if step_rewards is not None
-                            else self.env.get_reward(j)
+                            else batch_rewards[j]
                         )
                         self.episodes[j].Push(
                             states[j], actions[j], reward, values[j], logprobs[j]

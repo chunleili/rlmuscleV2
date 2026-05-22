@@ -295,6 +295,62 @@ def dart_qpos_to_mujoco(
     return mj_q
 
 
+def dart_qpos_batch_to_mujoco(
+    dart_q: np.ndarray,
+    joint_types: list[str] | None = None,
+    root_offset: np.ndarray | None = None,
+) -> np.ndarray:
+    """Vectorized DART->MuJoCo qpos conversion for batched target sampling."""
+    if joint_types is None:
+        joint_types = MASS_JOINT_TYPES
+
+    dart_q = np.asarray(dart_q, dtype=np.float64)
+    if dart_q.ndim != 2:
+        raise ValueError(f"dart_q must be 2D, got shape {dart_q.shape}")
+
+    idx = _IDX if joint_types is MASS_JOINT_TYPES else _build_index_tables(joint_types)
+    n_ball = idx["n_ball"]
+    ball_ds = idx["ball_dart_starts"]
+    ball_ms = idx["ball_mj_starts"]
+    free_di = idx["free_dart_idx"]
+    free_mi = idx["free_mj_idx"]
+    rev_ds = idx["rev_dart_indices"]
+    rev_ms = idx["rev_mj_indices"]
+
+    batch = dart_q.shape[0]
+    mj_size = sum(_MJ_QPOS[jt] for jt in joint_types)
+    mj_q = np.zeros((batch, mj_size), dtype=np.float64)
+
+    if free_di >= 0:
+        trans = dart_q[:, free_di + 3 : free_di + 6]
+        if root_offset is not None:
+            mj_q[:, free_mi : free_mi + 3] = trans + root_offset[None, :]
+        else:
+            mj_q[:, free_mi : free_mi + 3] = trans
+        free_quat_xyzw = Rotation.from_rotvec(
+            dart_q[:, free_di : free_di + 3]
+        ).as_quat()
+        mj_q[:, free_mi + 3] = free_quat_xyzw[:, 3]
+        mj_q[:, free_mi + 4 : free_mi + 7] = free_quat_xyzw[:, :3]
+
+    if n_ball > 0:
+        ball_expmaps = np.stack(
+            [dart_q[:, s : s + 3] for s in ball_ds],
+            axis=1,
+        )
+        q_xyzw_batch = Rotation.from_rotvec(
+            ball_expmaps.reshape(-1, 3)
+        ).as_quat().reshape(batch, n_ball, 4)
+        for k, mi in enumerate(ball_ms):
+            mj_q[:, mi] = q_xyzw_batch[:, k, 3]
+            mj_q[:, mi + 1 : mi + 4] = q_xyzw_batch[:, k, :3]
+
+    if len(rev_ds) > 0:
+        mj_q[:, rev_ms] = dart_q[:, rev_ds]
+
+    return mj_q
+
+
 def mujoco_qpos_to_dart(
     mj_q: np.ndarray,
     joint_types: list[str] | None = None,
@@ -434,6 +490,19 @@ def dart_position_differences(
         R_diff = np.transpose(R1_batch, (0, 2, 1)) @ R2_batch
 
         # Batch convert back to rotvec: (n_rot, 3)
+        if not (np.all(np.isfinite(R_diff)) and np.all(np.isfinite(e1_batch)) and np.all(np.isfinite(e2_batch))):
+            import os
+            dump = "/tmp/warp_div_dump.npz"
+            np.savez(dump, q1=q1, q2=q2, e1=e1_batch, e2=e2_batch,
+                     R1=R1_batch, R2=R2_batch, R_diff=R_diff)
+            bad_q1 = np.where(~np.isfinite(q1))[0]
+            bad_q2 = np.where(~np.isfinite(q2))[0]
+            raise FloatingPointError(
+                f"dart_position_differences non-finite input/output. "
+                f"bad q1 idx={bad_q1.tolist()[:20]} bad q2 idx={bad_q2.tolist()[:20]} "
+                f"max|q1|={np.nanmax(np.abs(q1)):.3e} max|q2|={np.nanmax(np.abs(q2)):.3e} "
+                f"dump={dump}"
+            )
         diff_batch = Rotation.from_matrix(R_diff).as_rotvec()
 
         # Scatter results
