@@ -591,6 +591,85 @@ def dart_position_differences(
     return result
 
 
+def dart_position_differences_batched(
+    q2_dart: np.ndarray,
+    q1_dart: np.ndarray,
+    joint_types: list[str] | None = None,
+) -> np.ndarray:
+    """Vectorized batched form of ``dart_position_differences``.
+
+    Operates on ``(N, dart_size)`` inputs and returns ``(N, dart_size)``.
+    Calls scipy ``Rotation`` once across all (N * n_rot) rotations,
+    eliminating the per-env Python loop in GPU rollout metric computation.
+    """
+    if joint_types is None:
+        joint_types = MASS_JOINT_TYPES
+
+    q2 = np.asarray(q2_dart, dtype=np.float64)
+    q1 = np.asarray(q1_dart, dtype=np.float64)
+    if q1.shape != q2.shape or q1.ndim != 2:
+        raise ValueError(
+            f"q1/q2 must be 2D same-shape; got {q1.shape} vs {q2.shape}"
+        )
+    N, dart_size = q1.shape
+    result = np.zeros_like(q2)
+
+    idx_tbl = _IDX if joint_types is MASS_JOINT_TYPES else _build_index_tables(joint_types)
+    n_ball = idx_tbl["n_ball"]
+    ball_ds = idx_tbl["ball_dart_starts"]
+    free_di = idx_tbl["free_dart_idx"]
+    rev_ds = idx_tbl["rev_dart_indices"]
+    has_free = free_di >= 0
+    n_rot = n_ball + (1 if has_free else 0)
+
+    if n_rot > 0:
+        # Build (N, n_rot, 3) exp-map stacks for q1 and q2
+        e1 = np.empty((N, n_rot, 3), dtype=np.float64)
+        e2 = np.empty((N, n_rot, 3), dtype=np.float64)
+        k = 0
+        if has_free:
+            e1[:, 0, :] = q1[:, free_di : free_di + 3]
+            e2[:, 0, :] = q2[:, free_di : free_di + 3]
+            k = 1
+        for i in range(n_ball):
+            s = ball_ds[i]
+            e1[:, k + i, :] = q1[:, s : s + 3]
+            e2[:, k + i, :] = q2[:, s : s + 3]
+
+        # One scipy call across all (N * n_rot) rotations
+        R1 = Rotation.from_rotvec(e1.reshape(-1, 3)).as_matrix().reshape(
+            N, n_rot, 3, 3,
+        )
+        R2 = Rotation.from_rotvec(e2.reshape(-1, 3)).as_matrix().reshape(
+            N, n_rot, 3, 3,
+        )
+        # R_diff = R1^T @ R2 for each (env, joint): (N, n_rot, 3, 3)
+        R_diff = np.einsum("nrij,nrjk->nrik", R1.transpose(0, 1, 3, 2), R2)
+        diff = Rotation.from_matrix(R_diff.reshape(-1, 3, 3)).as_rotvec().reshape(
+            N, n_rot, 3,
+        )
+
+        k = 0
+        if has_free:
+            result[:, free_di : free_di + 3] = diff[:, 0, :]
+            # FreeJoint translation: R1^T @ (t2 - t1)
+            t1 = q1[:, free_di + 3 : free_di + 6]
+            t2 = q2[:, free_di + 3 : free_di + 6]
+            dt = (t2 - t1)[:, :, None]  # (N, 3, 1)
+            result[:, free_di + 3 : free_di + 6] = np.einsum(
+                "nij,njk->nik", R1[:, 0, :, :].transpose(0, 2, 1), dt,
+            )[:, :, 0]
+            k = 1
+        for i in range(n_ball):
+            s = ball_ds[i]
+            result[:, s : s + 3] = diff[:, k + i, :]
+
+    if len(rev_ds) > 0:
+        result[:, rev_ds] = q2[:, rev_ds] - q1[:, rev_ds]
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Round-trip tests
 # ---------------------------------------------------------------------------

@@ -25,7 +25,7 @@ from rl_mass.env import MassEnv, batch_init_mass_envs
 from rl_mass.joint_utils import (
     DART_ROOT_OFFSET,
     dart_qpos_batch_to_mujoco,
-    dart_position_differences,
+    dart_position_differences_batched,
     mujoco_qpos_to_dart,
     mujoco_qpos_batch_to_dart,
 )
@@ -759,34 +759,35 @@ class WarpGPUEnv:
         qpos = self._engine.get_qpos().astype(np.float64, copy=False)
         qvel = self._engine.get_qvel().astype(np.float64, copy=False)
         times = self._engine.get_time().astype(np.float64, copy=False)
-        cur_pos_dart = np.empty((self.num_envs, self._engine.nv), dtype=np.float64)
-        for i in range(self.num_envs):
-            cur_pos_dart[i] = mujoco_qpos_to_dart(
-                qpos[i],
-                root_offset=DART_ROOT_OFFSET,
-            )
 
-        p_diff_all = np.empty_like(cur_pos_dart)
-        for i in range(self.num_envs):
-            p_diff_all[i] = dart_position_differences(
-                self._target_positions_dart[i],
-                cur_pos_dart[i],
-            )
+        # Vectorized: replaces two O(N) Python loops over the scalar
+        # mujoco_qpos_to_dart + dart_position_differences helpers.
+        cur_pos_dart = mujoco_qpos_batch_to_dart(qpos, root_offset=DART_ROOT_OFFSET)
+        p_diff_all = dart_position_differences_batched(
+            self._target_positions_dart, cur_pos_dart,
+        )
 
         reward_seg = p_diff_all[:, self._reward_dof_idx]
         pose_error_sq = np.sum(reward_seg * reward_seg, axis=1)
         r_q = np.exp(-2.0 * pose_error_sq)
         r_v = np.ones((self.num_envs,), dtype=np.float64)
 
+        # Single sync of xipos for both cur_com and cur_ee.
+        cur_xipos = self._engine.data.xipos.numpy()
         cur_com = np.tensordot(
-            self._engine.data.xipos.numpy()[:, self._body_ids, :],
+            cur_xipos[:, self._body_ids, :],
             self._body_masses,
             axes=([1], [0]),
         ) / self._body_mass_sum
-        cur_ee = self._engine.data.xipos.numpy()[:, self._ee_body_ids, :].copy()
+        cur_ee = cur_xipos[:, self._ee_body_ids, :].copy()
 
+        # Compute target-pose kinematics by temporarily swapping qpos.
+        # set_qvel(saved) is intentionally omitted — set_qpos doesn't touch
+        # qvel, so it was never disturbed. forward() is replaced with
+        # kinematics() + com_pos(): we only need xpos/xmat/xipos restored
+        # for the next get_states; the rest of forward() (inverse dynamics,
+        # solver, narrowphase) is wasted work here.
         saved_qpos = qpos.copy()
-        saved_qvel = qvel.copy()
         self._engine.set_qpos(self._target_positions_mj)
         self._engine.kinematics()
         self._engine.com_pos()
@@ -798,8 +799,8 @@ class WarpGPUEnv:
         ) / self._body_mass_sum
         target_ee = target_xipos[:, self._ee_body_ids, :].copy()
         self._engine.set_qpos(saved_qpos)
-        self._engine.set_qvel(saved_qvel)
-        self._engine.forward()
+        self._engine.kinematics()
+        self._engine.com_pos()
 
         com_diff = cur_com - target_com
         ee_diff = cur_ee - (target_ee + com_diff[:, None, :])
@@ -811,14 +812,14 @@ class WarpGPUEnv:
         root_y = self._engine.data.xpos.numpy()[:, self._root_bid, 1] - (-0.49958)
         has_nan = np.any(np.isnan(qpos), axis=1) | np.any(np.isnan(qvel), axis=1)
         eoe = has_nan | (times > 10.0)
-        for i, env in enumerate(self.envs):
-            if env.height_termination and root_y[i] < 1.3:
-                eoe[i] = True
-            if (
-                env.pose_error_threshold is not None
-                and pose_error_sq[i] > env.pose_error_threshold
-            ):
-                eoe[i] = True
+        # Vectorized termination: all envs share the same config (single
+        # config_path passed to WarpGPUEnv ctor), so the thresholds are
+        # scalar — no per-env Python loop needed.
+        e0 = self.envs[0]
+        if e0.height_termination:
+            eoe |= root_y < 1.3
+        if e0.pose_error_threshold is not None:
+            eoe |= pose_error_sq > e0.pose_error_threshold
 
         self._reward_cache[:] = reward
         self._pose_error_sq_cache[:] = pose_error_sq
