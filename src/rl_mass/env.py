@@ -94,6 +94,16 @@ class MassEnv:
         # tracking infeasible but rotation drift is still a meaningful signal.
         self.track_root_rotation: bool = cfg.get("track_root_rotation", False)
 
+        # Track the root's translation in r_q (and the pose-error termination
+        # norm). Useful for motions where the reference root translates and
+        # the character must follow (e.g. squat: pelvis drops & shifts back —
+        # without tracking translation the policy only bends knees in place
+        # and falls over). DART FreeJoint stores translation diff as
+        # R1^T * (t2 - t1), scaled in meters, so it can dominate r_q if the
+        # reference root moves a lot — start with shorter references / lower
+        # w_q when first enabling this.
+        self.track_root_translation: bool = cfg.get("track_root_translation", False)
+
         # Terminate episodes when the root drops below a standing height.
         # Disable for tasks with no ground/gravity (e.g. swimming), where the
         # reference pose is not upright and the root height is meaningless.
@@ -587,10 +597,12 @@ class MassEnv:
             p_diff[dart_idx : dart_idx + dart_ndof] = p_diff_all[dart_idx : dart_idx + dart_ndof]
 
         # Optionally include the root's SO(3) rotation diff (DART FreeJoint
-        # layout: [exp_map(3), translation(3), ...]). Indices 3:6 (root
-        # translation) stay zero so translation drift is not penalized.
+        # layout: [exp_map(3), translation(3), ...]). Indices 3:6 are root
+        # translation, gated by a separate flag.
         if self.track_root_rotation:
             p_diff[0:3] = p_diff_all[0:3]
+        if self.track_root_translation:
+            p_diff[3:6] = p_diff_all[3:6]
 
         # v_diff is NOT filtered in the original code:
         # v_diff stays zero, so r_v = exp(0) = 1.0.
@@ -628,10 +640,11 @@ class MassEnv:
         r_q = math.exp(-2.0 * np.dot(p_diff, p_diff))
         r_v = math.exp(-0.1 * np.dot(v_diff, v_diff))
         r_ee = math.exp(-40.0 * np.dot(ee_diff, ee_diff))
-        # r_com computed but not used in original MASS
-        # r_com = math.exp(-10.0 * np.dot(com_diff, com_diff))
+        r_com = math.exp(-10.0 * np.dot(com_diff, com_diff))
 
-        r = r_ee * (self.w_q * r_q + self.w_v * r_v)
+        # r_com is enabled when w_com > 0 (default 0.1, but originally unused —
+        # set w_com=0 in a task's config to fall back to the pre-COM reward).
+        r = r_ee * (self.w_q * r_q + self.w_v * r_v + self.w_com * r_com)
         return r
 
     def _get_skeleton_com(self) -> np.ndarray:
@@ -673,6 +686,9 @@ class MassEnv:
             err += float(np.dot(seg, seg))
         if self.track_root_rotation:
             seg = p_diff_all[0:3]
+            err += float(np.dot(seg, seg))
+        if self.track_root_translation:
+            seg = p_diff_all[3:6]
             err += float(np.dot(seg, seg))
         return err
 
