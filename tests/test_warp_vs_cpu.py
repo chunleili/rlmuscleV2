@@ -12,7 +12,7 @@ import numpy as np
 from rl_mass.env import MassEnv
 from rl_mass.engine import MuJoCoEngine
 from rl_mass.warp.engine import WarpEngine
-from rl_mass.warp.vec_env import WarpVecEnv
+from rl_mass.warp.gpu_env import WarpGPUEnv
 
 
 MODEL = "data/rl_mass/humanoid_swim.xml"
@@ -60,7 +60,7 @@ class WarpVsCpuTests(unittest.TestCase):
 
     def test_control_step_matches_cpu_with_zero_action(self):
         cpu = MassEnv("data/rl_mass/configs/swim.json")
-        warp = WarpVecEnv("data/rl_mass/configs/swim.json", num_envs=1, seed=0)
+        warp = WarpGPUEnv("data/rl_mass/configs/swim.json", num_envs=1, seed=0)
         try:
             cpu.reset(rsi=False)
             warp.reset(rsi=False)
@@ -97,7 +97,7 @@ class WarpVsCpuTests(unittest.TestCase):
 
     def test_reward_and_termination_match_cpu_after_reset(self):
         cpu = MassEnv("data/rl_mass/configs/swim.json")
-        warp = WarpVecEnv("data/rl_mass/configs/swim.json", num_envs=1, seed=0)
+        warp = WarpGPUEnv("data/rl_mass/configs/swim.json", num_envs=1, seed=0)
         try:
             t = 0.35
             cpu.reset(rsi=False, t=t)

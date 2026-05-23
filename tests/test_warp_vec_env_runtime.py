@@ -3,12 +3,12 @@ import unittest
 import numpy as np
 
 from rl_mass.warp.engine import WarpEngine
-from rl_mass.warp.vec_env import WarpVecEnv
+from rl_mass.warp.gpu_env import WarpGPUEnv
 
 
-class WarpVecEnvRuntimeTests(unittest.TestCase):
+class WarpGPUEnvRuntimeTests(unittest.TestCase):
     def test_uses_shared_warp_engine_and_exposes_states(self):
-        env = WarpVecEnv("data/rl_mass/configs/swim.json", num_envs=2, seed=123)
+        env = WarpGPUEnv("data/rl_mass/configs/swim.json", num_envs=2, seed=123)
         try:
             self.assertIsInstance(env._engine, WarpEngine)
             self.assertEqual(env.num_envs, 2)
@@ -18,7 +18,7 @@ class WarpVecEnvRuntimeTests(unittest.TestCase):
             env.close()
 
     def test_batched_states_match_per_env_state(self):
-        env = WarpVecEnv("data/rl_mass/configs/swim.json", num_envs=3, seed=123)
+        env = WarpGPUEnv("data/rl_mass/configs/swim.json", num_envs=3, seed=123)
         try:
             env.reset(rsi=False)
             expected = np.array([subenv.get_state() for subenv in env.envs], dtype=np.float64)
@@ -28,7 +28,7 @@ class WarpVecEnvRuntimeTests(unittest.TestCase):
             env.close()
 
     def test_steps_advances_all_world_times_together(self):
-        env = WarpVecEnv("data/rl_mass/configs/swim.json", num_envs=2, seed=123)
+        env = WarpGPUEnv("data/rl_mass/configs/swim.json", num_envs=2, seed=123)
         try:
             env.set_actions(np.zeros((2, env.num_action), dtype=np.float32))
             t0 = env._engine.get_time().copy()
@@ -43,7 +43,7 @@ class WarpVecEnvRuntimeTests(unittest.TestCase):
             env.close()
 
     def test_set_actions_updates_targets_from_shared_batch_sampler(self):
-        env = WarpVecEnv("data/rl_mass/configs/swim.json", num_envs=3, seed=123)
+        env = WarpGPUEnv("data/rl_mass/configs/swim.json", num_envs=3, seed=123)
         try:
             env.reset(rsi=False)
             env._engine.set_time(np.array([0.0, 0.05, 0.1], dtype=np.float32))
@@ -83,9 +83,9 @@ class WarpVecEnvRuntimeTests(unittest.TestCase):
             env.close()
 
 
-class WarpVecEnvBatchedMuscleTests(unittest.TestCase):
+class WarpGPUEnvBatchedMuscleTests(unittest.TestCase):
     def test_batched_desired_torques_match_per_env_fallback(self):
-        env = WarpVecEnv("data/rl_mass/configs/swim.json", num_envs=3, seed=0)
+        env = WarpGPUEnv("data/rl_mass/configs/swim.json", num_envs=3, seed=0)
         try:
             env.reset(rsi=False)
             acts = np.random.default_rng(1).normal(
@@ -104,7 +104,7 @@ class WarpVecEnvBatchedMuscleTests(unittest.TestCase):
             env.close()
 
     def test_full_control_step_with_batched_muscles(self):
-        env = WarpVecEnv("data/rl_mass/configs/swim.json", num_envs=4, seed=0)
+        env = WarpGPUEnv("data/rl_mass/configs/swim.json", num_envs=4, seed=0)
         try:
             env.reset(rsi=False)
             self.assertIsNotNone(env._warp_ms)
@@ -132,13 +132,13 @@ class WarpVecEnvBatchedMuscleTests(unittest.TestCase):
             env.close()
 
 
-class WarpVecEnvTensorApiTests(unittest.TestCase):
+class WarpGPUEnvTensorApiTests(unittest.TestCase):
     """Tensor-API rollout path must produce same numbers as numpy-API path."""
 
     def test_muscle_and_desired_torques_tensor_match_numpy(self):
         import torch
 
-        env = WarpVecEnv("data/rl_mass/configs/swim.json", num_envs=3, seed=0)
+        env = WarpGPUEnv("data/rl_mass/configs/swim.json", num_envs=3, seed=0)
         try:
             env.reset(rsi=False)
             acts = np.random.default_rng(7).normal(
@@ -165,7 +165,7 @@ class WarpVecEnvTensorApiTests(unittest.TestCase):
     def test_activation_tensor_upload_matches_numpy(self):
         import torch
 
-        env = WarpVecEnv("data/rl_mass/configs/swim.json", num_envs=2, seed=0)
+        env = WarpGPUEnv("data/rl_mass/configs/swim.json", num_envs=2, seed=0)
         try:
             env.reset(rsi=False)
             acts = np.random.default_rng(11).uniform(

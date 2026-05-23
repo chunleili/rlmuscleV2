@@ -147,9 +147,9 @@ def bench_env(
     gpu_index: int,
     metric_names: list[str] | None = None,
 ) -> dict:
-    from rl_mass.warp.vec_env import WarpVecEnv
+    from rl_mass.warp.gpu_env import WarpGPUEnv
 
-    env = WarpVecEnv(config, num_envs=num_envs, seed=0)
+    env = WarpGPUEnv(config, num_envs=num_envs, seed=0)
     try:
         env.reset(rsi=False)
         rng = np.random.default_rng(123)

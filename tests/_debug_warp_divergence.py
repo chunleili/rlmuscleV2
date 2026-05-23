@@ -1,6 +1,6 @@
 """Locate where warp rollout diverges from CPU.
 
-Run identical muscle+SPD closed-loop on CPU MassEnv and WarpVecEnv(num_envs=1),
+Run identical muscle+SPD closed-loop on CPU MassEnv and WarpGPUEnv(num_envs=1),
 report per-control-step max |Δqpos|, |Δqvel|, |Δxfrc|, |Δl_mt|. Stop at first
 control step where divergence exceeds threshold or NaN appears.
 """
@@ -17,13 +17,13 @@ DIVERGE = 1.0
 
 def main():
     from rl_mass.env import MassEnv
-    from rl_mass.warp.vec_env import WarpVecEnv
+    from rl_mass.warp.gpu_env import WarpGPUEnv
 
     cpu_env = MassEnv(CONFIG)
     with open(CONFIG) as f:
         skel = json.load(f)["skeleton_file"]
 
-    warp_env = WarpVecEnv(CONFIG, num_envs=1, seed=0)
+    warp_env = WarpGPUEnv(CONFIG, num_envs=1, seed=0)
     warp_env.reset(rsi=False)
     cpu_env.reset(rsi=False)
 

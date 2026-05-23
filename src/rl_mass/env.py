@@ -164,7 +164,7 @@ class MassEnv:
             )
             # parse_muscle_xml caches a pre-updated muscle list, so we no
             # longer need to call m.update(engine) per env — that was an
-            # 8s/32-envs hit during WarpVecEnv construction at scale.
+            # 8s/32-envs hit during WarpGPUEnv construction at scale.
             for m in self.muscles:
                 self.num_total_related_dofs += m.num_related_dofs
             if self.vectorized_muscles:

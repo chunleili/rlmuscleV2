@@ -752,7 +752,7 @@ def parse_muscle_xml(
         List of Muscle objects with anchors, l_mt0, and related DOFs computed.
 
     Results are cached per (xml_path mtime, engine.model identity). Repeated
-    calls against the same engine model (e.g. batched WarpVecEnv constructing
+    calls against the same engine model (e.g. batched WarpGPUEnv constructing
     N MassEnvs over a single shared WarpEngine) reuse the parse and return a
     deep-copy so each caller still owns mutable per-world muscle state.
     """

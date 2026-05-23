@@ -3,12 +3,12 @@ import unittest
 import numpy as np
 
 from rl_mass.train import PPO
-from rl_mass.warp.vec_env import WarpVecEnv
+from rl_mass.warp.gpu_env import WarpGPUEnv
 
 
 class WarpTrainEvalSmokeTests(unittest.TestCase):
     def test_warp_env_compute_diagnostics(self):
-        env = WarpVecEnv("data/rl_mass/configs/swim.json", num_envs=1, seed=123)
+        env = WarpGPUEnv("data/rl_mass/configs/swim.json", num_envs=1, seed=123)
         try:
             env.set_actions(np.zeros((1, env.num_action), dtype=np.float32))
             env.steps_at_once()

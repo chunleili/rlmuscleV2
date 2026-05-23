@@ -1,4 +1,15 @@
-"""Shared-engine vec-env backed by `WarpEngine`."""
+"""Batched GPU env backed by `WarpEngine`.
+
+GPU path is intentionally NOT modeled as "a vector of N MassEnvs". All state
+lives as `(N, ...)` tensors / arrays and every operation is one batched op
+over all worlds. Per-index loops (especially per-env reset) are the throughput
+killer on GPU — see commit `ee7df6f` for the cProfile evidence.
+
+This module deliberately does NOT inherit from `MassVecEnv` — that base class
+exists to abstract over CPU vec backends and its slow per-index fallbacks
+(``get_end_of_episodes`` / ``get_rewards``) are exactly the pattern we are
+trying to leave behind.
+"""
 
 from __future__ import annotations
 
@@ -19,20 +30,13 @@ from rl_mass.joint_utils import (
     mujoco_qpos_batch_to_dart,
 )
 from rl_mass.muscle import MuscleSystem
-from rl_mass.vec_env import MassVecEnv
 from rl_mass.warp.dart_diff import WarpDartDiff
 from rl_mass.warp.engine import WarpEngine, WarpWorldView
 from rl_mass.warp.muscle import WarpMuscleSystem
 
 
-class WarpVecEnv(MassVecEnv):
-    """Batched vec-env that shares one `WarpEngine` across all worlds.
-
-    Phase 1 intentionally keeps the MASS control / reward / muscle logic in
-    Python by reusing `MassEnv` per world, but all physics state lives inside
-    one tiled `mujoco_warp` data structure and each simulation sub-step is
-    executed once for all worlds together.
-    """
+class WarpGPUEnv:
+    """Single batched env over N worlds, backed by one `WarpEngine`."""
 
     backend_name = "warp"
 
@@ -520,6 +524,14 @@ class WarpVecEnv(MassVecEnv):
         self._refresh_metrics_if_needed()
         return float(self._reward_cache[idx])
 
+    def get_end_of_episodes(self) -> np.ndarray:
+        self._refresh_metrics_if_needed()
+        return self._eoe_cache.copy()
+
+    def get_rewards(self) -> np.ndarray:
+        self._refresh_metrics_if_needed()
+        return self._reward_cache.copy()
+
     def reset(self, rsi: bool = True, idx: Optional[int] = None):
         if idx is None:
             self._engine.reset()
@@ -575,6 +587,101 @@ class WarpVecEnv(MassVecEnv):
         self._target_velocities_dart[idx] = target_vel_dart
         self._metrics_dirty = True
         return state
+
+    def reset_subset(self, indices, rsi: bool = True) -> np.ndarray:
+        """Batched reset for a subset of envs.
+
+        cProfile evidence (N=2048, 1K transitions): the per-index path
+        ``reset(idx=j)`` was 55% of rollout wall — each call does 8 full
+        ``(N, ...)`` GPU<->CPU syncs + one full-N ``forward()``. At N=16384
+        that pattern is the dominant per-transition cost and the reason
+        throughput inverts (197 trans/s @ N=2048 -> 94 @ N=16384). This
+        method collapses k per-index resets into a single scatter + one
+        forward.
+
+        Args:
+            indices: 1-D array-like of env indices to reset.
+            rsi: random start initialization.
+
+        Returns:
+            ``(k, num_state)`` ndarray of post-reset states, in the same
+            order as ``indices``.
+        """
+        indices = np.asarray(indices, dtype=np.intp)
+        k = int(indices.shape[0])
+        if k == 0:
+            return np.empty((0, self.num_state), dtype=np.float64)
+        if k == self.num_envs:
+            self.reset(rsi=rsi)
+            return (
+                self.get_states_tensor().detach().cpu().numpy()
+                .astype(np.float64, copy=False)
+            )
+
+        if rsi:
+            start_times = np.array(
+                [random.uniform(0.0, self._max_time * 0.9) for _ in range(k)],
+                dtype=np.float32,
+            )
+        else:
+            start_times = np.zeros((k,), dtype=np.float32)
+        target_dart, target_vel_dart = (
+            self.envs[0].character.get_target_pos_and_vel_dart_batch(
+                start_times, self._dt_ctrl,
+            )
+        )
+        self._target_positions_dart[indices] = target_dart
+        self._target_velocities_dart[indices] = target_vel_dart
+        target_q = dart_qpos_batch_to_mujoco(
+            target_dart, root_offset=DART_ROOT_OFFSET,
+        )
+        target_v = target_vel_dart.copy()
+        target_v[:, :3] = target_vel_dart[:, 3:6]
+        target_v[:, 3:6] = target_vel_dart[:, :3]
+        self._target_positions_mj[indices] = target_q
+        self._target_velocities_mj[indices] = target_v
+
+        eng = self._engine
+        qpos = eng.data.qpos.numpy()
+        qpos[indices] = target_q.astype(np.float32)
+        eng.data.qpos.assign(qpos)
+
+        qvel = eng.data.qvel.numpy()
+        qvel[indices] = target_v.astype(np.float32)
+        eng.data.qvel.assign(qvel)
+
+        times = eng.data.time.numpy()
+        times[indices] = start_times
+        eng.data.time.assign(times)
+
+        qfrc = eng.data.qfrc_applied.numpy()
+        qfrc[indices] = 0.0
+        eng.data.qfrc_applied.assign(qfrc)
+
+        xfrc = eng.data.xfrc_applied.numpy()
+        xfrc[indices] = 0.0
+        eng.data.xfrc_applied.assign(xfrc)
+
+        eng.forward()
+
+        for k_idx, i in enumerate(indices.tolist()):
+            env = self.envs[i]
+            env.character.reset()
+            env.action[:] = 0.0
+            env.target_positions_mj = target_q[k_idx].copy()
+            env.target_velocities_mj = target_v[k_idx].copy()
+            env.sim_count = 0
+            env.random_sample_index = 0
+            env.average_activation_levels[:] = 0.0
+            if env.activation_levels.size:
+                env.activation_levels[:] = 0.0
+
+        self._metrics_dirty = True
+        states_np = (
+            self.get_states_tensor().detach().cpu().numpy()
+            .astype(np.float64, copy=False)
+        )
+        return states_np[indices]
 
     def gather_muscle_tuples(self) -> list:
         if self._muscle_tuple_chunks:
@@ -638,7 +745,7 @@ class WarpVecEnv(MassVecEnv):
 
     def run_control_step(self, actions: np.ndarray) -> list[tuple[np.ndarray, float, bool]]:
         raise NotImplementedError(
-            "WarpVecEnv packed control path is not implemented yet; "
+            "WarpGPUEnv packed control path is not implemented yet; "
             "use the batch API with `--vec_env_mode warp --no_packed`."
         )
 

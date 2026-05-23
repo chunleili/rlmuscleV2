@@ -5,7 +5,7 @@ implementations:
 
   - SerialVecEnv: in-process for-loop (debug / bit-level regression baseline).
   - SubprocVecEnv: multiprocessing workers with Pipe command dispatch.
-  - WarpVecEnv: bootstrap wrapper for the upcoming GPU backend.
+  - WarpGPUEnv: bootstrap wrapper for the upcoming GPU backend.
 
 Both expose the batch API described in docs/specs/2026-04-24-rl-mass-vecenv-spec.md.
 
@@ -525,9 +525,9 @@ def make_vec_env(
     if num_envs < 1:
         raise ValueError(f"num_envs must be >= 1, got {num_envs}")
     if mode == "warp":
-        from rl_mass.warp import WarpVecEnv
+        from rl_mass.warp import WarpGPUEnv
 
-        return WarpVecEnv(config_path, num_envs, seed=seed)
+        return WarpGPUEnv(config_path, num_envs, seed=seed)
     if mode == "serial" or num_envs == 1:
         return SerialVecEnv(config_path, num_envs)
     elif mode == "subproc":

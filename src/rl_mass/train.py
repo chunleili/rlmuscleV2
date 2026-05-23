@@ -262,6 +262,7 @@ class PPO:
                 batch_rewards = self.env.get_rewards()
 
             # Check for episode end, collect rewards
+            terminated_indices: list[int] = []
             for j in range(self.num_envs):
                 nan_occur = False
                 terminated_state = True
@@ -291,9 +292,24 @@ class PPO:
                         self.episodes[j].Pop()
                     self.total_episodes.append(self.episodes[j])
                     self.episodes[j] = EpisodeBuffer()
-                    new_state = self.env.reset(rsi=True, idx=j)
-                    if self._packed_path and new_state is not None:
-                        next_states[j] = new_state
+                    terminated_indices.append(j)
+
+            # Batched reset for the warp/GPU backend: one scatter + one
+            # forward over the union of terminated envs. CPU vec backends
+            # still fall back to per-index reset.
+            if terminated_indices:
+                if hasattr(self.env, "reset_subset"):
+                    new_states = self.env.reset_subset(
+                        np.asarray(terminated_indices, dtype=np.intp), rsi=True,
+                    )
+                    if self._packed_path and next_states is not None:
+                        for k_idx, j in enumerate(terminated_indices):
+                            next_states[j] = new_states[k_idx]
+                else:
+                    for j in terminated_indices:
+                        new_state = self.env.reset(rsi=True, idx=j)
+                        if self._packed_path and new_state is not None:
+                            next_states[j] = new_state
 
             if local_step >= self.buffer_size:
                 break

@@ -230,29 +230,50 @@ Two changes landed together:
    (called outside the graph), preserving the per-substep NaN rollback
    semantics.
 
-### Throughput (walk.json, 128 control steps = 1 PPO iter, random actions)
+### Throughput (walk.json, real training, 10K transitions, GH200 120GB)
 
-| backend / num_envs | s/iter | ms/step | **trans/s** | GPU avg util | peak GPU mem |
-|---|---:|---:|---:|---:|---:|
-| CPU subproc, 64 envs (real training) | 4.73 | – | **1,730** | – | – |
-| Warp 1024 envs, no graph (phase 4) | ~80.0 | 625 | **1,640** | ~5–10% | – |
-| Warp 1024 envs + graph | 62.1 | 485 | **2,111** | 14.4% | 5.6 GB |
-| Warp 4096 envs + graph | 101.7 | 794 | **5,155** | 16.3% | 20.4 GB |
-| Warp 8192 envs + graph | 139.3 | 1,088 | **7,529** | 17.9% | ≥ 3 GB rolling, ~30 GB at gather (estimated) |
+Wall time and trans/s from real PPO training (`--max_steps 10000`) on a single
+GH200, freshly-initialized policy. Each row is `--num_envs N` running until
+the first iter whose `Num Transition So far >= 10000` completes.
 
-Graph capture alone gives a **~6× wall-time speedup** at 1024 envs vs the
-no-graph build (from a separate 16-ctrl micro-bench: 80s → 13.5s); the
-1024-env 62.1s number above is from a 32-ctrl bench where random-action
-divergence inflates the per-step cost (see caveat below).
+| num_envs | wall | transitions | **trans/s** | pre-batched-reset |
+|---:|---:|---:|---:|---:|
+|  1024 |  30s | 10916 | **363.8** | 145.4 (2.5×) |
+|  2048 |  53s | 10567 | **199.3** | 197.1 (~1×) |
+|  4096 |  52s | 17847 | **343.2** | 144.7 (2.4×) |
+|  8192 |  84s | 20177 | **240.2** | 102.1 (2.4×) |
+| 16384 | 135s | 23551 | **174.4** |  93.8 (1.9×) |
 
-### Caveat: random-action divergence
+Numbers after the batched-reset fix (this commit). The previous column shows
+the pre-fix throughput right after `batch_init_mass_envs` (commit `ee7df6f`)
+but before episode-end reset was batched.
 
-The above are measured with random `~N(0, 0.1)` actions for 32+ control
-steps. The character drifts into deep contact penetration, which
-floods the constraint solver with `nefc overflow` fallbacks and slows
-per-substep time 3–5×. Trained-policy rollouts stay near upright and
-should be substantially faster — the actual training run is the
-authoritative measurement.
+### What the batched-reset fix removed
+
+cProfile of N=2048 pre-fix (1K control steps) showed `MassEnv.reset` being
+called **195×** during a single rollout = 42.8s = 55% of the run, with
+`WarpEngine.reset_world` contributing 21.1s on its own. Each per-env reset
+did 8 full-tensor GPU↔CPU `.numpy()/.assign()` round-trips on the (N, nq)
+state plus a full N-world `engine.forward()`. On cold-start every env hits
+the height-termination cutoff together, so the per-step reset count is
+~N and the per-call cost scales linearly with N — the effective cost is
+O(N²) per step, which is exactly the inversion the pre-fix table showed.
+
+The fix collects all episode-terminated indices for the step and does
+**one** scattered qpos/qvel/time/qfrc/xfrc write + **one** `engine.forward()`
+via `WarpGPUEnv.reset_subset()`. This restores throughput monotonically
+with N up to GPU saturation (peaks at ~360 trans/s, no more inversion at
+the top end).
+
+### Caveat: cold-start still dominates short 10K windows
+
+trans/s is not yet monotone in N because the first ~12 PPO iters yield
+zero useful transitions (untrained muscle policy → random torques → falls
+within one control step → all envs terminate). Each cold-start iter is more
+expensive at larger N, so the wasted prefix is a bigger fraction of the
+10K-transition budget. Over a real multi-million-transition training run
+this prefix amortizes; the table above is a short-window snapshot, not a
+steady-state number.
 
 ### What CUDA graph removed
 

@@ -5,17 +5,17 @@ import unittest
 from rl_mass.vec_env import make_vec_env
 
 
-class _DummyWarpVecEnv:
+class _DummyWarpGPUEnv:
     def __init__(self, config_path: str, num_envs: int, seed=None):
         self.config_path = config_path
         self.num_envs = num_envs
         self.seed = seed
 
 
-class WarpVecEnvFactoryTests(unittest.TestCase):
+class WarpGPUEnvFactoryTests(unittest.TestCase):
     def test_make_vec_env_routes_warp_mode_even_for_single_env(self):
         fake_module = types.ModuleType("rl_mass.warp")
-        fake_module.WarpVecEnv = _DummyWarpVecEnv
+        fake_module.WarpGPUEnv = _DummyWarpGPUEnv
         old_module = sys.modules.get("rl_mass.warp")
         sys.modules["rl_mass.warp"] = fake_module
         try:
@@ -26,7 +26,7 @@ class WarpVecEnvFactoryTests(unittest.TestCase):
             else:
                 sys.modules["rl_mass.warp"] = old_module
 
-        self.assertIsInstance(env, _DummyWarpVecEnv)
+        self.assertIsInstance(env, _DummyWarpGPUEnv)
         self.assertEqual(env.config_path, "dummy.json")
         self.assertEqual(env.num_envs, 1)
         self.assertEqual(env.seed, 123)
