@@ -30,7 +30,7 @@ from rl_mass.joint_utils import (
     mujoco_qpos_batch_to_dart,
 )
 from rl_mass.muscle import MuscleSystem
-from rl_mass.warp.dart_diff import WarpDartDiff
+from rl_mass.warp.dart_diff import WarpDartDiff, WarpMujocoToDart
 from rl_mass.warp.engine import WarpEngine, WarpWorldView
 from rl_mass.warp.muscle import WarpMuscleSystem
 
@@ -73,6 +73,33 @@ class WarpGPUEnv:
             num_worlds=self.num_envs,
             device=self._engine.device,
         )
+        self._mj_to_dart = WarpMujocoToDart(
+            num_worlds=self.num_envs,
+            root_offset=DART_ROOT_OFFSET,
+            device=self._engine.device,
+        )
+        # Pre-allocated device buffers for the GPU SPD pipeline. Avoids
+        # the per-iter wp.array() H->D allocation+upload that dominated
+        # env_step pre-refactor.
+        import warp as _wp
+        _dv = self._engine.nv
+        with _wp.ScopedDevice(self._engine.device):
+            self._q_dart_buf = _wp.zeros((self.num_envs, _dv), dtype=_wp.float32)
+            self._p_des_buf = _wp.zeros((self.num_envs, _dv), dtype=_wp.float32)
+            self._qdqdt_buf = _wp.zeros((self.num_envs, _dv), dtype=_wp.float32)
+            self._pos_diff_buf = _wp.zeros((self.num_envs, _dv), dtype=_wp.float32)
+            self._target_dart_buf = _wp.zeros((self.num_envs, _dv), dtype=_wp.float32)
+        # Torch views over the wp buffers (same memory). Use these for
+        # the SPD math; writes through these update the underlying wp.array
+        # so dart_diff sees them.
+        self._q_dart_t = _wp.to_torch(self._q_dart_buf)
+        self._p_des_t = _wp.to_torch(self._p_des_buf)
+        self._qdqdt_t = _wp.to_torch(self._qdqdt_buf)
+        self._pos_diff_t = _wp.to_torch(self._pos_diff_buf)
+        self._target_dart_t = _wp.to_torch(self._target_dart_buf)
+        # Cached SPD intermediates.
+        self._actions_t: Optional[torch.Tensor] = None
+        self._M_buf: Optional[torch.Tensor] = None
         self._root_joint_dof = e0.root_joint_dof
         self._root_bid = e0._root_bid
         self._body_ids = np.asarray(e0._body_ids, dtype=np.intp)
@@ -221,6 +248,14 @@ class WarpGPUEnv:
             env.sim_count = 0
             env.random_sample_index = int(rsi[i])
             env.average_activation_levels[:] = 0.0
+        # Upload target_dart + actions to device once per control step. These
+        # are consumed by _compute_tau_tensor across the 15 muscle iters;
+        # pre-uploading lets the SPD loop stay on the GPU.
+        import warp as _wp
+        self._target_dart_buf.assign(target_dart.astype(np.float32, copy=False))
+        self._actions_t = torch.as_tensor(
+            scaled, device=self._engine.device, dtype=torch.float32,
+        )
         self._metrics_dirty = True
 
     def get_muscle_torques(self) -> np.ndarray:
@@ -243,52 +278,61 @@ class WarpGPUEnv:
         return wp.to_torch(jta_wp).to(dtype=torch.float32)
 
     def _compute_tau_tensor(self) -> torch.Tensor:
-        """Run batched SPD on GPU. Returns full-DOF `tau` torch tensor (nworld, nv).
+        """Run batched SPD entirely on GPU. Returns full-DOF tau torch tensor.
+
+        Pre-refactor this was the dominant rollout cost (53% of env_step at
+        N=16384) because every iter did 4 GPU<->CPU round-trips:
+        get_qpos/get_qvel sync, scipy mujoco_qpos_batch_to_dart, then
+        wp.array(p_des)+wp.array(qdqdt) re-uploads. Now all data stays on
+        device; the only host op is the engine.forward_dynamics() call.
 
         Side effect: leaves SPD intermediate state (kinematics+forward_dynamics)
         consistent for the upcoming substep step.
         """
         self._engine.forward_dynamics()
-        q_mj = self._engine.get_qpos()
-        dq = self._engine.get_qvel()
         dt = self._engine.timestep
-
-        # Batched p_des: target + per-env action appended after root DOFs.
         rjd = int(self._root_joint_dof)
-        p_des = self._target_positions_dart.copy()
-        # All envs share the same root_joint_dof (asserted by _root_joint_dof
-        # being a scalar in __init__); stack actions in a single op.
-        actions_batch = np.stack(
-            [env.action for env in self.envs], axis=0
-        )
-        p_des[:, rjd:] += actions_batch
-        p_des_dart = p_des.astype(np.float32, copy=False)
 
-        # Batched q_dart + dq_dart (with first/second 3 swapped) + step.
-        q_dart = mujoco_qpos_batch_to_dart(q_mj, root_offset=DART_ROOT_OFFSET)
-        dq_dart = dq.copy()
-        dq_dart[:, :3] = dq[:, 3:6]
-        dq_dart[:, 3:6] = dq[:, :3]
-        qdqdt_dart = (q_dart + dq_dart * dt).astype(np.float32, copy=False)
-
+        # MuJoCo qpos -> DART qpos via warp kernel; writes into self._q_dart_buf.
+        self._mj_to_dart.compute(self._engine.data.qpos, self._q_dart_buf)
+        # Device-resident views of mujoco qvel.
         import warp as wp
+        qvel_t = wp.to_torch(self._engine.data.qvel).to(dtype=torch.float32)
 
-        with wp.ScopedDevice(self._engine.device):
-            q1_wp = wp.array(p_des_dart, dtype=wp.float32)
-            q2_wp = wp.array(qdqdt_dart, dtype=wp.float32)
-            out_wp = wp.zeros_like(q1_wp)
-            self._dart_diff.compute(q1_wp, q2_wp, out_wp)
-            pos_diff_batch = wp.to_torch(out_wp).to(dtype=torch.float32)
+        # dq_dart: mujoco qvel with the [0:3] (root rot) and [3:6] (root trans)
+        # 3-DOF blocks swapped. Build on device with a torch concat.
+        if qvel_t.shape[1] > 6:
+            dq_dart_t = torch.cat(
+                [qvel_t[:, 3:6], qvel_t[:, 0:3], qvel_t[:, 6:]], dim=1,
+            )
+        else:
+            dq_dart_t = torch.cat([qvel_t[:, 3:6], qvel_t[:, 0:3]], dim=1)
 
-        dq_t = torch.as_tensor(dq, device=pos_diff_batch.device, dtype=torch.float32)
+        # p_des = target_dart + actions (after root DOFs). Write into the
+        # p_des wp.array via its torch view so dart_diff sees the result.
+        self._p_des_t.copy_(self._target_dart_t)
+        self._p_des_t[:, rjd:].add_(self._actions_t)
+
+        # qdqdt = q_dart + dq_dart * dt. Same buffer-aliasing trick.
+        self._qdqdt_t.copy_(self._q_dart_t)
+        self._qdqdt_t.add_(dq_dart_t, alpha=dt)
+
+        # Batched DART position differences on device.
+        self._dart_diff.compute(
+            self._p_des_buf, self._qdqdt_buf, self._pos_diff_buf,
+        )
+        pos_diff_batch = self._pos_diff_t
+
         kp_t = self._kp_t
         kv_t = self._kv_t
         p_diff = -kp_t * pos_diff_batch
+        # Swap root rot/trans 3-blocks (kp is in dart layout, mujoco needs
+        # the swap before the linear solve).
         p_diff_root_ang = p_diff[:, :3].clone()
         p_diff[:, :3] = p_diff[:, 3:6]
         p_diff[:, 3:6] = p_diff_root_ang
 
-        v_diff = -kv_t * dq_t
+        v_diff = -kv_t * qvel_t
         M = self._engine.mass_matrix_tensor()
         diag_idx = self._engine._torch_diag_idx
         M[:, diag_idx, diag_idx] += dt * kv_t
@@ -300,8 +344,6 @@ class WarpGPUEnv:
         )
         ddq = torch.linalg.solve(M, rhs.unsqueeze(-1)).squeeze(-1)
         tau = p_diff + v_diff - dt * kv_t * ddq
-        # Zero root-joint DOFs uniformly (root_joint_dof identical across worlds).
-        rjd = int(self._root_joint_dof)
         if rjd > 0:
             tau[:, :rjd] = 0.0
         self._latest_tau_t = tau

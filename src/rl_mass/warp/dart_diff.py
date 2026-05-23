@@ -8,6 +8,10 @@ in parallel. For each rotational joint (FreeJoint rot + every BallJoint):
     diff   = logMap(R_proj)
 FreeJoint translation: R1.T @ (t2 - t1).
 RevoluteJoints: q2 - q1 (direct copy).
+
+This module also provides `WarpMujocoToDart`, the GPU sibling of
+`rl_mass.joint_utils.mujoco_qpos_batch_to_dart`. It eliminates the
+CPU↔GPU round-trip inside the muscle inner loop's SPD controller.
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ from __future__ import annotations
 import numpy as np
 import warp as wp
 
-from rl_mass.joint_utils import MASS_JOINT_TYPES, _build_index_tables
+from rl_mass.joint_utils import MASS_JOINT_TYPES, _build_index_tables, _MJ_QPOS
 
 
 @wp.func
@@ -194,4 +198,168 @@ class WarpDartDiff:
                     dim=(self.num_worlds, self.n_rev),
                     inputs=[q1, q2, self.rev_idx],
                     outputs=[out],
+                )
+
+
+# ---------------------------------------------------------------------------
+# MuJoCo qpos -> DART qpos on GPU (eliminates the scipy round-trip in SPD)
+# ---------------------------------------------------------------------------
+
+@wp.func
+def _quat_wxyz_to_expmap(qw: wp.float32, qx: wp.float32, qy: wp.float32, qz: wp.float32) -> wp.vec3:
+    # Pick the w>=0 hemisphere so the rotvec stays in [-pi, pi]
+    # and matches scipy.Rotation.from_quat(...).as_rotvec().
+    if qw < 0.0:
+        qw = -qw
+        qx = -qx
+        qy = -qy
+        qz = -qz
+    n = wp.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+    if n < 1.0e-12:
+        return wp.vec3(0.0, 0.0, 0.0)
+    qw = qw / n
+    qx = qx / n
+    qy = qy / n
+    qz = qz / n
+    v_norm = wp.sqrt(qx * qx + qy * qy + qz * qz)
+    if v_norm < 1.0e-8:
+        return wp.vec3(0.0, 0.0, 0.0)
+    theta = 2.0 * wp.atan2(v_norm, qw)
+    f = theta / v_norm
+    return wp.vec3(qx * f, qy * f, qz * f)
+
+
+@wp.kernel
+def _free_mj_to_dart_kernel(
+    mj_q: wp.array2d(dtype=wp.float32),
+    free_mi: wp.int32,
+    free_di: wp.int32,
+    root_offset: wp.vec3,
+    dart_q: wp.array2d(dtype=wp.float32),
+):
+    w = wp.tid()
+    # MuJoCo: trans (3) then quat_wxyz (4) starting at free_mi.
+    # DART:   expmap_3 then trans_3 starting at free_di.
+    t = wp.vec3(
+        mj_q[w, free_mi + 0] - root_offset[0],
+        mj_q[w, free_mi + 1] - root_offset[1],
+        mj_q[w, free_mi + 2] - root_offset[2],
+    )
+    em = _quat_wxyz_to_expmap(
+        mj_q[w, free_mi + 3],
+        mj_q[w, free_mi + 4],
+        mj_q[w, free_mi + 5],
+        mj_q[w, free_mi + 6],
+    )
+    dart_q[w, free_di + 0] = em[0]
+    dart_q[w, free_di + 1] = em[1]
+    dart_q[w, free_di + 2] = em[2]
+    dart_q[w, free_di + 3] = t[0]
+    dart_q[w, free_di + 4] = t[1]
+    dart_q[w, free_di + 5] = t[2]
+
+
+@wp.kernel
+def _ball_mj_to_dart_kernel(
+    mj_q: wp.array2d(dtype=wp.float32),
+    ball_mj_starts: wp.array(dtype=wp.int32),
+    ball_dart_starts: wp.array(dtype=wp.int32),
+    dart_q: wp.array2d(dtype=wp.float32),
+):
+    w, k = wp.tid()
+    mi = ball_mj_starts[k]
+    di = ball_dart_starts[k]
+    em = _quat_wxyz_to_expmap(
+        mj_q[w, mi + 0],
+        mj_q[w, mi + 1],
+        mj_q[w, mi + 2],
+        mj_q[w, mi + 3],
+    )
+    dart_q[w, di + 0] = em[0]
+    dart_q[w, di + 1] = em[1]
+    dart_q[w, di + 2] = em[2]
+
+
+@wp.kernel
+def _rev_mj_to_dart_kernel(
+    mj_q: wp.array2d(dtype=wp.float32),
+    rev_mj_idx: wp.array(dtype=wp.int32),
+    rev_dart_idx: wp.array(dtype=wp.int32),
+    dart_q: wp.array2d(dtype=wp.float32),
+):
+    w, k = wp.tid()
+    dart_q[w, rev_dart_idx[k]] = mj_q[w, rev_mj_idx[k]]
+
+
+class WarpMujocoToDart:
+    """GPU sibling of `mujoco_qpos_batch_to_dart`. Avoids the per-iter
+    scipy Rotation round-trip inside the muscle inner loop's SPD controller.
+
+    Input/output are ``wp.array2d(dtype=wp.float32)``. Output buffer is
+    allocated and owned by the caller (passed via ``compute``).
+    """
+
+    def __init__(
+        self,
+        num_worlds: int,
+        joint_types: list[str] | None = None,
+        root_offset: np.ndarray | None = None,
+        device: str | None = None,
+    ):
+        if joint_types is None:
+            joint_types = MASS_JOINT_TYPES
+        idx = _build_index_tables(joint_types)
+
+        self.num_worlds = int(num_worlds)
+        self.device = device or wp.get_preferred_device().alias
+
+        self.free_mi = int(idx["free_mj_idx"])
+        self.free_di = int(idx["free_dart_idx"])
+        ro = np.zeros(3, dtype=np.float32) if root_offset is None else (
+            np.asarray(root_offset, dtype=np.float32).reshape(3)
+        )
+        self.root_offset = wp.vec3(float(ro[0]), float(ro[1]), float(ro[2]))
+
+        ball_mj = np.asarray(idx["ball_mj_starts"], dtype=np.int32)
+        ball_dart = np.asarray(idx["ball_dart_starts"], dtype=np.int32)
+        rev_mj = np.asarray(idx["rev_mj_indices"], dtype=np.int32)
+        rev_dart = np.asarray(idx["rev_dart_indices"], dtype=np.int32)
+
+        with wp.ScopedDevice(self.device):
+            self.ball_mj_starts = wp.array(ball_mj, dtype=wp.int32)
+            self.ball_dart_starts = wp.array(ball_dart, dtype=wp.int32)
+            self.rev_mj_idx = wp.array(rev_mj, dtype=wp.int32)
+            self.rev_dart_idx = wp.array(rev_dart, dtype=wp.int32)
+        self.n_ball = int(len(ball_mj))
+        self.n_rev = int(len(rev_mj))
+
+        self.mj_q_size = int(sum(_MJ_QPOS[jt] for jt in joint_types))
+        self.dart_q_size = int(
+            sum({"Free": 6, "Ball": 3, "Revolute": 1}[jt] for jt in joint_types)
+        )
+
+    def compute(self, mj_q: wp.array, dart_q: wp.array) -> None:
+        """``mj_q`` is (nworld, mj_q_size) float32; ``dart_q`` is
+        (nworld, dart_q_size) float32. Output buffer is overwritten."""
+        with wp.ScopedDevice(self.device):
+            if self.free_di >= 0:
+                wp.launch(
+                    _free_mj_to_dart_kernel,
+                    dim=self.num_worlds,
+                    inputs=[mj_q, self.free_mi, self.free_di, self.root_offset],
+                    outputs=[dart_q],
+                )
+            if self.n_ball > 0:
+                wp.launch(
+                    _ball_mj_to_dart_kernel,
+                    dim=(self.num_worlds, self.n_ball),
+                    inputs=[mj_q, self.ball_mj_starts, self.ball_dart_starts],
+                    outputs=[dart_q],
+                )
+            if self.n_rev > 0:
+                wp.launch(
+                    _rev_mj_to_dart_kernel,
+                    dim=(self.num_worlds, self.n_rev),
+                    inputs=[mj_q, self.rev_mj_idx, self.rev_dart_idx],
+                    outputs=[dart_q],
                 )
