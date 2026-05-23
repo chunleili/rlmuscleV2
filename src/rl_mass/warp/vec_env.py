@@ -10,7 +10,7 @@ from typing import Optional
 import numpy as np
 import torch
 
-from rl_mass.env import MassEnv
+from rl_mass.env import MassEnv, batch_init_mass_envs
 from rl_mass.joint_utils import (
     DART_ROOT_OFFSET,
     dart_qpos_batch_to_mujoco,
@@ -48,14 +48,12 @@ class WarpVecEnv(MassVecEnv):
             timestep=1.0 / cfg.get("simulation_hz", 600),
             num_worlds=num_envs,
         )
-        self.envs = [
-            MassEnv(
-                config_path,
-                engine=WarpWorldView(self._engine, i),
-                vectorized_muscles=False,
-            )
-            for i in range(num_envs)
-        ]
+        self.envs = batch_init_mass_envs(
+            config_path,
+            engine_for=lambda i: WarpWorldView(self._engine, i),
+            num_envs=num_envs,
+            vectorized_muscles=False,
+        )
 
         e0 = self.envs[0]
         self.num_state = e0.num_state
@@ -587,6 +585,47 @@ class WarpVecEnv(MassVecEnv):
             self._muscle_tuple_chunks.clear()
             for env in self.envs:
                 env.muscle_tuples.clear()
+
+            # Filter rows with any non-finite value (NaN/Inf) before they
+            # reach OptimizeMuscleNN. A single bad row poisons the muscle
+            # network gradients and breaks training globally.
+            JtA = out["JtA"]
+            TauDes = out["TauDes"]
+            L = out["L"]
+            b = out["b"]
+            n_total = JtA.shape[0]
+
+            def _row_finite(t: torch.Tensor) -> torch.Tensor:
+                if t.dim() == 1:
+                    return torch.isfinite(t)
+                return torch.isfinite(t.reshape(t.shape[0], -1)).all(dim=1)
+
+            mask = (
+                _row_finite(JtA)
+                & _row_finite(TauDes)
+                & _row_finite(L)
+                & _row_finite(b)
+            )
+            n_valid = int(mask.sum().item())
+            if n_valid < n_total:
+                dropped = n_total - n_valid
+                print(
+                    f"[muscle] dropped {dropped}/{n_total} non-finite muscle tuples"
+                )
+                if n_valid == 0:
+                    return {
+                        "JtA": JtA[:0],
+                        "TauDes": TauDes[:0],
+                        "L": L[:0],
+                        "b": b[:0],
+                    }
+                idx = torch.nonzero(mask, as_tuple=False).squeeze(1)
+                out = {
+                    "JtA": JtA.index_select(0, idx),
+                    "TauDes": TauDes.index_select(0, idx),
+                    "L": L.index_select(0, idx),
+                    "b": b.index_select(0, idx),
+                }
             return out
         out = []
         for env in self.envs:

@@ -76,6 +76,7 @@ class MassEnv:
         config_path: str = "data/rl_mass/config.json",
         engine=None,
         vectorized_muscles: bool = True,
+        _fast_init: bool = False,
     ):
         with open(config_path) as f:
             cfg = json.load(f)
@@ -155,9 +156,12 @@ class MassEnv:
         self.num_total_related_dofs: int = 0
         if self.use_muscle:
             # Parse muscles at rest pose
-            self.engine.forward()
+            if not _fast_init:
+                self.engine.forward()
             muscle_file = cfg["muscle_file"]
-            self.muscles = parse_muscle_xml(muscle_file, self.engine)
+            self.muscles = parse_muscle_xml(
+                muscle_file, self.engine, deepcopy_result=not _fast_init
+            )
             # parse_muscle_xml caches a pre-updated muscle list, so we no
             # longer need to call m.update(engine) per env — that was an
             # 8s/32-envs hit during WarpVecEnv construction at scale.
@@ -200,8 +204,13 @@ class MassEnv:
         self._bvh_reward_info = self._build_bvh_reward_info()
 
         # Initialize state
-        self.reset(rsi=False)
-        self.num_state: int = self.get_state().shape[0]
+        if _fast_init:
+            # VecEnv will overwrite per-world engine state via its batched
+            # reset path. We just need the per-env attribute hooks.
+            self.num_state = 0
+        else:
+            self.reset(rsi=False)
+            self.num_state: int = self.get_state().shape[0]
 
     def _build_bvh_reward_info(self) -> list[tuple[str, str, int, int]]:
         """Build info for reward computation: (body_name, joint_type, dart_dof_start, dart_dof_count).
@@ -987,6 +996,53 @@ def _test_env() -> None:
     print("\n" + "=" * 60)
     print("MassEnv Quick Test PASSED")
     print("=" * 60)
+
+
+def batch_init_mass_envs(
+    config_path: str,
+    engine_for,
+    num_envs: int,
+    vectorized_muscles: bool = False,
+):
+    """Build N MassEnv objects without doing O(N^2) shared-engine work.
+
+    env 0 is constructed with a full init (calls engine.forward, parse_muscle_xml
+    with deepcopy, and self.reset(rsi=False)). Envs 1..N-1 are constructed with
+    _fast_init=True: they skip the per-env engine touches (forward / set_qpos /
+    set_qvel / set_time) and share the cached muscle list. Caller (VecEnv) is
+    responsible for doing a batched reset before the first step.
+
+    Args:
+        config_path: Same config used for every env.
+        engine_for: Callable(i) -> per-world engine view (e.g. WarpWorldView).
+        num_envs: Number of envs to build.
+        vectorized_muscles: Passed through to MassEnv. Default False because the
+            warp backend uses a single shared WarpMuscleSystem instead of N
+            per-env MuscleSystems.
+
+    Returns:
+        list[MassEnv] of length num_envs.
+    """
+    if num_envs <= 0:
+        return []
+    envs: list[MassEnv] = [
+        MassEnv(
+            config_path,
+            engine=engine_for(0),
+            vectorized_muscles=vectorized_muscles,
+            _fast_init=False,
+        )
+    ]
+    for i in range(1, num_envs):
+        envs.append(
+            MassEnv(
+                config_path,
+                engine=engine_for(i),
+                vectorized_muscles=vectorized_muscles,
+                _fast_init=True,
+            )
+        )
+    return envs
 
 
 if __name__ == "__main__":

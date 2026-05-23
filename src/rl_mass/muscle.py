@@ -737,7 +737,9 @@ def _engine_cache_key(engine: PhysicsEngine):
     return id(model)
 
 
-def parse_muscle_xml(xml_path: str, engine: PhysicsEngine) -> list[Muscle]:
+def parse_muscle_xml(
+    xml_path: str, engine: PhysicsEngine, deepcopy_result: bool = True
+) -> list[Muscle]:
     """Parse muscle definitions from MASS muscle XML.
 
     Matches Character::LoadMuscles in Character.cpp.
@@ -770,6 +772,8 @@ def parse_muscle_xml(xml_path: str, engine: PhysicsEngine) -> list[Muscle]:
         for m in cached:
             m.update(engine)
         _PARSE_MUSCLE_CACHE[key] = cached
+    if not deepcopy_result:
+        return cached
     return [copy.deepcopy(m) for m in cached]
 
 

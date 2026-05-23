@@ -456,6 +456,9 @@ class PPO:
         if "JtA" not in self.muscle_buffer:
             print("No muscle tuples to optimize")
             return
+        if self.muscle_buffer["JtA"].shape[0] == 0:
+            print("Muscle buffer empty after NaN filter; skipping muscle update")
+            return
 
         for j in range(self.num_epochs_muscle):
             minibatches = self.generate_shuffle_indices(
@@ -500,6 +503,10 @@ class PPO:
                 loss_target = (((tau - stack_tau_des) / 100.0).pow(2)).mean()
 
                 loss = 0.01 * loss_reg + loss_target
+
+                if not torch.isfinite(loss):
+                    self.optimizer_muscle.zero_grad()
+                    continue
 
                 self.optimizer_muscle.zero_grad()
                 loss.backward(retain_graph=True)

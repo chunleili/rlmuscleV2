@@ -104,10 +104,16 @@ class WarpEngine:
             self.cpu_model.opt.timestep = timestep
             self.cpu_data = mujoco.MjData(self.cpu_model)
             self.model = mujoco_warp.put_model(self.cpu_model)
+            # Force ample njmax/nconmax to avoid "nefc overflow" silently
+            # dropping constraints at large N (default sizes were tuned for
+            # single-world; at 1024+ worlds, occasional worlds exceed them
+            # and physics diverges -> all envs immediately hit eoe).
             self.data = mujoco_warp.put_data(
                 self.cpu_model,
                 self.cpu_data,
                 nworld=self.num_worlds,
+                njmax=1024,
+                nconmax=128,
             )
 
         self._initial_qpos = self.get_qpos().copy()
