@@ -286,7 +286,12 @@ class PPO:
                 step_eoes = [r[2] for r in results]
             else:
                 # P0/P1 batch-API path: main process drives MuscleNN, workers step.
+                if _PROF:
+                    _t_es = time.perf_counter()
                 self.env.set_actions(actions)
+                if _PROF:
+                    _sync_gpu()
+                    prof.add("es.set_actions", time.perf_counter() - _t_es)
                 if self.use_muscle:
                     tensor_api = (
                         hasattr(self.env, "get_muscle_torques_tensor")
@@ -294,12 +299,34 @@ class PPO:
                         and hasattr(self.env, "set_activation_levels_tensor")
                     )
                     if tensor_api:
+                        if _PROF:
+                            _t_es = time.perf_counter()
                         mt = self.env.get_muscle_torques_tensor()
+                        if _PROF:
+                            _sync_gpu()
+                            prof.add("es.jta_init", time.perf_counter() - _t_es)
                         for _ in range(self.num_simulation_per_control // 2):
+                            if _PROF:
+                                _t_es = time.perf_counter()
                             dt = self.env.get_desired_torques_tensor()
+                            if _PROF:
+                                _sync_gpu()
+                                prof.add("es.des_tau", time.perf_counter() - _t_es)
+                                _t_es = time.perf_counter()
                             activations = self.muscle_model(mt, dt)
+                            if _PROF:
+                                _sync_gpu()
+                                prof.add("es.muscle_nn", time.perf_counter() - _t_es)
+                                _t_es = time.perf_counter()
                             self.env.set_activation_levels_tensor(activations)
+                            if _PROF:
+                                _sync_gpu()
+                                prof.add("es.set_act", time.perf_counter() - _t_es)
+                                _t_es = time.perf_counter()
                             self.env.steps(2)
+                            if _PROF:
+                                _sync_gpu()
+                                prof.add("es.substeps", time.perf_counter() - _t_es)
                     else:
                         mt = Tensor(self.env.get_muscle_torques())
                         for _ in range(self.num_simulation_per_control // 2):
