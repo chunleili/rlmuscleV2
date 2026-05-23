@@ -25,6 +25,45 @@ from rl_mass.model import MuscleNN, SimulationNN, Tensor, use_cuda
 from rl_mass.vec_env import MassVecEnv, make_vec_env
 
 # ---------------------------------------------------------------------------
+# Instrumentation (RL_MASS_PROFILE=1 enables per-iter bucket breakdown)
+# ---------------------------------------------------------------------------
+
+_PROF = os.environ.get("RL_MASS_PROFILE", "0") != "0"
+
+
+def _sync_gpu():
+    """Force GPU work to complete so wall-time buckets aren't muddled by async
+    kernel launches. Only used when RL_MASS_PROFILE=1."""
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+    try:
+        import warp as wp
+        wp.synchronize()
+    except Exception:
+        pass
+
+
+class _Buckets(dict):
+    def add(self, name: str, t: float) -> None:
+        self[name] = self.get(name, 0.0) + t
+
+    def total(self) -> float:
+        return sum(self.values())
+
+    def report(self, header: str, extra: dict | None = None) -> None:
+        tot = self.total()
+        print(f"[prof] {header} total={tot * 1000:.0f}ms")
+        for k, v in sorted(self.items(), key=lambda kv: -kv[1]):
+            pct = 100.0 * v / tot if tot > 0 else 0.0
+            print(f"[prof]   {k:<16s} {v * 1000:8.0f}ms  {pct:5.1f}%")
+        if extra:
+            for k, v in extra.items():
+                print(f"[prof]   {k:<16s} {v}")
+
+# ---------------------------------------------------------------------------
 # Data structures (identical to MASS main.py)
 # ---------------------------------------------------------------------------
 
@@ -200,11 +239,22 @@ class PPO:
         local_step = 0
         counter = 0
 
+        # --- profiling buckets ---
+        prof = _Buckets() if _PROF else None
+        prof_steps = 0
+        prof_reset_calls = 0
+        prof_reset_idx_total = 0
+        if _PROF:
+            _sync_gpu()
+            _prof_iter_t0 = time.perf_counter()
+
         while True:
             counter += 1
             if counter % 10 == 0:
                 print(f"SIM : {local_step}", end="\r")
 
+            if _PROF:
+                _t0 = time.perf_counter()
             # Forward pass through policy
             if states_t is not None:
                 states_tensor = states_t.to(dtype=torch.float32)
@@ -221,6 +271,10 @@ class PPO:
                 .reshape(-1)
             )
             values = v.cpu().detach().numpy().reshape(-1)
+            if _PROF:
+                _sync_gpu()
+                prof.add("policy_fwd", time.perf_counter() - _t0)
+                _t0 = time.perf_counter()
 
             # Step environments
             if self._packed_path:
@@ -258,8 +312,16 @@ class PPO:
                 next_states = None  # computed after episode bookkeeping
                 step_rewards = None
                 step_eoes = None
+                if _PROF:
+                    _sync_gpu()
+                    prof.add("env_step", time.perf_counter() - _t0)
+                    _t0 = time.perf_counter()
                 batch_eoes = self.env.get_end_of_episodes()
                 batch_rewards = self.env.get_rewards()
+                if _PROF:
+                    _sync_gpu()
+                    prof.add("get_metrics", time.perf_counter() - _t0)
+                    _t0 = time.perf_counter()
 
             # Check for episode end, collect rewards
             terminated_indices: list[int] = []
@@ -293,6 +355,9 @@ class PPO:
                     self.total_episodes.append(self.episodes[j])
                     self.episodes[j] = EpisodeBuffer()
                     terminated_indices.append(j)
+            if _PROF:
+                prof.add("python_loop", time.perf_counter() - _t0)
+                _t0 = time.perf_counter()
 
             # Batched reset for the warp/GPU backend: one scatter + one
             # forward over the union of terminated envs. CPU vec backends
@@ -310,8 +375,17 @@ class PPO:
                         new_state = self.env.reset(rsi=True, idx=j)
                         if self._packed_path and new_state is not None:
                             next_states[j] = new_state
+            if _PROF:
+                _sync_gpu()
+                prof.add("reset_subset", time.perf_counter() - _t0)
+                if terminated_indices:
+                    prof_reset_calls += 1
+                    prof_reset_idx_total += len(terminated_indices)
+                _t0 = time.perf_counter()
 
             if local_step >= self.buffer_size:
+                if _PROF:
+                    prof_steps += 1
                 break
 
             # Next states: packed path already has them (with reset fixups above);
@@ -325,6 +399,28 @@ class PPO:
                 )
             else:
                 states = self.env.get_states()
+            if _PROF:
+                _sync_gpu()
+                prof.add("next_states", time.perf_counter() - _t0)
+                prof_steps += 1
+
+        if _PROF:
+            wall = time.perf_counter() - _prof_iter_t0
+            extra = {
+                "control_steps": prof_steps,
+                "transitions": local_step,
+                "trans/s": f"{local_step / wall:.1f}" if wall > 0 else "n/a",
+                "wall_iter": f"{wall * 1000:.0f}ms",
+                "reset_calls": prof_reset_calls,
+                "avg_terminated_per_reset": (
+                    f"{prof_reset_idx_total / prof_reset_calls:.0f}"
+                    if prof_reset_calls else "0"
+                ),
+            }
+            prof.report("rollout", extra=extra)
+            # Expose so Train() can include in cycle line
+            self._prof_rollout = prof
+            self._prof_rollout_wall = wall
 
     # ------------------------------------------------------------------
     # ComputeTDandGAE
@@ -543,18 +639,52 @@ class PPO:
     # ------------------------------------------------------------------
 
     def OptimizeModel(self):
+        if not _PROF:
+            self.ComputeTDandGAE()
+            self.OptimizeSimulationNN()
+            if self.use_muscle:
+                self.OptimizeMuscleNN()
+            return
+        prof = _Buckets()
+        _sync_gpu()
+        _t0 = time.perf_counter()
         self.ComputeTDandGAE()
+        _sync_gpu()
+        prof.add("td_gae", time.perf_counter() - _t0)
+        _t0 = time.perf_counter()
         self.OptimizeSimulationNN()
+        _sync_gpu()
+        prof.add("optimize_sim", time.perf_counter() - _t0)
         if self.use_muscle:
+            _t0 = time.perf_counter()
             self.OptimizeMuscleNN()
+            _sync_gpu()
+            prof.add("optimize_muscle", time.perf_counter() - _t0)
+        prof.report("optimize")
+        self._prof_optimize = prof
+        self._prof_optimize_wall = prof.total()
 
     # ------------------------------------------------------------------
     # Train
     # ------------------------------------------------------------------
 
     def Train(self):
+        if not _PROF:
+            self.GenerateTransitions()
+            self.OptimizeModel()
+            return
+        _sync_gpu()
+        _t0 = time.perf_counter()
         self.GenerateTransitions()
         self.OptimizeModel()
+        _sync_gpu()
+        cyc = time.perf_counter() - _t0
+        ro = getattr(self, "_prof_rollout_wall", 0.0)
+        op = getattr(self, "_prof_optimize_wall", 0.0)
+        print(
+            f"[prof] cycle  total={cyc * 1000:.0f}ms  "
+            f"rollout={ro * 1000:.0f}ms  optimize={op * 1000:.0f}ms"
+        )
 
     # ------------------------------------------------------------------
     # Evaluate
@@ -699,6 +829,7 @@ if __name__ == "__main__":
         args.num_envs = args.num_envs_gpu if args.vec_env_mode == "warp" else args.num_envs_cpu
     print(f"[num_envs] {args.num_envs} (mode={args.vec_env_mode})")
 
+    _t_init = time.perf_counter()
     ppo = PPO(
         args.meta,
         num_envs=args.num_envs,
@@ -708,6 +839,10 @@ if __name__ == "__main__":
         reward_csv_path=args.reward_csv if args.reward_csv else None,
         nn_dir=args.nn_dir,
     )
+    if _PROF:
+        _sync_gpu()
+    _init_wall = time.perf_counter() - _t_init
+    print(f"[prof] init   total={_init_wall * 1000:.0f}ms  (PPO ctor incl. env)")
     if args.max_iter is not None:
         ppo.max_iteration = args.max_iter + 5  # loop runs max_iteration - 5
 
