@@ -850,6 +850,32 @@ if __name__ == "__main__":
              "Evaluate() writes iter=resume_iter+1 into the reward CSV. Use "
              "with -m current and an existing CSV to extend a prior run.",
     )
+    parser.add_argument(
+        "--horizon",
+        type=int,
+        default=None,
+        help="Target control steps per env per iter. Sets PPO buffer_size to "
+             "horizon * num_envs so all backends collect the same rollout length "
+             "regardless of num_envs. CPU n=64 historically used buffer_size=2048 "
+             "→ horizon=32; recommend the same here. Leave unset to keep the "
+             "legacy fixed buffer_size=2048 (which yields horizon=1 on GPU "
+             "n=2048 — stale-logprob territory).",
+    )
+    parser.add_argument(
+        "--ppo_batch_per_env",
+        type=int,
+        default=None,
+        help="If set, PPO minibatch size = ppo_batch_per_env * num_envs (MimicKit "
+             "style — keeps updates/iter ~constant across num_envs). Leave unset "
+             "to keep legacy fixed batch_size=128.",
+    )
+    parser.add_argument(
+        "--ppo_epochs",
+        type=int,
+        default=None,
+        help="If set, overrides PPO num_epochs (legacy default 10). MimicKit "
+             "uses 5. Leave unset to keep legacy 10.",
+    )
     args = parser.parse_args()
 
     if args.num_envs is None:
@@ -872,6 +898,22 @@ if __name__ == "__main__":
     print(f"[prof] init   total={_init_wall * 1000:.0f}ms  (PPO ctor incl. env)")
     if args.max_iter is not None:
         ppo.max_iteration = args.max_iter + 5  # loop runs max_iteration - 5
+    if args.horizon is not None:
+        ppo.buffer_size = args.horizon * args.num_envs
+        # ReplayBuffer is a deque with FIFO eviction once full; the default
+        # 30000 silently drops half the rollout when buffer_size > 30000.
+        # Size it to hold a full iter plus one extra step across all envs.
+        rb_cap = max(30000, ppo.buffer_size + args.num_envs)
+        ppo.replay_buffer = ReplayBuffer(rb_cap)
+        print(f"[horizon] {args.horizon} step/env -> buffer_size={ppo.buffer_size} "
+              f"replay_buffer_cap={rb_cap} (num_envs={args.num_envs})")
+    if args.ppo_batch_per_env is not None:
+        ppo.batch_size = args.ppo_batch_per_env * args.num_envs
+        print(f"[ppo] batch_size={ppo.batch_size} "
+              f"({args.ppo_batch_per_env} * num_envs={args.num_envs})")
+    if args.ppo_epochs is not None:
+        ppo.num_epochs = args.ppo_epochs
+        print(f"[ppo] num_epochs={ppo.num_epochs}")
 
     nn_dir = args.nn_dir
     if not os.path.exists(nn_dir):
