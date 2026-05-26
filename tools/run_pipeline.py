@@ -5,11 +5,9 @@ Stages (all artifacts written under output/pipeline/<run_name>/):
   2. Bake UsdSkel from traj         -> source_skel.usd  (23 MASS joints)
   3. Retarget to Human.usd ragdoll  -> ragdoll_anim.usd (91 bone xforms)
   4. Convert ragdoll USD -> JSON    -> motion.json     (otto-format)
-  5. example_drive (fullbody_drive) -> muscle.usd
-  6. usd_to_mp4                     -> muscle.mp4
+  5. example (fullbody_drive, --lbs-only) -> muscle.usd
 
 Defaults wire walk_max.pt -> data/muscle/config/fullbody_drive.json -> muscle.usd
-(MP4 stage 6 is opt-in via --mp4).
 
 Usage:
     uv run python tools/run_pipeline.py
@@ -31,9 +29,9 @@ import numpy as np
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SISTER_ASSET = Path(
-    "/lus/lfs1aip2/scratch/u6ey/chunleili.u6ey/Dev/RLMuscle/data/snu/snu_ysy_v3.usd"
-)
+SISTER_ASSET = PROJECT_ROOT / "data/rl_mass/snuV2.usd"
+HUMAN_USD = PROJECT_ROOT / "data/Human/model/Human.usd"
+JOINT_MAPPING = PROJECT_ROOT / "data/Human/config/joint_mapping.json"
 
 
 def _hdr(msg: str) -> None:
@@ -181,8 +179,8 @@ def stage3_retarget(source_usd: Path, out_usd: Path, max_frames: int) -> None:
     cmd = [
         sys.executable, "retarget_newton.py",
         "--source", str(source_usd.resolve()),
-        "--human-usd", str((PROJECT_ROOT / "data/Human/Human.usd").resolve()),
-        "--joint-mapping", str((PROJECT_ROOT / "data/Human/joint_mapping.json").resolve()),
+        "--human-usd", str(HUMAN_USD.resolve()),
+        "--joint-mapping", str(JOINT_MAPPING.resolve()),
         "--out", str(out_usd.resolve()),
         "--max-frames", str(max_frames),
     ]
@@ -297,9 +295,10 @@ def stage5_example_drive(base_cfg: Path, motion_json: Path,
         json.dump(cfg, fh, indent=2)
 
     cmd = [
-        sys.executable, "-m", "muscle.coupleOneWay.example_drive",
+        sys.executable, "-m", "muscle.coupleOneWay.example",
         "--config", str(tmp_cfg.resolve()),
         "--auto",
+        "--lbs-only",
         "--output", str(out_usd.resolve()),
         "--device", "cuda",
     ]
@@ -308,50 +307,6 @@ def stage5_example_drive(base_cfg: Path, motion_json: Path,
     env = os.environ.copy()
     env["PYTHONPATH"] = "src" + os.pathsep + env.get("PYTHONPATH", "")
     subprocess.run(cmd, check=True, cwd=PROJECT_ROOT, env=env)
-
-
-# ---------------------------------------------------------------------------
-# Stage 6: usd_to_mp4
-# ---------------------------------------------------------------------------
-
-def stage6_render_mp4(usd: Path, mp4: Path) -> None:
-    _hdr(f"Stage 6: render MP4 -> {mp4.name}")
-    usd_root = Path(
-        "/lus/lfs1aip2/scratch/u6ey/chunleili.u6ey/Dev/RLMuscle/.conda_envs/usd"
-    )
-    ffmpeg_bin = Path(
-        "/lus/lfs1aip2/scratch/u6ey/chunleili.u6ey/Dev/miniforge3/envs/lerobot/bin"
-    )
-    if not usd_root.exists():
-        raise RuntimeError(f"USD render env missing: {usd_root}")
-
-    # Manual Xvfb (no xvfb-run on this node)
-    xvfb = subprocess.Popen(
-        ["/usr/bin/Xvfb", ":99", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    try:
-        time.sleep(2)
-        env = os.environ.copy()
-        env["DISPLAY"] = ":99"
-        env["USD_ROOT"] = str(usd_root)
-        env["PATH"] = f"{ffmpeg_bin}{os.pathsep}{env.get('PATH', '')}"
-        # MuscleSim's USD writes points on /root/muscle and /root/bone (no
-        # animated prim xforms), so --follow can't track. Use a static camera.
-        cmd = [
-            sys.executable, "tools/usd_to_mp4.py", str(usd),
-            "--follow", "none",
-            "--output", str(mp4),
-            "--stride", "1", "--width", "720",
-            "--cam-distance", "3.0", "--cam-elevation", "0.5",
-        ]
-        subprocess.run(cmd, check=True, cwd=PROJECT_ROOT, env=env)
-    finally:
-        xvfb.terminate()
-        try:
-            xvfb.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            xvfb.kill()
 
 
 # ---------------------------------------------------------------------------
@@ -380,8 +335,6 @@ def main() -> int:
                    help="UsdSkel template (snu_ysy_v3.usd from sister project)")
     p.add_argument("--skip-stages", default="",
                    help="Comma-separated stage indices to skip (e.g. 1,2,3)")
-    p.add_argument("--mp4", action="store_true",
-                   help="Also run stage 6 (usd_to_mp4 render). Off by default.")
     args = p.parse_args()
 
     run_name = args.run_name or args.ckpt
@@ -396,7 +349,6 @@ def main() -> int:
     ragdoll = out_root / "ragdoll_anim.usd"
     motion_json = out_root / "motion.json"
     muscle_usd = out_root / "muscle.usd"
-    mp4 = out_root / "muscle.mp4"
 
     if 1 not in skip:
         stage1_eval(args.ckpt, args.max_eval_steps, out_root)
@@ -419,7 +371,7 @@ def main() -> int:
     if 4 not in skip:
         stage4_to_motion_json(
             ragdoll, motion_json,
-            human_usd=PROJECT_ROOT / "data/Human/Human.usd",
+            human_usd=HUMAN_USD,
         )
     else:
         print("[skip] stage 4")
@@ -434,17 +386,12 @@ def main() -> int:
     else:
         print("[skip] stage 5")
 
-    if args.mp4 and 6 not in skip:
-        stage6_render_mp4(muscle_usd, mp4)
-
     _hdr("DONE")
     print(f"traj        : {traj}")
     print(f"source_skel : {source_skel}")
     print(f"ragdoll     : {ragdoll}")
     print(f"motion_json : {motion_json}")
     print(f"muscle_usd  : {muscle_usd}")
-    if args.mp4:
-        print(f"mp4         : {mp4}")
     return 0
 
 
