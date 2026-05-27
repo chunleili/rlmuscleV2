@@ -109,13 +109,15 @@ def arap_svd_kernel(
     # dCdF = U @ diag(dCdS) @ V^T
     dCdF = svd.U * diagS * wp.transpose(svd.V)
 
-    # Per-vertex gradients: g_{k+1} = dCdF @ B[:,k]; g_0 = -(g_1+g_2+g_3).
-    col0 = wp.vec3(Bt[0, 0], Bt[1, 0], Bt[2, 0])
-    col1 = wp.vec3(Bt[0, 1], Bt[1, 1], Bt[2, 1])
-    col2 = wp.vec3(Bt[0, 2], Bt[1, 2], Bt[2, 2])
-    g1 = dCdF * col0
-    g2 = dCdF * col1
-    g3 = dCdF * col2
+    # Per-vertex gradients: g_{k+1} = dCdF · B[k,:]^T (ROW k of B).
+    # Derivation: F = Ds·B with Ds_{i,m} = (x_{m+1}-x_0)_i, so
+    # dF_{ik}/d(x_{m+1})_j = δ_{ij}·B_{m,k} → dC/d(x_{m+1})_j = (dCdF·B[m,:]^T)_j.
+    row0 = wp.vec3(Bt[0, 0], Bt[0, 1], Bt[0, 2])
+    row1 = wp.vec3(Bt[1, 0], Bt[1, 1], Bt[1, 2])
+    row2 = wp.vec3(Bt[2, 0], Bt[2, 1], Bt[2, 2])
+    g1 = dCdF * row0
+    g2 = dCdF * row1
+    g3 = dCdF * row2
     g0 = -(g1 + g2 + g3)
 
     w0 = inv_mass[p0i]
