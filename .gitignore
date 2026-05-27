@@ -36,3 +36,7 @@ src/rl_mass/verify/
 
 MUJOCO_LOG.TXT
 .claude
+
+# Lion .geo blobs are too large for git (~520 MB)
+data/model/lion/*.geo
+result/lion/
