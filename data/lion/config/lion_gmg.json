@@ -2,24 +2,19 @@
     "end_frame":90,
     "use_pintotarget":true,
     "geo_dir":"data/lion/model",
+    "rest_path":"data/lion/model/restpos.geo",
+    "coarse_rest_path":"data/lion/model/restpos_lowres.geo",
     "quasi_static":true,
-
-
-
-    "export_log":true,
     "use_external_constraints":true,
-    "model_path" : "data/lion/model/",
-    "fine_model_path" : "data/lion/model/restpos.geo",
-    "coarse_model_path" :"data/lion/model/restpos_lowres.geo",
     "omega":0.1,
     "mu":1e9,
     "delta_t":0.04166,
     "damping_coeff":1.0,
-    "gravity":[0.0, 0, 0.0],
+    "gravity":[0.0, 0.0, 0.0],
     "total_mass":16000.0,
     "mass_density":-1.0,
     "coarse_iterations":30,
     "fine_iterations":1,
     "nsubsteps":10,
-    "use_multigrid":false
+    "use_multigrid":true
 }

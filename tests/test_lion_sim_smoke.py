@@ -10,7 +10,7 @@ wp.init()
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data" / "lion" / "model"
-CONFIG = ROOT / "data" / "lion" / "config" / "lion_hpbd.json"
+CONFIG = ROOT / "data" / "lion" / "config" / "lion_nomg.json"
 
 skip_no_data = pytest.mark.skipif(
     not (DATA / "restpos.geo").exists(),
@@ -20,7 +20,7 @@ skip_no_data = pytest.mark.skipif(
 
 @skip_no_data
 def test_lion_init_and_one_frame_no_nan():
-    from muscle.coupleOneWay2.solver import OneWaySim
+    from muscle.coupleOneWayGmg.solver import OneWaySim
 
     cfg = json.load(open(CONFIG))
     cfg["geo_dir"] = str(DATA)
@@ -46,7 +46,7 @@ def test_lion_init_and_one_frame_no_nan():
 
 @skip_no_data
 def test_lion_five_frames_run():
-    from muscle.coupleOneWay2.solver import OneWaySim
+    from muscle.coupleOneWayGmg.solver import OneWaySim
 
     cfg = json.load(open(CONFIG))
     cfg["geo_dir"] = str(DATA)

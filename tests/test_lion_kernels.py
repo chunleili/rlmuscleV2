@@ -13,7 +13,7 @@ def _make_tet_arrays(pos_np):
 
 def test_precompute_regular_tet():
     """Reference tet (0,0,0),(1,0,0),(0,1,0),(0,0,1) → Dm=I, V0=1/6, alpha=6/mu."""
-    from muscle.coupleOneWay2.solver import precompute_rest_kernel
+    from muscle.coupleOneWayGmg.solver import precompute_rest_kernel
 
     pos_np = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
     pos, tets = _make_tet_arrays(pos_np)
@@ -37,7 +37,7 @@ def test_precompute_regular_tet():
 
 def test_arap_identity_no_displacement():
     """F=I → constraint magnitude below threshold → no displacement, L unchanged."""
-    from muscle.coupleOneWay2.solver import precompute_rest_kernel, arap_svd_kernel
+    from muscle.coupleOneWayGmg.solver import precompute_rest_kernel, arap_svd_kernel
 
     pos_np = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
     pos, tets = _make_tet_arrays(pos_np)
@@ -65,7 +65,7 @@ def test_arap_identity_no_displacement():
 
 def test_arap_uniform_stretch_contracts_edges():
     """Stretched tet (×1.1) → C>0 → one ARAP iter shrinks edges toward rest."""
-    from muscle.coupleOneWay2.solver import precompute_rest_kernel, arap_svd_kernel
+    from muscle.coupleOneWayGmg.solver import precompute_rest_kernel, arap_svd_kernel
 
     rest_np = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
     stretched_np = rest_np * 1.1
@@ -108,7 +108,7 @@ def test_arap_asymmetric_tet_matches_reference_kernel():
     non-symmetric tet where B≠I, so row-vs-column indexing of B actually
     differs. Catches the bug where g_{k+1} uses cols of B instead of rows.
     """
-    from muscle.coupleOneWay2.solver import precompute_rest_kernel, arap_svd_kernel
+    from muscle.coupleOneWayGmg.solver import precompute_rest_kernel, arap_svd_kernel
 
     rest_np = np.array(
         [[0, 0, 0], [2, 0.1, 0.2], [0.3, 1.5, -0.1], [-0.2, 0.4, 1.3]],

@@ -1,8 +1,8 @@
 """End-to-end driver for the ARAP-HPBD one-way pin-to-target sim.
 
 Usage:
-    python -m muscle.coupleOneWay2.example \
-        --config data/lion/config/lion_hpbd.json \
+    python -m muscle.coupleOneWayGmg.example \
+        --config data/lion/config/lion_nomg.json \
         --out_dir result/lion
 """
 from __future__ import annotations
@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
-from muscle.coupleOneWay2.solver import OneWaySim, load_config
+from muscle.coupleOneWayGmg.solver import OneWaySim, load_config
 from muscle.util.mesh_io import save_ply
 
 
@@ -39,7 +39,7 @@ def _vectorized_surface_tris(tets: np.ndarray) -> np.ndarray:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="data/lion/config/lion_hpbd.json")
+    ap.add_argument("--config", default="data/lion/config/lion_nomg.json")
     ap.add_argument("--out_dir", default="result/lion")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--end_frame", type=int, default=None,

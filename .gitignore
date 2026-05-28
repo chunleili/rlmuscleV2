@@ -37,5 +37,5 @@ src/rl_mass/verify/
 MUJOCO_LOG.TXT
 .claude
 
-result/lion/
+result/
 data/minotaur_leg/model/bone/

@@ -4,7 +4,7 @@ Originally ported from realtimeMuscle lion sim; generic over any
 restpos.geo + cons_<frame>.geo pipeline (lion, HumanV2, ...).
 
 Algorithm-equivalent (not strict bit-identical) to
-``realtimeMuscle/engine/arap_hpbd.py`` running the lion_hpbd.json config:
+``realtimeMuscle/engine/arap_hpbd.py`` running the lion_nomg.json config:
 quasi-static, no gravity, no multigrid, ``nsubsteps=10``,
 ``fine_iterations=1``, SOR ``omega=0.1``, ``mu=1e9``.
 
@@ -163,6 +163,119 @@ def pintotarget_overwrite_kernel(
     pos[pid] = target_pos[i] + rest_offset[i]
 
 
+@wp.kernel
+def compute_barycentric_kernel(
+    query_pos: wp.array(dtype=wp.vec3),
+    cage_pos: wp.array(dtype=wp.vec3),
+    cage_tet: wp.array(dtype=wp.vec4i),
+    out_cage_idx: wp.array(dtype=wp.int32),
+    out_bary: wp.array(dtype=wp.vec3),
+):
+    """For each query point, find a cage tet containing it (brute force).
+
+    Mirrors `compute_barycentric_kernel` in
+    realtimeMuscle/engine/compute_R_acc.py — falls back to nearest-vertex tet
+    if no container is found. Brute force is fine: this runs once at init.
+    """
+    i = wp.tid()
+    p = query_pos[i]
+    n_cage = cage_tet.shape[0]
+
+    found_idx = int(-1)
+    found_bary = wp.vec3(0.0, 0.0, 0.0)
+    min_dis = float(1.0e30)
+    nearest_tet = int(0)
+    nearest_bary = wp.vec3(0.0, 0.0, 0.0)
+
+    for t in range(n_cage):
+        idx = cage_tet[t]
+        p0 = cage_pos[idx[0]]
+        p1 = cage_pos[idx[1]]
+        p2 = cage_pos[idx[2]]
+        p3 = cage_pos[idx[3]]
+        Am = wp.mat33(
+            p1[0] - p0[0], p2[0] - p0[0], p3[0] - p0[0],
+            p1[1] - p0[1], p2[1] - p0[1], p3[1] - p0[1],
+            p1[2] - p0[2], p2[2] - p0[2], p3[2] - p0[2],
+        )
+        bv = p - p0
+        x = wp.inverse(Am) * bv
+        contained = (x[0] >= 0.0 and x[1] >= 0.0 and x[2] >= 0.0
+                     and (x[0] + x[1] + x[2] <= 1.0))
+        if contained and found_idx == -1:
+            found_idx = t
+            found_bary = x
+
+        d0 = wp.length(p0 - p)
+        d1 = wp.length(p1 - p)
+        d2 = wp.length(p2 - p)
+        d3 = wp.length(p3 - p)
+        dm = wp.min(wp.min(d0, d1), wp.min(d2, d3))
+        if dm < min_dis:
+            min_dis = dm
+            nearest_tet = t
+            nearest_bary = x
+
+    if found_idx >= 0:
+        out_cage_idx[i] = found_idx
+        out_bary[i] = found_bary
+    else:
+        out_cage_idx[i] = nearest_tet
+        out_bary[i] = nearest_bary
+
+
+@wp.kernel
+def restrict_direct_kernel(
+    fine_pos: wp.array(dtype=wp.vec3),
+    fine_tet: wp.array(dtype=wp.vec4i),
+    cage_idx_c2f: wp.array(dtype=wp.int32),
+    uvw_c2f: wp.array(dtype=wp.vec3),
+    coarse_pos: wp.array(dtype=wp.vec3),
+):
+    """coarse.pos[i] = blend(fine.pos at containing fine tet).
+
+    Direct restriction. Stable V-cycle: coarse mirrors fine each substep,
+    relaxes elasticity, prolongs back, fine re-pins and refines. Replaces
+    the dp variant from arap_hpbd_nogui.py which is unstable under
+    quasi-static (fine_old_pos never updated → cumulative coarse strain).
+    """
+    i = wp.tid()
+    t = cage_idx_c2f[i]
+    idx = fine_tet[t]
+    uvw = uvw_c2f[i]
+    u = uvw[0]
+    v = uvw[1]
+    w = uvw[2]
+    a = 1.0 - u - v - w
+    coarse_pos[i] = (a * fine_pos[idx[0]] + u * fine_pos[idx[1]]
+                     + v * fine_pos[idx[2]] + w * fine_pos[idx[3]])
+
+
+@wp.kernel
+def prolong_kernel(
+    coarse_pos: wp.array(dtype=wp.vec3),
+    coarse_tet: wp.array(dtype=wp.vec4i),
+    cage_idx: wp.array(dtype=wp.int32),
+    uvw: wp.array(dtype=wp.vec3),
+    fine_pos: wp.array(dtype=wp.vec3),
+):
+    """fine.pos[i] = blend(coarse.pos at containing coarse tet).
+
+    Direct (v1) prolongation — mirrors update_fine_mesh_mfree_kernel in
+    realtimeMuscle/engine/arap_hpbd_nogui.py:253.
+    """
+    i = wp.tid()
+    t = cage_idx[i]
+    idx = coarse_tet[t]
+    b = uvw[i]
+    u = b[0]
+    v = b[1]
+    w = b[2]
+    a = 1.0 - u - v - w
+    fine_pos[i] = (a * coarse_pos[idx[0]] + u * coarse_pos[idx[1]]
+                   + v * coarse_pos[idx[2]] + w * coarse_pos[idx[3]])
+
+
 # ─── Python-side class glue ────────────────────────────────────────────────
 
 import json
@@ -198,6 +311,15 @@ class OneWaySim:
         self.end_frame = int(cfg.get("end_frame", 90))
         self.start_frame = int(cfg.get("start_frame", 1))
         self._device = device
+
+        self.use_multigrid = bool(cfg.get("use_multigrid", False))
+        self.coarse_iters = int(cfg.get("coarse_iterations", 0))
+        # Accept either `coarse_rest_path` (preferred) or legacy
+        # `coarse_model_path` (matches realtimeMuscle scene JSONs).
+        self.coarse_rest_path = cfg.get("coarse_rest_path",
+                                        cfg.get("coarse_model_path", None))
+        if self.coarse_rest_path is not None:
+            self.coarse_rest_path = str(self.coarse_rest_path)
 
         rest = GeoFile(self.rest_path)
         self.NV = int(rest.positions.shape[0])
@@ -239,6 +361,78 @@ class OneWaySim:
         self.rest_offset = wp.array(rest_offset_np, dtype=wp.vec3, device=device)
         self.target_pos = wp.array(cons0.target_pos.copy(), dtype=wp.vec3, device=device)
 
+        if self.use_multigrid:
+            if self.coarse_rest_path is None:
+                raise ValueError(
+                    "use_multigrid=true but no coarse_rest_path / "
+                    "coarse_model_path in config"
+                )
+            self._init_coarse(rest.positions)
+
+    # ------------------------------------------------------------------
+
+    def _init_coarse(self, fine_rest_positions: np.ndarray) -> None:
+        """Load coarse mesh, allocate per-coarse fields, build f↔c barycentric map.
+
+        Both mappings are computed in rest pose: fine vert i → containing
+        coarse tet (cage_idx, uvw) for prolongation; coarse vert i →
+        containing fine tet (cage_idx_c2f, uvw_c2f) for restriction.
+        """
+        device = self._device
+        coarse = GeoFile(self.coarse_rest_path)
+        self.coarse_NV = int(coarse.positions.shape[0])
+        self.coarse_NT = int(coarse.tet_indices.shape[0])
+
+        self.coarse_pos     = wp.array(coarse.positions.copy(), dtype=wp.vec3, device=device)
+        self.coarse_pos_mid = wp.clone(self.coarse_pos)
+        self.coarse_tet_idx = wp.array(coarse.tet_indices, dtype=wp.vec4i, device=device)
+
+        self.coarse_B           = wp.zeros(self.coarse_NT, dtype=wp.mat33,   device=device)
+        self.coarse_rest_volume = wp.zeros(self.coarse_NT, dtype=wp.float32, device=device)
+        self.coarse_alpha       = wp.zeros(self.coarse_NT, dtype=wp.float32, device=device)
+        self.coarse_L           = wp.zeros(self.coarse_NT, dtype=wp.float32, device=device)
+        wp.launch(
+            precompute_rest_kernel,
+            dim=self.coarse_NT,
+            inputs=[self.coarse_pos, self.coarse_tet_idx, self.coarse_B,
+                    self.coarse_rest_volume, self.coarse_alpha, self.mu],
+            device=device,
+        )
+        V0c = self.coarse_rest_volume.numpy()
+        density_c = self.total_mass / float(V0c.sum())
+        mass_c = np.zeros(self.coarse_NV, dtype=np.float32)
+        per_tet_mass_c = density_c * V0c / 4.0
+        for k in range(4):
+            np.add.at(mass_c, coarse.tet_indices[:, k], per_tet_mass_c)
+        self.coarse_inv_mass = wp.array((1.0 / mass_c).astype(np.float32),
+                                        dtype=wp.float32, device=device)
+
+        # Rest-pose barycentric maps (one-shot brute force).
+        fine_pos_rest = wp.array(fine_rest_positions.copy(), dtype=wp.vec3, device=device)
+
+        # fine → coarse: each fine vert i lives in some coarse tet
+        self.cage_idx = wp.zeros(self.NV, dtype=wp.int32, device=device)
+        self.uvw      = wp.zeros(self.NV, dtype=wp.vec3,  device=device)
+        wp.launch(
+            compute_barycentric_kernel,
+            dim=self.NV,
+            inputs=[fine_pos_rest, self.coarse_pos, self.coarse_tet_idx,
+                    self.cage_idx, self.uvw],
+            device=device,
+        )
+
+        # coarse → fine: each coarse vert i lives in some fine tet
+        self.cage_idx_c2f = wp.zeros(self.coarse_NV, dtype=wp.int32, device=device)
+        self.uvw_c2f      = wp.zeros(self.coarse_NV, dtype=wp.vec3,  device=device)
+        wp.launch(
+            compute_barycentric_kernel,
+            dim=self.coarse_NV,
+            inputs=[self.coarse_pos, fine_pos_rest, self.tet_idx,
+                    self.cage_idx_c2f, self.uvw_c2f],
+            device=device,
+        )
+        wp.synchronize()
+
     # ------------------------------------------------------------------
 
     def load_frame_targets(self, frame: int) -> None:
@@ -255,7 +449,38 @@ class OneWaySim:
         )
 
     def substep(self) -> None:
-        # quasi_static=true, no_gravity, no_multigrid → ARAP only.
+        # quasi_static=true, no_gravity. Optional multigrid V-cycle:
+        # restrict (dp) → coarse iters → prolong → fine iters.
+        if self.use_multigrid:
+            # Direct V-cycle: restrict fine→coarse, relax coarse, prolong
+            # back, re-apply pin-to-target (prolong overwrites pinned verts).
+            wp.launch(
+                restrict_direct_kernel,
+                dim=self.coarse_NV,
+                inputs=[self.pos, self.tet_idx,
+                        self.cage_idx_c2f, self.uvw_c2f, self.coarse_pos],
+                device=self._device,
+            )
+            self.coarse_L.zero_()
+            for _ in range(self.coarse_iters):
+                wp.copy(self.coarse_pos_mid, self.coarse_pos)
+                wp.launch(
+                    arap_svd_kernel,
+                    dim=self.coarse_NT,
+                    inputs=[self.coarse_pos_mid, self.coarse_tet_idx,
+                            self.coarse_B, self.coarse_inv_mass,
+                            self.coarse_alpha, self.coarse_L,
+                            self.dt, self.omega, self.coarse_pos],
+                    device=self._device,
+                )
+            wp.launch(
+                prolong_kernel,
+                dim=self.NV,
+                inputs=[self.coarse_pos, self.coarse_tet_idx,
+                        self.cage_idx, self.uvw, self.pos],
+                device=self._device,
+            )
+            self.apply_pintotarget()
         self.L.zero_()
         for _ in range(self.fine_iters):
             wp.copy(self.pos_mid, self.pos)
