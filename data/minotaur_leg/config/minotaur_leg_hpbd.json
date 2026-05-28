@@ -1,0 +1,21 @@
+{
+    "start_frame":1,
+    "end_frame":200,
+    "geo_dir":"data/minotaur_leg/model",
+    "cons_dir":"data/minotaur_leg/model/cons",
+    "rest_path":"data/minotaur_leg/model/restpos.geo",
+    "use_pintotarget":true,
+    "quasi_static":true,
+    "use_external_constraints":true,
+    "use_multigrid":false,
+    "omega":0.1,
+    "mu":1e9,
+    "delta_t":0.04166,
+    "damping_coeff":1.0,
+    "gravity":[0.0, 0.0, 0.0],
+    "total_mass":50.0,
+    "mass_density":-1.0,
+    "coarse_iterations":30,
+    "fine_iterations":1,
+    "nsubsteps":10
+}

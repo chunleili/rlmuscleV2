@@ -41,6 +41,10 @@ class GeoFile:
             meta = _pair_list_to_dict(entry[0])
             data = _pair_list_to_dict(entry[1])
             name = meta["name"]
+            if name not in ("P", "gluetoanimation", "pts", "target_pos"):
+                continue
+            if "values" not in data:
+                continue
             values = data["values"]
 
             if name == "P":

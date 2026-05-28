@@ -9,8 +9,8 @@ import warp as wp
 wp.init()
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA = ROOT / "data" / "model" / "lion"
-CONFIG = ROOT / "data" / "scene" / "lion_hpbd.json"
+DATA = ROOT / "data" / "lion" / "model"
+CONFIG = ROOT / "data" / "lion" / "config" / "lion_hpbd.json"
 
 skip_no_data = pytest.mark.skipif(
     not (DATA / "restpos.geo").exists(),

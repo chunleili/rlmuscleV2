@@ -6,11 +6,11 @@ import pytest
 
 from muscle.util.geo_io import GeoFile, read_cons_frame
 
-DATA = Path(__file__).resolve().parents[1] / "data" / "model" / "lion"
+DATA = Path(__file__).resolve().parents[1] / "data" / "lion" / "model"
 
 skip_no_data = pytest.mark.skipif(
     not (DATA / "restpos.geo").exists(),
-    reason="lion .geo blobs not present (cp them in from realtimeMuscle/data/model/lion)",
+    reason="lion .geo blobs not present (cp them in from realtimeMuscle/data/model/lion (now data/lion/model))",
 )
 
 

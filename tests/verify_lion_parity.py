@@ -8,7 +8,7 @@ Usage:
     # First, populate the reference:
     cd ~/Dev/realtimeMuscle
     python engine/arap_hpbd.py -use_json=1 \
-        -json_path=./data/scene/lion_hpbd.json \
+        -json_path=./data/lion/config/lion_hpbd.json \
         -end_frame=90 -export_mesh=1 -out_dir=result/lion_ref
 
     # Then verify (run from rlmuscleV2-physics root):

@@ -38,3 +38,4 @@ MUJOCO_LOG.TXT
 .claude
 
 result/lion/
+data/minotaur_leg/model/bone/
