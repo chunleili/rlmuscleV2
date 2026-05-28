@@ -38,4 +38,8 @@ MUJOCO_LOG.TXT
 .claude
 
 result/
-data/minotaur_leg/model/bone/
+
+# Unzipped model assets — extracted from data/<case>/model.zip at runtime.
+data/lion/model/
+data/minotaur/model/
+data/minotaur_leg/model/

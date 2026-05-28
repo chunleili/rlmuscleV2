@@ -1,7 +1,7 @@
 """Warp ARAP-HPBD one-way pin-to-target solver.
 
 Originally ported from realtimeMuscle lion sim; generic over any
-restpos.geo + cons_<frame>.geo pipeline (lion, HumanV2, ...).
+restpos.geo + cons_<frame>.geo pipeline (lion, minotaur, ...).
 
 Algorithm-equivalent (not strict bit-identical) to
 ``realtimeMuscle/engine/arap_hpbd.py`` running the lion_nomg.json config:
@@ -286,6 +286,32 @@ import numpy as np
 from muscle.util.geo_io import GeoFile, read_cons_frame
 
 
+def _check_unzipped(path: str) -> None:
+    """Raise if a required .geo asset is missing — model dirs ship as zips.
+
+    Each case's geometry (restpos, restpos_lowres, cons_*.geo) lives inside
+    ``data/<case>/model.zip`` to save LFS storage. Unzip once before running
+    any sim. See data/README.md.
+    """
+    p = Path(path)
+    if p.exists():
+        return
+    parts = p.parts
+    if "data" in parts:
+        i = parts.index("data")
+        if i + 1 < len(parts):
+            case_dir = Path(*parts[: i + 2])
+            zip_path = case_dir / "model.zip"
+            if zip_path.exists():
+                raise FileNotFoundError(
+                    f"missing asset: {path}\n"
+                    f"model assets are zipped — extract first:\n"
+                    f"    (cd {case_dir} && unzip -o model.zip)\n"
+                    f"see data/README.md"
+                )
+    raise FileNotFoundError(f"missing asset: {path}")
+
+
 class OneWaySim:
     """Per-frame ARAP-HPBD driver for the pin-to-target workflow.
 
@@ -321,6 +347,7 @@ class OneWaySim:
         if self.coarse_rest_path is not None:
             self.coarse_rest_path = str(self.coarse_rest_path)
 
+        _check_unzipped(self.rest_path)
         rest = GeoFile(self.rest_path)
         self.NV = int(rest.positions.shape[0])
         self.NT = int(rest.tet_indices.shape[0])
@@ -354,7 +381,9 @@ class OneWaySim:
 
         # Pin-to-target: topology (pts) is constant across all cons_<frame>.geo
         # files; only target_pos varies.
-        cons0 = GeoFile(str(Path(self.cons_dir) / f"cons_{self.start_frame}.geo"))
+        cons0_path = str(Path(self.cons_dir) / f"cons_{self.start_frame}.geo")
+        _check_unzipped(cons0_path)
+        cons0 = GeoFile(cons0_path)
         self.NCONS = int(cons0.pts.shape[0])
         self.pts = wp.array(cons0.pts, dtype=wp.int32, device=device)
         rest_offset_np = (rest.positions[cons0.pts] - cons0.target_pos).astype(np.float32)
@@ -379,6 +408,7 @@ class OneWaySim:
         containing fine tet (cage_idx_c2f, uvw_c2f) for restriction.
         """
         device = self._device
+        _check_unzipped(self.coarse_rest_path)
         coarse = GeoFile(self.coarse_rest_path)
         self.coarse_NV = int(coarse.positions.shape[0])
         self.coarse_NT = int(coarse.tet_indices.shape[0])

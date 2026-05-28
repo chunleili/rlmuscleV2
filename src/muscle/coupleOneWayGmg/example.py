@@ -4,6 +4,14 @@ Usage:
     python -m muscle.coupleOneWayGmg.example \
         --config data/lion/config/lion_nomg.json \
         --out_dir result/lion
+
+    python -m muscle.coupleOneWayGmg.example \
+        --config data/minotaur/config/minotaur.json \
+        --out_dir result/minotaur
+
+    python -m muscle.coupleOneWayGmg.example \
+        --config data/minotaur_leg/config/minotaur_leg.json \
+        --out_dir result/minotaur_leg
 """
 from __future__ import annotations
 

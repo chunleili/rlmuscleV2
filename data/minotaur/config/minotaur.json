@@ -1,0 +1,22 @@
+{
+    "start_frame":1,
+    "end_frame":200,
+    "geo_dir":"data/minotaur/model",
+    "cons_dir":"data/minotaur/model/cons",
+    "rest_path":"data/minotaur/model/muscle/restpos.geo",
+    "coarse_rest_path":"data/minotaur/model/muscle/restpos_lowres.geo",
+    "use_pintotarget":true,
+    "quasi_static":true,
+    "use_external_constraints":true,
+    "use_multigrid":false,
+    "omega":0.1,
+    "mu":1e9,
+    "delta_t":0.04166,
+    "damping_coeff":1.0,
+    "gravity":[0.0, 0.0, 0.0],
+    "total_mass":80.0,
+    "mass_density":-1.0,
+    "coarse_iterations":5,
+    "fine_iterations":1,
+    "nsubsteps":10
+}
