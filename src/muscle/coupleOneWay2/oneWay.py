@@ -1,4 +1,7 @@
-"""Warp port of the realtimeMuscle lion ARAP-HPBD solver.
+"""Warp ARAP-HPBD one-way pin-to-target solver.
+
+Originally ported from realtimeMuscle lion sim; generic over any
+restpos.geo + cons_<frame>.geo pipeline (lion, HumanV2, ...).
 
 Algorithm-equivalent (not strict bit-identical) to
 ``realtimeMuscle/engine/arap_hpbd.py`` running the lion_hpbd.json config:
@@ -170,8 +173,8 @@ import numpy as np
 from muscle.coupleOneWay.geo_io import GeoFile, read_cons_frame
 
 
-class LionSim:
-    """Per-frame ARAP-HPBD driver for the lion-style pin-to-target workflow.
+class OneWaySim:
+    """Per-frame ARAP-HPBD driver for the pin-to-target workflow.
 
     Lifecycle (one frame):
         sim.load_frame_targets(frame)  # reads cons_<frame>.geo target_pos
@@ -273,8 +276,8 @@ class LionSim:
         return self.pos.numpy()
 
 
-def load_lion_config(config_path: str) -> dict:
-    """Load a lion-style JSON config and resolve geo_dir relative to cwd if needed."""
+def load_config(config_path: str) -> dict:
+    """Load a JSON scene config and resolve geo_dir relative to cwd if needed."""
     cfg = json.load(open(config_path))
     if not Path(cfg["geo_dir"]).is_absolute():
         cfg["geo_dir"] = str(Path.cwd() / cfg["geo_dir"])

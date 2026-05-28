@@ -1,4 +1,4 @@
-"""End-to-end smoke test for LionSim against real lion data."""
+"""End-to-end smoke test for OneWaySim against real lion data."""
 import json
 from pathlib import Path
 
@@ -20,11 +20,11 @@ skip_no_data = pytest.mark.skipif(
 
 @skip_no_data
 def test_lion_init_and_one_frame_no_nan():
-    from muscle.coupleOneWay.lion_sim import LionSim
+    from muscle.coupleOneWay2.oneWay import OneWaySim
 
     cfg = json.load(open(CONFIG))
     cfg["geo_dir"] = str(DATA)
-    sim = LionSim(cfg)
+    sim = OneWaySim(cfg)
 
     p_rest = sim.positions_np().copy()
     assert sim.NV == p_rest.shape[0]
@@ -46,12 +46,12 @@ def test_lion_init_and_one_frame_no_nan():
 
 @skip_no_data
 def test_lion_five_frames_run():
-    from muscle.coupleOneWay.lion_sim import LionSim
+    from muscle.coupleOneWay2.oneWay import OneWaySim
 
     cfg = json.load(open(CONFIG))
     cfg["geo_dir"] = str(DATA)
     cfg["end_frame"] = 5
-    sim = LionSim(cfg)
+    sim = OneWaySim(cfg)
 
     for frame in range(sim.start_frame, sim.end_frame + 1):
         sim.step_frame(frame)

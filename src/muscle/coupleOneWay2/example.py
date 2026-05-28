@@ -1,7 +1,7 @@
-"""End-to-end driver for the lion ARAP-HPBD sim.
+"""End-to-end driver for the ARAP-HPBD one-way pin-to-target sim.
 
 Usage:
-    python -m muscle.coupleOneWay.lion_example \
+    python -m muscle.coupleOneWay2.example \
         --config data/scene/lion_hpbd.json \
         --out_dir result/lion
 """
@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
-from muscle.coupleOneWay.lion_sim import LionSim, load_lion_config
+from muscle.coupleOneWay2.oneWay import OneWaySim, load_config
 from muscle.util.mesh_io import save_ply
 
 
@@ -49,11 +49,11 @@ def main():
     args = ap.parse_args()
 
     wp.init()
-    cfg = load_lion_config(args.config)
+    cfg = load_config(args.config)
     if args.end_frame is not None:
         cfg["end_frame"] = args.end_frame
 
-    sim = LionSim(cfg, device=args.device)
+    sim = OneWaySim(cfg, device=args.device)
     print(f"NV={sim.NV}  NT={sim.NT}  NCONS={sim.NCONS}  "
           f"frames={sim.start_frame}..{sim.end_frame}  "
           f"nsubsteps={sim.nsubsteps}  fine_iters={sim.fine_iters}")
