@@ -170,7 +170,7 @@ from pathlib import Path
 
 import numpy as np
 
-from muscle.coupleOneWay.geo_io import GeoFile, read_cons_frame
+from muscle.util.geo_io import GeoFile, read_cons_frame
 
 
 class OneWaySim:
@@ -192,12 +192,14 @@ class OneWaySim:
         self.fine_iters = int(cfg["fine_iterations"])
         self.total_mass = float(cfg["total_mass"])
         self.geo_dir = str(cfg["geo_dir"])
+        self.cons_dir = str(cfg.get("cons_dir", self.geo_dir))
+        self.rest_path = str(cfg.get("rest_path", str(Path(self.geo_dir) / "restpos.geo")))
         self.dt = self.dt_frame / self.nsubsteps
         self.end_frame = int(cfg.get("end_frame", 90))
         self.start_frame = int(cfg.get("start_frame", 1))
         self._device = device
 
-        rest = GeoFile(str(Path(self.geo_dir) / "restpos.geo"))
+        rest = GeoFile(self.rest_path)
         self.NV = int(rest.positions.shape[0])
         self.NT = int(rest.tet_indices.shape[0])
 
@@ -230,7 +232,7 @@ class OneWaySim:
 
         # Pin-to-target: topology (pts) is constant across all cons_<frame>.geo
         # files; only target_pos varies.
-        cons0 = GeoFile(str(Path(self.geo_dir) / f"cons_{self.start_frame}.geo"))
+        cons0 = GeoFile(str(Path(self.cons_dir) / f"cons_{self.start_frame}.geo"))
         self.NCONS = int(cons0.pts.shape[0])
         self.pts = wp.array(cons0.pts, dtype=wp.int32, device=device)
         rest_offset_np = (rest.positions[cons0.pts] - cons0.target_pos).astype(np.float32)
@@ -240,7 +242,7 @@ class OneWaySim:
     # ------------------------------------------------------------------
 
     def load_frame_targets(self, frame: int) -> None:
-        targets = read_cons_frame(self.geo_dir, frame)
+        targets = read_cons_frame(self.cons_dir, frame)
         # In-place copy preserves the GPU buffer identity / device.
         self.target_pos.assign(targets)
 
@@ -277,8 +279,9 @@ class OneWaySim:
 
 
 def load_config(config_path: str) -> dict:
-    """Load a JSON scene config and resolve geo_dir relative to cwd if needed."""
+    """Load a JSON scene config and resolve relative paths against cwd."""
     cfg = json.load(open(config_path))
-    if not Path(cfg["geo_dir"]).is_absolute():
-        cfg["geo_dir"] = str(Path.cwd() / cfg["geo_dir"])
+    for key in ("geo_dir", "cons_dir", "rest_path"):
+        if key in cfg and not Path(cfg[key]).is_absolute():
+            cfg[key] = str(Path.cwd() / cfg[key])
     return cfg

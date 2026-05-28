@@ -1,10 +1,10 @@
-"""Tests for muscle.coupleOneWay.geo_io against real lion data."""
+"""Tests for muscle.util.geo_io against real lion data."""
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from muscle.coupleOneWay.geo_io import GeoFile, read_cons_frame
+from muscle.util.geo_io import GeoFile, read_cons_frame
 
 DATA = Path(__file__).resolve().parents[1] / "data" / "model" / "lion"
 

@@ -33,7 +33,7 @@ def load_positions(path: Path) -> np.ndarray:
         m = meshio.read(str(path))
         return np.asarray(m.points, dtype=np.float64)
     if suffix == ".geo":
-        from muscle.coupleOneWay.geo_io import GeoFile
+        from muscle.util.geo_io import GeoFile
 
         return GeoFile(str(path)).positions.astype(np.float64)
     raise ValueError(f"unsupported extension: {path}")
