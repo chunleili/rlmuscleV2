@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
-from muscle.coupleOneWay2.oneWay import OneWaySim, load_config
+from muscle.coupleOneWay2.solver import OneWaySim, load_config
 from muscle.util.mesh_io import save_ply
 
 

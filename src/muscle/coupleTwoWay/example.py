@@ -4,9 +4,9 @@ Default config (bicep_coupled.json) uses TETFIBERNORM constraint.
 Switch to bicep_fibermillard_coupled.json via --config to use TETFIBERMILLARD.
 
 Usage:
-    uv run python -m muscle.couple.example --auto --steps 300
-    uv run python -m muscle.couple.example --auto --render
-    uv run python -m muscle.couple.example --eval
+    uv run python -m muscle.coupleTwoWay.example --auto --steps 300
+    uv run python -m muscle.coupleTwoWay.example --auto --render
+    uv run python -m muscle.coupleTwoWay.example --eval
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ import warp as wp
 import newton
 
 from muscle.util.util import load_config
-from muscle.couple.solver import (
+from muscle.coupleTwoWay.solver import (
     build_coupling_config,
     config_to_dict,
     parse_levels,
@@ -33,7 +33,7 @@ from muscle.couple.solver import (
 )
 from muscle.util.mesh_utils import MeshDistortionError, check_mesh_quality
 from muscle.muscle_warp import MuscleSim, activation_ramp
-from muscle.couple.solver import SolverMuscleBoneCoupled
+from muscle.coupleTwoWay.solver import SolverMuscleBoneCoupled
 from muscle.util.usd_io import UsdIO, build_bone_prim_map
 
 DEFAULT_CONFIG = "data/muscle/config/bicep_coupled.json"
