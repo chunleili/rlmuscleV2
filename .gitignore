@@ -40,6 +40,8 @@ MUJOCO_LOG.TXT
 result/
 
 # Unzipped model assets — extracted from data/<case>/model.zip at runtime.
+data/humanV2/model/
+data/humanV2/model.zip
 data/lion/model/
 data/minotaur/model/
 data/minotaur_leg/model/
