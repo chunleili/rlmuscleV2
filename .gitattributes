@@ -11,3 +11,7 @@
 *.hiplc filter=lfs diff=lfs merge=lfs -text
 *.hipnc filter=lfs diff=lfs merge=lfs -text
 *.bvh filter=lfs diff=lfs merge=lfs -text
+*.geo filter=lfs diff=lfs merge=lfs -text
+*.bgeo filter=lfs diff=lfs merge=lfs -text
+*.bgeo.sc filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text

@@ -1,0 +1,1 @@
+Use houdini to open the hip file and right click on the lopnet node and select "Cook the output" to produce the geometry files. 

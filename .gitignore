@@ -36,3 +36,15 @@ src/rl_mass/verify/
 
 MUJOCO_LOG.TXT
 .claude
+
+result/
+
+# Unzipped model assets — extracted from data/<case>/model.zip at runtime.
+data/humanV2/model/
+data/humanV2/model.zip
+data/lion/model/
+data/lion/model.zip
+data/minotaur/model/
+data/minotaur/model.zip
+data/minotaur_leg/model/
+data/minotaur_leg/model.zip
