@@ -1,0 +1,16 @@
+{
+    "skeleton_format": "mujoco_native",
+    "use_muscle": true,
+    "control_hz": 30,
+    "simulation_hz": 600,
+    "skeleton_file": "/home/chunleli/Dev/musclemimic_models/musclemimic_models/model/arm/myoarm_bimanual.xml",
+    "trajectory_file": "/home/chunleli/Dev/musclemimic/trajectory_data_bimanual/bimanual_episodes_mjx_20260601_220203.npz",
+    "reward_param": {
+        "w_q": 0.85,
+        "w_v": 0.15
+    },
+    "pose_error_threshold": 5.0,
+    "spd": {
+        "kp": 100.0
+    }
+}
