@@ -26,7 +26,7 @@ from rl_mass.engine import MuJoCoEngine
 
 
 class TendonMuscleSystem:
-    def __init__(self, engine: MuJoCoEngine):
+    def __init__(self, engine: MuJoCoEngine, force_scale: float = 1.0):
         import mujoco
 
         self._mj = mujoco
@@ -34,9 +34,14 @@ class TendonMuscleSystem:
         self.nv = int(m.nv)
         self.n_muscles = int(m.nu)
 
-        # Per-muscle static params.
+        # Per-muscle static params. force_scale uniformly scales peak isometric
+        # force f0: rl_mass muscle force units are arbitrary, and the bimanual
+        # model's anatomical f0 saturate (activation >> 1) against the SPD target
+        # torque, so a tuning gain is needed to keep activations in [0, 1] (see
+        # the convergence diagnosis in the design doc / project memory).
         self.f0 = m.actuator_gainprm[:, 2].copy().astype(np.float64)
         assert np.all(self.f0 > 0), "expected all muscle f0 > 0"
+        self.f0 *= float(force_scale)
         self._LR = m.actuator_lengthrange.copy().astype(np.float64)   # (nu, 2)
         rng = m.actuator_gainprm[:, 0:2].copy().astype(np.float64)    # (nu, 2)
         assert np.all(self._LR[:, 1] > self._LR[:, 0]), "bad actuator_lengthrange"

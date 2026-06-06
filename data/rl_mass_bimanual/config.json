@@ -10,6 +10,7 @@
         "w_v": 0.15
     },
     "pose_error_threshold": 5.0,
+    "muscle_force_scale": 16.0,
     "spd": {
         "kp": 20.0
     }

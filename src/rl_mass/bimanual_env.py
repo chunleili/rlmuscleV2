@@ -40,6 +40,7 @@ class BimanualEnv:
         )
         self.kp: float = cfg.get("spd", {}).get("kp", 100.0)
         self.kv: float = math.sqrt(2.0 * self.kp)
+        self.muscle_force_scale: float = cfg.get("muscle_force_scale", 1.0)
 
         self.engine = MuJoCoEngine(cfg["skeleton_file"], timestep=1.0 / self.simulation_hz)
         # Disable MuJoCo's own actuator forces; we apply Hill forces ourselves.
@@ -72,7 +73,9 @@ class BimanualEnv:
         self.muscle_system: Optional[TendonMuscleSystem] = None
         self.num_total_related_dofs: int = 0
         if self.use_muscle:
-            self.muscle_system = TendonMuscleSystem(self.engine)
+            self.muscle_system = TendonMuscleSystem(
+                self.engine, force_scale=self.muscle_force_scale
+            )
             self.num_total_related_dofs = self.muscle_system.num_total_related_dofs
 
         self.n_muscles = int(self.model.nu)
