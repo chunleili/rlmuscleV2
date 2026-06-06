@@ -11,6 +11,6 @@
     },
     "pose_error_threshold": 5.0,
     "spd": {
-        "kp": 100.0
+        "kp": 20.0
     }
 }
