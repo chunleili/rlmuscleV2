@@ -80,6 +80,13 @@ def precompute_rest_scaled_kernel(
     )
     det = wp.determinant(Dm)
     V0 = wp.abs(det) / 6.0
+    k = stiffness[t]
+    if V0 < 1.0e-12:
+        # Degenerate tet: make it inert (identity rest, no volume, stiff-inert).
+        B[t] = wp.identity(n=3, dtype=wp.float32)
+        rest_volume[t] = 0.0
+        alpha[t] = 1.0e20
+        return
     s = scale[t]
     Dm_s = wp.mat33(
         s * e1[0], s * e2[0], s * e3[0],
@@ -88,7 +95,6 @@ def precompute_rest_scaled_kernel(
     )
     B[t] = wp.inverse(Dm_s)
     rest_volume[t] = V0
-    k = stiffness[t]
     alpha[t] = 1.0 / (k * V0)
 
 
@@ -466,7 +472,8 @@ def build_merged_state(muscle_pos, muscle_tet, fascia_pos, fascia_tet,
     per_tet_mass = density * V0 / 4.0
     for k in range(4):
         np.add.at(mass_v, tet_np[:, k], per_tet_mass)
-    inv_mass = wp.array((1.0 / mass_v).astype(np.float32), dtype=wp.float32, device=device)
+    inv_mass_np = np.where(mass_v > 0.0, 1.0 / np.maximum(mass_v, 1e-30), 0.0).astype(np.float32)
+    inv_mass = wp.array(inv_mass_np, dtype=wp.float32, device=device)
 
     gf = (np.asarray(glue_fascia, np.int32) + nvm)
     gm = np.asarray(glue_muscle, np.int32)
