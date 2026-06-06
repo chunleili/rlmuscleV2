@@ -54,6 +54,8 @@ def main():
                     help="override end_frame from config")
     ap.add_argument("--no_export", action="store_true",
                     help="don't write PLY files (timing-only run)")
+    ap.add_argument("--split_fascia", action="store_true",
+                    help="export muscle and fascia as separate PLY streams")
     args = ap.parse_args()
 
     wp.init()
@@ -76,12 +78,27 @@ def main():
     surface_faces = _vectorized_surface_tris(sim.tet_idx.numpy())
     print(f"  {surface_faces.shape[0]} surface tris  ({time.perf_counter()-t_surf:.2f}s)")
 
+    nvm = getattr(sim, "nvm", sim.NV)
+    split = args.split_fascia and nvm < sim.NV
+    if split:
+        tets = sim.tet_idx.numpy()
+        muscle_tets = tets[(tets < nvm).all(axis=1)]
+        fascia_tets = tets[(tets >= nvm).all(axis=1)]
+        muscle_faces = _vectorized_surface_tris(muscle_tets)
+        fascia_faces = _vectorized_surface_tris(fascia_tets)
+        print(f"  split: {muscle_faces.shape[0]} muscle tris, "
+              f"{fascia_faces.shape[0]} fascia tris")
+
     n_frames = sim.end_frame - sim.start_frame + 1
     t0 = time.perf_counter()
     for frame in range(sim.start_frame, sim.end_frame + 1):
         sim.step_frame(frame)
         if not args.no_export:
-            save_ply(str(mesh_out / f"{frame:04d}.ply"), sim.positions_np(), surface_faces)
+            if split:
+                save_ply(str(mesh_out / f"muscle_{frame:04d}.ply"), sim.positions_np(), muscle_faces)
+                save_ply(str(mesh_out / f"fascia_{frame:04d}.ply"), sim.positions_np(), fascia_faces)
+            else:
+                save_ply(str(mesh_out / f"{frame:04d}.ply"), sim.positions_np(), surface_faces)
         if frame % 10 == 0 or frame == sim.end_frame:
             elapsed = time.perf_counter() - t0
             done = frame - sim.start_frame + 1

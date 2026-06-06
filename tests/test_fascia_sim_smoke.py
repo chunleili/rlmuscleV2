@@ -108,3 +108,37 @@ def test_substep_runs_glue_when_fascia_present(monkeypatch):
     sim.substep()
     assert calls["glue"] == 1
     assert not np.isnan(sim.pos.numpy()).any()
+
+
+import json
+from pathlib import Path
+import pytest
+
+_ROOT = Path(__file__).resolve().parents[1]
+_HV2 = _ROOT / "data" / "humanV2" / "model"
+_FASCIA_CFG = _ROOT / "data" / "humanV2" / "config" / "humanV2_fascia.json"
+
+skip_no_hv2 = pytest.mark.skipif(
+    not (_HV2 / "muscle" / "restpos.geo").exists()
+    or not (_HV2 / "fascia" / "fascia.geo").exists()
+    or not _FASCIA_CFG.exists(),
+    reason="humanV2 model not extracted / fascia.geo not copied / config missing",
+)
+
+
+@skip_no_hv2
+def test_humanV2_fascia_one_frame_no_nan():
+    from muscle.coupleOneWayGmg.solver import OneWaySim, load_config
+    cfg = load_config(str(_FASCIA_CFG))
+    cfg["end_frame"] = cfg["start_frame"]
+    # Run on CPU if no GPU; keep it to a single frame.
+    sim = OneWaySim(cfg)
+    assert sim.NV > 157369          # muscle (157369) + fascia merged
+    assert sim.merged.n_glue > 0
+    rest = sim.positions_np().copy()
+    sim.step_frame(sim.start_frame)
+    after = sim.positions_np()
+    assert not np.isnan(after).any() and not np.isinf(after).any()
+    # fascia verts (index >= nvm) actually moved (contraction/glue active)
+    fascia_disp = np.linalg.norm(after[sim.nvm:] - rest[sim.nvm:], axis=1).mean()
+    assert fascia_disp > 1e-5
