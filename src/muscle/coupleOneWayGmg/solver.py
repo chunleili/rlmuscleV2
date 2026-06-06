@@ -690,29 +690,39 @@ class OneWaySim:
         fascia_tet = fg.tet_indices
 
         mrest = GeoFile(self.rest_path)
-        surf = mrest.point_group("surface_points")
-        surf_tree = cKDTree(rest_muscle_pos[surf])
 
-        def pair(group_name, dist_attr, stiff_attr):
-            if group_name not in fg._groups:
-                return (np.zeros(0, np.int32), np.zeros(0, np.int32),
-                        np.zeros(0, np.float32), np.zeros(0, np.float32))
-            fids = fg.point_group(group_name)
-            d, loc = surf_tree.query(fascia_pos[fids], k=1)
-            mids = surf[loc].astype(np.int32)
-            want = fg.point_attr(dist_attr)[fids].astype(np.float32)
-            restlen = np.minimum(want, d.astype(np.float32))  # don't yank distant pts
-            stiff = fg.point_attr(stiff_attr)[fids].astype(np.float32)
-            return fids.astype(np.int32), mids, restlen, stiff
+        # glue_scale is needed by both pairing modes (surface uses it for the
+        # uniform stiffness); read it here so _pair_surface can see it.
+        glue_scale = float(self.cfg.get("fascia_glue_stiffness_scale", 0.001))
 
-        gi_f, gi_m, gi_r, gi_s = pair("tissue_inner_points",
-                                      "tissuetomuscledistance", "tissuetomusclestiffness")
-        gb_f, gb_m, gb_r, gb_s = pair("tissue_bone_points",
-                                      "tissuetobonedistance", "tissuetobonestiffness")
-        glue_fascia = np.concatenate([gi_f, gb_f])
-        glue_muscle = np.concatenate([gi_m, gb_m])
-        glue_restlen = np.concatenate([gi_r, gb_r])
-        glue_stiff = np.concatenate([gi_s, gb_s])
+        glue_mode = str(self.cfg.get("fascia_glue_mode", "groups"))
+        if glue_mode == "surface":
+            glue_fascia, glue_muscle, glue_restlen, glue_stiff = self._pair_surface(
+                fg, fascia_pos, mrest, rest_muscle_pos, glue_scale)
+        else:
+            surf = mrest.point_group("surface_points")
+            surf_tree = cKDTree(rest_muscle_pos[surf])
+
+            def pair(group_name, dist_attr, stiff_attr):
+                if group_name not in fg._groups:
+                    return (np.zeros(0, np.int32), np.zeros(0, np.int32),
+                            np.zeros(0, np.float32), np.zeros(0, np.float32))
+                fids = fg.point_group(group_name)
+                d, loc = surf_tree.query(fascia_pos[fids], k=1)
+                mids = surf[loc].astype(np.int32)
+                want = fg.point_attr(dist_attr)[fids].astype(np.float32)
+                restlen = np.minimum(want, d.astype(np.float32))  # don't yank distant pts
+                stiff = fg.point_attr(stiff_attr)[fids].astype(np.float32)
+                return fids.astype(np.int32), mids, restlen, stiff
+
+            gi_f, gi_m, gi_r, gi_s = pair("tissue_inner_points",
+                                          "tissuetomuscledistance", "tissuetomusclestiffness")
+            gb_f, gb_m, gb_r, gb_s = pair("tissue_bone_points",
+                                          "tissuetobonedistance", "tissuetobonestiffness")
+            glue_fascia = np.concatenate([gi_f, gb_f])
+            glue_muscle = np.concatenate([gi_m, gb_m])
+            glue_restlen = np.concatenate([gi_r, gb_r])
+            glue_stiff = np.concatenate([gi_s, gb_s]) * glue_scale
 
         if "rigid" in fg._groups:
             rid = fg.point_group("rigid")
@@ -725,7 +735,7 @@ class OneWaySim:
             anchor_muscle = np.zeros(0, np.int32)
 
         log.info(f"fascia: {fascia_pos.shape[0]} verts, {fascia_tet.shape[0]} tets; "
-                 f"glue pairs={len(glue_fascia)} (inner={len(gi_f)}, bone={len(gb_f)}); "
+                 f"glue mode={glue_mode}, glue pairs={len(glue_fascia)}; "
                  f"anchors={len(anchor_fascia)}; rest_scale={self.fascia_rest_scale}")
 
         # --- Free the muscle verts the fascia glues to (+dilated ring) from the
@@ -733,7 +743,6 @@ class OneWaySim:
         # them inward. See Task 9. ---
         free_ring = int(self.cfg.get("fascia_free_ring", 1))
         surface_mu = float(self.cfg.get("fascia_surface_mu", 1.0e5))
-        glue_scale = float(self.cfg.get("fascia_glue_stiffness_scale", 100.0))
 
         muscle_tet = mrest.tet_indices  # (nt_m, 4)
         nvm = rest_muscle_pos.shape[0]
@@ -768,7 +777,7 @@ class OneWaySim:
             muscle_stiffness=muscle_stiff,
             fascia_stiffness=float(fg.point_attr("solidshapestiffness").mean()),
             glue_fascia=glue_fascia, glue_muscle=glue_muscle,
-            glue_restlen=glue_restlen, glue_stiffness=glue_stiff * glue_scale,
+            glue_restlen=glue_restlen, glue_stiffness=glue_stiff,
             anchor_fascia=anchor_fascia, anchor_muscle=anchor_muscle,
             total_mass=self.total_mass, device=self._device)
 
@@ -788,6 +797,38 @@ class OneWaySim:
         self.inv_mass = self.merged.inv_mass
         self.NT = self.merged.NT
         self.NV = self.pos.shape[0]
+
+    # ------------------------------------------------------------------
+
+    def _pair_surface(self, fg, fascia_pos, mrest, rest_muscle_pos, glue_scale):
+        """Build glue pairs from the MUSCLE side (full-surface glue mode).
+
+        Instead of pairing the small tissue_inner/tissue_bone fascia groups to
+        their nearest muscle vert (groups mode, ~4252 pairs), this pairs EVERY
+        muscle surface vertex to its nearest fascia vertex (~119482 pairs). This
+        un-dilutes the global mean-radius squeeze metric by gluing the whole
+        surface, not just a small patch. See Task 10.
+
+        Returns (glue_fascia LOCAL ids, glue_muscle GLOBAL ids, glue_restlen,
+        glue_stiff) — same convention as groups mode; build_merged_state offsets
+        glue_fascia by nvm.
+        """
+        from scipy.spatial import cKDTree
+
+        surf = mrest.point_group("surface_points")  # global muscle vert ids
+        fascia_tree = cKDTree(fascia_pos)
+        d, floc = fascia_tree.query(rest_muscle_pos[surf], k=1)  # floc: LOCAL fascia ids
+
+        want = float(self.cfg.get("fascia_glue_target_distance", 0.01))
+        glue_muscle = surf.astype(np.int32)
+        glue_fascia = floc.astype(np.int32)
+        glue_restlen = np.minimum(want, d.astype(np.float32)).astype(np.float32)
+
+        base_stiff = float(self.cfg.get(
+            "fascia_glue_stiffness",
+            float(fg.point_attr("tissuetomusclestiffness").mean())))
+        glue_stiff = np.full(len(surf), base_stiff * glue_scale, dtype=np.float32)
+        return glue_fascia, glue_muscle, glue_restlen, glue_stiff
 
     # ------------------------------------------------------------------
 

@@ -154,6 +154,9 @@ def test_fascia_frees_glue_target_pins():
     from muscle.coupleOneWayGmg.solver import OneWaySim, load_config
     cfg = load_config(str(_FASCIA_CFG))
     cfg["end_frame"] = cfg["start_frame"]
+    # The humanV2 config now defaults to surface glue mode; this test asserts the
+    # groups-mode free/glue behavior specifically, so pin it to groups.
+    cfg["fascia_glue_mode"] = "groups"
     sim = OneWaySim(cfg, device="cuda:0")
     active = sim.pin_active.numpy()
     assert active.sum() < active.shape[0]        # some pins freed
@@ -161,3 +164,21 @@ def test_fascia_frees_glue_target_pins():
     assert n_freed >= sim.merged.n_glue          # at least the glue targets (dilated >=)
     sim.step_frame(sim.start_frame)
     assert not np.isnan(sim.positions_np()).any()
+
+
+@skip_no_hv2
+def test_fascia_surface_glue_covers_full_surface():
+    """surface glue mode pairs (nearly) all muscle surface verts -> many more
+    glue pairs and freed verts than groups mode."""
+    from muscle.coupleOneWayGmg.solver import OneWaySim, load_config
+    from muscle.util.geo_io import GeoFile
+    cfg = load_config(str(_FASCIA_CFG))
+    cfg["end_frame"] = cfg["start_frame"]
+    cfg["fascia_glue_mode"] = "surface"
+    sim = OneWaySim(cfg, device="cuda:0")
+    n_surf = GeoFile(cfg["rest_path"]).point_group("surface_points").shape[0]
+    assert sim.merged.n_glue >= int(0.9 * n_surf)   # ~all surface verts glued
+    freed = sim.pin_active.numpy().shape[0] - int(sim.pin_active.numpy().sum())
+    assert freed >= sim.merged.n_glue               # freed >= glued (dilated)
+    sim.step_frame(sim.start_frame)
+    assert not np.isnan(sim.positions_np()).any() and not np.isinf(sim.positions_np()).any()

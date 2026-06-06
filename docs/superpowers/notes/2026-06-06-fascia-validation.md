@@ -112,3 +112,67 @@ To make this a *visibly* strong squeeze, the next step is a more stable glue
 solver (e.g. graph-colored Gauss-Seidel glue, or per-vertex mass lumping for
 the freed surface verts) so the glue stiffness can be raised 100–1000x without
 divergence — not more parameter tuning of the current Jacobi solve.
+
+---
+
+## Task 10: full-surface glue mode (un-dilute global squeeze)
+
+### Idea
+Groups mode only glued the small `tissue_inner`/`tissue_bone` fascia groups to
+their nearest muscle vert (~4252 pairs, ~14297 freed muscle verts), so the
+global mean-radius metric averaged the local squeeze over ~119482 surface verts
+and diluted it ~8x. Surface mode (`fascia_glue_mode: "surface"`) instead builds
+glue pairs from the MUSCLE side: a cKDTree over ALL fascia verts is queried with
+every muscle `surface_points` vertex, producing one glue pair per surface vert.
+
+- `glue_muscle = surface_points` (119482 global muscle ids)
+- `glue_fascia = nearest fascia LOCAL id` (offset by nvm in `build_merged_state`)
+- `glue_restlen = min(fascia_glue_target_distance=0.01, d)`
+- `glue_stiff = mean(tissuetomusclestiffness) * fascia_glue_stiffness_scale`
+- free-set dilation, soft-pin and surface-tet softening reused unchanged.
+
+Also fixed the in-code default `fascia_glue_stiffness_scale` 100.0 -> 0.001
+(the validated stable value).
+
+### Stability
+At the Task 9 settings (`fascia_glue_iterations=10`, `fascia_soft_pin=0.5`)
+surface mode DIVERGES (NaN) — a single frame survives but 30 frames blow up
+(first NaN ~frame 7-15). Cause: nearly the whole surface is now freed
+(157070/157369 verts), so almost no muscle vert has a hard bone pin; with too
+many glue iters / too weak a soft-pin the freed verts drift when the per-frame
+bone target jumps. Lowering soft-pin made it WORSE (the bone tie is what holds
+them). Sweep result: stable at `fascia_glue_iterations=2`, `fascia_soft_pin=0.7`
+(fr=1). `soft_pin=0.6/fr=1` blew up to radius~1810 (finite but garbage), so 0.7
+is the chosen value with margin; iters reduced 10 -> 2.
+
+### Final settings used (humanV2_fascia.json)
+`fascia_glue_mode=surface`, `fascia_glue_target_distance=0.01`,
+`fascia_glue_iterations=2` (was 10), `fascia_soft_pin=0.7` (was 0.5),
+`fascia_free_ring=1`, `fascia_surface_mu=1e5`,
+`fascia_glue_stiffness_scale=0.001`, `fascia_rest_scale` 0.95 (ON) / 1.0 (OFF).
+**n_glue = 119482** (was 4252). **Freed = 157070 / 157369 muscle verts**
+(was 14297). 299 pins still active.
+
+### Results (RTX 4090, cuda:0, 30 frames, no NaN/Inf)
+Official `tools/fascia_validate.py`, mean radius over all 119482 surface verts:
+
+| quantity                | groups (task 9) | surface (task 10) |
+|-------------------------|-----------------|-------------------|
+| mean surface radius OFF | 0.145614        | 0.145668          |
+| mean surface radius ON  | 0.145609        | 0.145637          |
+| percent change          | **-0.004%**     | **-0.021%**       |
+| fascia self-squeeze     | -2.46%          | -0.88%            |
+| mean fascia disp OFF->ON| -               | 0.001900          |
+| total runtime           | 51.8 s          | 69.4 s            |
+
+### Verdict
+Surface mode un-dilutes the global metric ~5x: **-0.021%** vs the groups-mode
+**-0.004%**, reproducible across reruns, stable over 30 frames, no NaN. The
+fascia's own self-squeeze drops (−2.46% -> −0.88%) because gluing the entire
+soft, freed muscle surface to the fascia now loads the fascia and resists its
+contraction — the squeeze is genuinely transferred to the muscle rather than
+spent shrinking only the fascia. So it is meaningfully larger but still small
+in absolute terms (0.02%): the glue stiffness is still stability-capped by the
+ultra-light freed surface verts in the Jacobi/PBD glue solve. Raising it further
+needs the same fix flagged in Task 9 (graph-colored Gauss-Seidel glue or mass
+lumping on freed verts), not more parameter tuning.
