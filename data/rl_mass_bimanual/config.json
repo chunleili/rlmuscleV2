@@ -9,8 +9,8 @@
         "w_q": 0.85,
         "w_v": 0.15
     },
-    "pose_error_threshold": 5.0,
-    "muscle_force_scale": 16.0,
+    "pose_error_threshold": 50.0,
+    "muscle_force_scale": 1.0,
     "spd": {
         "kp": 20.0
     }
