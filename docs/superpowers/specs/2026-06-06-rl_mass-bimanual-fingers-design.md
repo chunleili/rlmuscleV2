@@ -125,6 +125,25 @@ humanoid/DART/BVH path so walk/dance keep working. Selected by a config flag
 - **Contacts:** confirm bimanual model needs no special contact handling for
   imitation (anchored arms, minimal contact).
 
+## Update (2026-06-06): constraint-dependent DOFs excluded
+
+Implementation surfaced that MyoBimanualArm encodes the **scapulohumeral
+rhythm** via 22 `mjEQ_JOINT` equality constraints: 22 shoulder-girdle DOFs
+(sternoclavicular, unrotscap, acromioclavicular, unrothum, shoulder1 — both
+sides) are slaved to `shoulder_elv`/`elv_angle`. These DOFs are driven by
+MuJoCo's constraint forces, not muscles, so the muscle moment matrix `L` is
+only rank 64 over the 76 DOFs and SPD demands torque on 22 unspannable
+directions (Task-7 conditioning gate: residual 0.81).
+
+Resolution (chosen by user): exclude the 22 constraint-dependent DOFs from the
+muscle-tuple target and the action space — mirroring how rl_mass excludes the
+unactuated root DOFs. `BimanualEnv` computes `active_dof` (54 independent DOFs)
+from the `mjEQ_JOINT` constraints' dependent joints; the policy action and
+`tau_des`/`L`/`b` operate on those 54. `JtA` stays full (input feature, not a
+target). On the 54 independent DOFs the basis is full rank and the
+torque-matching LS residual is **0.0**. Reward still tracks all 76 qpos (the
+dependent DOFs follow their drivers). `num_action` = 54.
+
 ## Non-Goals (v1)
 
 - Full-body (MyoFullBody) skeleton.
