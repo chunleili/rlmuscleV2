@@ -62,3 +62,40 @@ def test_free_tet_contracts_to_scale():
 
     v = _tet_volume(pos.numpy())
     np.testing.assert_allclose(v, (0.5 ** 3) * (1.0 / 6.0), rtol=0.05)
+
+
+def _run_glue(pos_np, pair_i, pair_j, restlen, inv_mass_np, stiff=1.0e6, iters=500):
+    from muscle.coupleOneWayGmg.solver import solve_glue_kernel
+    pos = wp.array(pos_np.astype(np.float32), dtype=wp.vec3)
+    pi = wp.array(np.asarray(pair_i, np.int32), dtype=wp.int32)
+    pj = wp.array(np.asarray(pair_j, np.int32), dtype=wp.int32)
+    rl = wp.array(np.asarray(restlen, np.float32), dtype=wp.float32)
+    comp = wp.array((1.0 / np.asarray(stiff, np.float32) * np.ones(len(pair_i))).astype(np.float32),
+                    dtype=wp.float32)
+    L = wp.zeros(len(pair_i), dtype=wp.float32)
+    inv_mass = wp.array(inv_mass_np.astype(np.float32), dtype=wp.float32)
+    dt = 0.004166
+    for _ in range(iters):
+        L.zero_()
+        wp.launch(solve_glue_kernel, dim=len(pair_i),
+                  inputs=[pi, pj, rl, comp, inv_mass, L, dt, 1.0, pos])
+    wp.synchronize()
+    return pos.numpy()
+
+
+def test_glue_pulls_to_restlen_symmetric():
+    """Equal masses -> both move equally, final distance == restlen, midpoint fixed."""
+    pos_np = np.array([[0, 0, 0], [1, 0, 0]], dtype=np.float32)
+    out = _run_glue(pos_np, [0], [1], [0.2], np.array([1.0, 1.0]))
+    d = np.linalg.norm(out[0] - out[1])
+    np.testing.assert_allclose(d, 0.2, rtol=0.02)
+    np.testing.assert_allclose((out[0] + out[1]) / 2.0, [0.5, 0, 0], atol=1e-3)
+
+
+def test_glue_mass_weighted_split():
+    """Lighter particle (larger inv_mass) moves farther, in inv_mass ratio."""
+    pos_np = np.array([[0, 0, 0], [1, 0, 0]], dtype=np.float32)
+    out = _run_glue(pos_np, [0], [1], [0.0], np.array([2.0, 1.0]))
+    disp_i = np.linalg.norm(out[0] - pos_np[0])
+    disp_j = np.linalg.norm(out[1] - pos_np[1])
+    np.testing.assert_allclose(disp_i / disp_j, 2.0, rtol=0.05)

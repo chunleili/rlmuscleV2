@@ -204,6 +204,41 @@ def pintotarget_overwrite_kernel(
 
 
 @wp.kernel
+def solve_glue_kernel(
+    pair_i: wp.array(dtype=wp.int32),    # fascia vertex (unique per pair)
+    pair_j: wp.array(dtype=wp.int32),    # muscle vertex (may repeat across pairs)
+    restlen: wp.array(dtype=wp.float32),
+    compliance: wp.array(dtype=wp.float32),  # 1/stiffness
+    inv_mass: wp.array(dtype=wp.float32),
+    L: wp.array(dtype=wp.float32),
+    dt: float,
+    omega: float,
+    pos: wp.array(dtype=wp.vec3),
+):
+    """XPBD two-way distance constraint between pos[pair_i] and pos[pair_j]."""
+    c = wp.tid()
+    i = pair_i[c]
+    j = pair_j[c]
+    n = pos[i] - pos[j]
+    d = wp.length(n)
+    if d < 1.0e-9:
+        return
+    dirn = n / d
+    C = d - restlen[c]
+    wi = inv_mass[i]
+    wj = inv_mass[j]
+    alpha_tilde = compliance[c] / (dt * dt)
+    denom = wi + wj + alpha_tilde
+    if denom < 1.0e-12:
+        return
+    dlambda = -(C + alpha_tilde * L[c]) / denom
+    L[c] = L[c] + dlambda
+    f = omega * dlambda
+    wp.atomic_add(pos, i, (f * wi) * dirn)
+    wp.atomic_add(pos, j, (-f * wj) * dirn)
+
+
+@wp.kernel
 def compute_barycentric_kernel(
     query_pos: wp.array(dtype=wp.vec3),
     cage_pos: wp.array(dtype=wp.vec3),
