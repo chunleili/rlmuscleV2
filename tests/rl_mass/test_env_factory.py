@@ -12,11 +12,11 @@ def main():
     assert isinstance(env, BimanualEnv)
 
     vec = make_vec_env(CFG, num_envs=2, mode="serial")
-    assert vec.num_action == 76
+    assert vec.num_action == 54
     assert vec.num_muscles == 126
     states = vec.get_states()
     assert states.shape == (2, 153), states.shape
-    vec.set_actions(np.zeros((2, 76)))
+    vec.set_actions(np.zeros((2, 54)))
     vec.set_activation_levels(np.zeros((2, 126)))
     vec.steps_at_once()
     tuples = vec.gather_muscle_tuples()

@@ -7,7 +7,7 @@ CFG = "data/rl_mass_bimanual/config.json"
 
 def main():
     env = BimanualEnv(CFG)
-    assert env.num_action == 76, env.num_action
+    assert env.num_action == 54, env.num_action
     assert env.num_muscles == 126, env.num_muscles
     assert env.use_muscle is True
     assert env.num_state == 153, env.num_state
@@ -24,13 +24,13 @@ def main():
     env.steps_at_once()
     assert len(env.muscle_tuples) >= 1
     mt = env.muscle_tuples[-1]
-    assert mt.L.shape == (76 * 126,), mt.L.shape
-    assert mt.b.shape == (76,), mt.b.shape
-    assert mt.tau_des.shape == (76,), mt.tau_des.shape
+    assert mt.L.shape == (54 * 126,), mt.L.shape
+    assert mt.b.shape == (54,), mt.b.shape
+    assert mt.tau_des.shape == (54,), mt.tau_des.shape
     assert mt.JtA.shape == (env.num_total_related_dofs,), mt.JtA.shape
 
     dt = env.get_desired_torques()
-    assert dt.shape == (76,), dt.shape
+    assert dt.shape == (54,), dt.shape
     mtq = env.get_muscle_torques()
     assert mtq.shape == (env.num_total_related_dofs,), mtq.shape
     assert not env.is_end_of_episode()

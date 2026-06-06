@@ -49,7 +49,21 @@ class BimanualEnv:
         self.data = self.engine.data
 
         self.nv = self.engine.nv
-        self.num_action_: int = self.nv  # all DOFs active (no root)
+        # Constraint-dependent DOFs (scapulohumeral rhythm): 22 shoulder-girdle
+        # joints are slaved to shoulder_elv via mjEQ_JOINT equality constraints.
+        # Muscles cannot drive them — MuJoCo's constraint forces do — so they are
+        # excluded from the muscle-tuple target and the action space, exactly as
+        # rl_mass excludes the unactuated root DOFs. On the remaining independent
+        # DOFs the muscle moment matrix is full rank (validated: LS residual 0).
+        dep_dofs = set()
+        for i in range(self.model.neq):
+            if int(self.model.eq_type[i]) == int(mujoco.mjtEq.mjEQ_JOINT):
+                jid = int(self.model.eq_obj1id[i])
+                dep_dofs.add(int(self.model.jnt_dofadr[jid]))
+        self.active_dof = np.array(
+            [d for d in range(self.nv) if d not in dep_dofs], dtype=np.intp
+        )
+        self.num_action_: int = int(self.active_dof.size)  # independent DOFs
         self.action = np.zeros(self.num_action_, dtype=np.float64)
 
         self.ref = TrajectoryRef(cfg["trajectory_file"], nq=self.engine.nq)
@@ -129,9 +143,10 @@ class BimanualEnv:
 
     def get_desired_torques(self) -> np.ndarray:
         q_des = self.target_q.copy()
-        q_des += self.action  # offset target (all DOFs, no root)
-        self.desired_torque = native_spd_forces(self.engine, q_des, self.kp, self.kv)
-        return self.desired_torque
+        q_des[self.active_dof] += self.action  # offset independent-DOF targets
+        tau = native_spd_forces(self.engine, q_des, self.kp, self.kv)
+        self.desired_torque = tau  # full nv (used by the non-muscle qfrc path)
+        return tau[self.active_dof]  # SPD target on independent DOFs only
 
     def get_muscle_torques(self) -> np.ndarray:
         return self.muscle_system.get_muscle_torques(self.engine)
@@ -160,13 +175,17 @@ class BimanualEnv:
             self.step()
 
     def _collect_muscle_tuple(self) -> None:
-        # tau_des from SPD at the current pose (also caches self.desired_torque).
-        tau_des = self.get_desired_torques()
+        # tau_des on the independent DOFs (also caches the full self.desired_torque).
+        tau_des = self.get_desired_torques()  # (num_action,)
         L, b, JtA = self.muscle_system.tuple_terms(self.engine, self.activation_levels)
+        # L and b are full (nv, ...); slice to independent DOFs so the MuscleNN
+        # target (tau_des) and the moment matrix L agree on the 54-DOF space.
+        # JtA (per-muscle related-DOF moments) stays full — it is an input feature,
+        # not a target, mirroring how rl_mass keeps root rows in JtA but not in L.
         self.current_muscle_tuple = MuscleTuple(
             JtA=JtA.copy(),
-            L=L.ravel().copy(),
-            b=b.copy(),
+            L=L[self.active_dof].ravel().copy(),
+            b=b[self.active_dof].copy(),
             tau_des=tau_des.copy(),
         )
         self.muscle_tuples.append(self.current_muscle_tuple)
