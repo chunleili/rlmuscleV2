@@ -92,9 +92,9 @@ class SerialVecEnv(MassVecEnv):
     """In-process serial implementation. Used for debug and bit-level regression."""
 
     def __init__(self, config_path: str, num_envs: int):
-        from rl_mass.env import MassEnv
+        from rl_mass.env_factory import make_env
 
-        self.envs = [MassEnv(config_path) for _ in range(num_envs)]
+        self.envs = [make_env(config_path) for _ in range(num_envs)]
         e0 = self.envs[0]
         self.num_envs = num_envs
         self.num_state = e0.num_state
@@ -193,9 +193,9 @@ def _worker_loop(child_conn, config_path: str, base_seed: int, worker_id: int):
     torch.manual_seed(worker_seed)
     torch.set_num_threads(1)
 
-    from rl_mass.env import MassEnv
+    from rl_mass.env_factory import make_env
 
-    env = MassEnv(config_path)
+    env = make_env(config_path)
 
     # Worker-side MuscleNN, constructed lazily on first update_muscle_nn.
     muscle_nn = None
