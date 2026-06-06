@@ -239,6 +239,18 @@ def solve_glue_kernel(
 
 
 @wp.kernel
+def fascia_anchor_kernel(
+    anchor_fascia: wp.array(dtype=wp.int32),
+    anchor_muscle: wp.array(dtype=wp.int32),
+    rest_offset: wp.array(dtype=wp.vec3),
+    pos: wp.array(dtype=wp.vec3),
+):
+    """pos[anchor_fascia[i]] = pos[anchor_muscle[i]] + rest_offset[i]."""
+    i = wp.tid()
+    pos[anchor_fascia[i]] = pos[anchor_muscle[i]] + rest_offset[i]
+
+
+@wp.kernel
 def compute_barycentric_kernel(
     query_pos: wp.array(dtype=wp.vec3),
     cage_pos: wp.array(dtype=wp.vec3),

@@ -99,3 +99,16 @@ def test_glue_mass_weighted_split():
     disp_i = np.linalg.norm(out[0] - pos_np[0])
     disp_j = np.linalg.norm(out[1] - pos_np[1])
     np.testing.assert_allclose(disp_i / disp_j, 2.0, rtol=0.05)
+
+
+def test_anchor_follows_bound_muscle_vertex():
+    from muscle.coupleOneWayGmg.solver import fascia_anchor_kernel
+    # pos: [muscle0, muscle1, fascia0]; fascia0 anchored to muscle1 with offset (0,0.1,0)
+    pos = wp.array(np.array([[0, 0, 0], [2, 0, 0], [9, 9, 9]], dtype=np.float32), dtype=wp.vec3)
+    anchor_fascia = wp.array(np.array([2], dtype=np.int32), dtype=wp.int32)
+    anchor_muscle = wp.array(np.array([1], dtype=np.int32), dtype=wp.int32)
+    rest_offset = wp.array(np.array([[0, 0.1, 0]], dtype=np.float32), dtype=wp.vec3)
+    wp.launch(fascia_anchor_kernel, dim=1,
+              inputs=[anchor_fascia, anchor_muscle, rest_offset, pos])
+    wp.synchronize()
+    np.testing.assert_allclose(pos.numpy()[2], [2, 0.1, 0], atol=1e-6)
