@@ -21,7 +21,8 @@ from __future__ import annotations
 import numpy as np
 
 from rl_mass.engine import MuJoCoEngine
-from rl_mass.muscle import g_al, g_pl
+# Hill force-length curves are inlined (vectorized) in update(); they mirror
+# g_al / g_pl in rl_mass.muscle — keep the constants in sync if those change.
 
 
 class TendonMuscleSystem:
@@ -56,8 +57,16 @@ class TendonMuscleSystem:
         engine.forward()
         self._densify_moment(engine)
         R_rest = -self._moment_dense.T  # (nv, nu)
+        # Related DOFs = DOFs a muscle's tendon path structurally depends on.
+        # Computed ONCE at rest pose; num_total_related_dofs must stay fixed
+        # (it sizes the MuscleNN JtA input). A wrapped spatial tendon has a
+        # continuous moment function, so a structurally-spanned DOF is nonzero
+        # at virtually all poses incl. neutral — the 1e-6 m floor keeps those
+        # (important for small-moment-arm finger joints) while excluding pure
+        # numerical noise. If a future motion needs a DOF that is exactly zero
+        # at rest, build this union over several sampled reference poses instead.
         self.related_dof_indices = [
-            np.where(np.abs(R_rest[:, m]) > 1e-3)[0].astype(np.intp)
+            np.where(np.abs(R_rest[:, m]) > 1e-6)[0].astype(np.intp)
             for m in range(self.n_muscles)
         ]
         self.num_related_dofs = [int(idx.size) for idx in self.related_dof_indices]
@@ -76,7 +85,11 @@ class TendonMuscleSystem:
         self._densify_moment(engine)
         self.R[:] = -self._moment_dense.T  # (nv, nu)
 
-        al = d.actuator_length.copy()
+        al = d.actuator_length
+        # Normalized fiber length via MuJoCo's operating range. NOT clamped:
+        # poses outside [LR0, LR1] yield l_m_norm outside the [rng0, rng1]
+        # band, and g_al naturally decays there — that decay is the intended
+        # force-length behavior (see Task 7 conditioning gate).
         self.l_m_norm[:] = self._rng0 + (al - self._LR[:, 0]) / self._L0
         # Vectorized g_al / g_pl (same math as rl_mass.muscle).
         x = self.l_m_norm
@@ -87,7 +100,14 @@ class TendonMuscleSystem:
         self.f_passive[:] = self.f0 * fp
 
     def apply_forces(self, engine: MuJoCoEngine, activations: np.ndarray) -> None:
-        """Set qfrc_applied from current R and the given activations."""
+        """Set qfrc_applied from current R and the given activations.
+
+        CONTRACT: assumes update() was already called this substep (uses the
+        cached R / f_active / f_passive). Unlike get_muscle_torques and
+        tuple_terms, this does NOT self-update — the env's step() calls
+        update() right before apply_forces() every substep, and re-updating
+        here would double-compute the dense moment in the hot loop.
+        """
         a = np.asarray(activations, dtype=np.float64).ravel()
         muscle_force = self.f_active * a + self.f_passive  # (nu,)
         qfrc = self.R @ muscle_force                       # (nv,)
