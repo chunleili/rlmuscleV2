@@ -53,6 +53,46 @@ def precompute_rest_kernel(
 
 
 @wp.kernel
+def precompute_rest_scaled_kernel(
+    pos_rest: wp.array(dtype=wp.vec3),
+    tet_indices: wp.array(dtype=wp.vec4i),
+    scale: wp.array(dtype=wp.float32),      # per-tet shrink factor (1.0 = no shrink)
+    stiffness: wp.array(dtype=wp.float32),  # per-tet ARAP stiffness (muscle: mu; fascia: solidshapestiffness)
+    B: wp.array(dtype=wp.mat33),
+    rest_volume: wp.array(dtype=wp.float32),
+    alpha: wp.array(dtype=wp.float32),
+):
+    """Like precompute_rest_kernel but per-tet: B = inv(scale*Dm),
+    rest_volume from UNSCALED Dm (physical mass), alpha = 1/(stiffness*V0)."""
+    t = wp.tid()
+    idx = tet_indices[t]
+    x0 = pos_rest[idx[0]]
+    x1 = pos_rest[idx[1]]
+    x2 = pos_rest[idx[2]]
+    x3 = pos_rest[idx[3]]
+    e1 = x1 - x0
+    e2 = x2 - x0
+    e3 = x3 - x0
+    Dm = wp.mat33(
+        e1[0], e2[0], e3[0],
+        e1[1], e2[1], e3[1],
+        e1[2], e2[2], e3[2],
+    )
+    det = wp.determinant(Dm)
+    V0 = wp.abs(det) / 6.0
+    s = scale[t]
+    Dm_s = wp.mat33(
+        s * e1[0], s * e2[0], s * e3[0],
+        s * e1[1], s * e2[1], s * e3[1],
+        s * e1[2], s * e2[2], s * e3[2],
+    )
+    B[t] = wp.inverse(Dm_s)
+    rest_volume[t] = V0
+    k = stiffness[t]
+    alpha[t] = 1.0 / (k * V0)
+
+
+@wp.kernel
 def arap_svd_kernel(
     pos_mid: wp.array(dtype=wp.vec3),
     tet_indices: wp.array(dtype=wp.vec4i),
