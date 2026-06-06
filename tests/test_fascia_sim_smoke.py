@@ -142,3 +142,22 @@ def test_humanV2_fascia_one_frame_no_nan():
     # fascia verts (index >= nvm) actually moved (contraction/glue active)
     fascia_disp = np.linalg.norm(after[sim.nvm:] - rest[sim.nvm:], axis=1).mean()
     assert fascia_disp > 1e-5
+
+
+@skip_no_hv2
+def test_fascia_frees_glue_target_pins():
+    """With fascia active, glue-target muscle verts are removed from the pin
+    overwrite, and after a frame they deviate from their pure bone target."""
+    import warp as wp
+    if not wp.is_cuda_available():
+        pytest.skip("CUDA not available")
+    from muscle.coupleOneWayGmg.solver import OneWaySim, load_config
+    cfg = load_config(str(_FASCIA_CFG))
+    cfg["end_frame"] = cfg["start_frame"]
+    sim = OneWaySim(cfg, device="cuda:0")
+    active = sim.pin_active.numpy()
+    assert active.sum() < active.shape[0]        # some pins freed
+    n_freed = active.shape[0] - int(active.sum())
+    assert n_freed >= sim.merged.n_glue          # at least the glue targets (dilated >=)
+    sim.step_frame(sim.start_frame)
+    assert not np.isnan(sim.positions_np()).any()

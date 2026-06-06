@@ -210,6 +210,51 @@ def pintotarget_overwrite_kernel(
 
 
 @wp.kernel
+def pintotarget_overwrite_masked_kernel(
+    pts: wp.array(dtype=wp.int32),
+    target_pos: wp.array(dtype=wp.vec3),
+    rest_offset: wp.array(dtype=wp.vec3),
+    active: wp.array(dtype=wp.int32),     # 1 = apply pin, 0 = skip (freed vert)
+    pos: wp.array(dtype=wp.vec3),
+):
+    """Like pintotarget_overwrite_kernel but skips verts whose pin is freed.
+
+    Used when fascia is active: muscle verts the fascia glues to (plus a
+    dilated 1-ring) are freed (active==0) so the two-way glue can pull them
+    inward instead of being hard-overwritten back to the bone target.
+    """
+    i = wp.tid()
+    if active[i] == 0:
+        return
+    pos[pts[i]] = target_pos[i] + rest_offset[i]
+
+
+@wp.kernel
+def pintotarget_soft_kernel(
+    pts: wp.array(dtype=wp.int32),
+    target_pos: wp.array(dtype=wp.vec3),
+    rest_offset: wp.array(dtype=wp.vec3),
+    active: wp.array(dtype=wp.int32),     # 0 = freed vert (gets soft pull), 1 = skip
+    stiffness: float,                     # in [0,1]: fraction toward bone target / substep
+    pos: wp.array(dtype=wp.vec3),
+):
+    """Soft pin for FREED verts: blend pos toward the bone target.
+
+    Freed verts (active==0) are not hard-overwritten by the masked pin, so
+    they can yield to the fascia glue. But without any tie to the bone they
+    drift catastrophically when the per-frame target jumps. This soft pull
+    (a PBD-style partial step toward target) lets them track gross body
+    motion while still yielding inward to the fascia squeeze.
+    """
+    i = wp.tid()
+    if active[i] != 0:
+        return
+    pid = pts[i]
+    tgt = target_pos[i] + rest_offset[i]
+    pos[pid] = pos[pid] + stiffness * (tgt - pos[pid])
+
+
+@wp.kernel
 def solve_glue_kernel(
     pair_i: wp.array(dtype=wp.int32),    # fascia vertex (unique per pair)
     pair_j: wp.array(dtype=wp.int32),    # muscle vertex (may repeat across pairs)
@@ -557,6 +602,11 @@ class OneWaySim:
             self.fascia_path = str(Path.cwd() / self.fascia_path)
         self.fascia_rest_scale = float(cfg.get("fascia_rest_scale", 0.95))
         self.fascia_glue_iters = int(cfg.get("fascia_glue_iterations", self.fine_iters))
+        # Soft-pin stiffness for FREED muscle verts (fraction toward bone target
+        # per substep). Keeps freed verts tracking gross body motion so they
+        # don't tear loose when the per-frame target jumps, while still letting
+        # the fascia glue pull them inward. 0 disables (pure free).
+        self.fascia_soft_pin = float(cfg.get("fascia_soft_pin", 0.5))
         self.dt = self.dt_frame / self.nsubsteps
         self.end_frame = int(cfg.get("end_frame", 90))
         self.start_frame = int(cfg.get("start_frame", 1))
@@ -610,6 +660,8 @@ class OneWaySim:
         cons0 = GeoFile(cons0_path)
         self.NCONS = int(cons0.pts.shape[0])
         self.pts = wp.array(cons0.pts, dtype=wp.int32, device=device)
+        self._pin_pts_np = np.asarray(cons0.pts, dtype=np.int64)
+        self.pin_active = None  # set by _init_fascia when fascia is active
         rest_offset_np = (rest.positions[cons0.pts] - cons0.target_pos).astype(np.float32)
         self.rest_offset = wp.array(rest_offset_np, dtype=wp.vec3, device=device)
         self.target_pos = wp.array(cons0.target_pos.copy(), dtype=wp.vec3, device=device)
@@ -676,17 +728,57 @@ class OneWaySim:
                  f"glue pairs={len(glue_fascia)} (inner={len(gi_f)}, bone={len(gb_f)}); "
                  f"anchors={len(anchor_fascia)}; rest_scale={self.fascia_rest_scale}")
 
+        # --- Free the muscle verts the fascia glues to (+dilated ring) from the
+        # pin overwrite, and soften the surface muscle tets so the glue can pull
+        # them inward. See Task 9. ---
+        free_ring = int(self.cfg.get("fascia_free_ring", 1))
+        surface_mu = float(self.cfg.get("fascia_surface_mu", 1.0e5))
+        glue_scale = float(self.cfg.get("fascia_glue_stiffness_scale", 100.0))
+
+        muscle_tet = mrest.tet_indices  # (nt_m, 4)
+        nvm = rest_muscle_pos.shape[0]
+        free_mask = np.zeros(nvm, dtype=bool)
+        seed = np.unique(glue_muscle.astype(np.int64))
+        free_mask[seed[(seed >= 0) & (seed < nvm)]] = True
+        # Dilate by `free_ring` rings via muscle-tet adjacency.
+        if free_ring > 0:
+            from collections import defaultdict
+            v2t = defaultdict(list)
+            for ti, tet in enumerate(muscle_tet):
+                for v in tet:
+                    v2t[int(v)].append(ti)
+            for _ in range(free_ring):
+                cur = np.where(free_mask)[0]
+                for v in cur:
+                    for ti in v2t[int(v)]:
+                        for w in muscle_tet[ti]:
+                            free_mask[int(w)] = True
+        free_ids = np.where(free_mask)[0].astype(np.int32)
+
+        # Per-muscle-tet stiffness: soft where a tet touches a freed vert.
+        muscle_stiff = np.full(muscle_tet.shape[0], self.mu, dtype=np.float32)
+        tet_touches_free = free_mask[muscle_tet].any(axis=1)
+        muscle_stiff[tet_touches_free] = surface_mu
+
         self.nvm = rest_muscle_pos.shape[0]
         self.merged = build_merged_state(
             muscle_pos=rest_muscle_pos, muscle_tet=mrest.tet_indices,
             fascia_pos=fascia_pos, fascia_tet=fascia_tet,
             fascia_rest_scale=self.fascia_rest_scale,
-            muscle_stiffness=self.mu,
+            muscle_stiffness=muscle_stiff,
             fascia_stiffness=float(fg.point_attr("solidshapestiffness").mean()),
             glue_fascia=glue_fascia, glue_muscle=glue_muscle,
-            glue_restlen=glue_restlen, glue_stiffness=glue_stiff,
+            glue_restlen=glue_restlen, glue_stiffness=glue_stiff * glue_scale,
             anchor_fascia=anchor_fascia, anchor_muscle=anchor_muscle,
             total_mass=self.total_mass, device=self._device)
+
+        # Build the pin_active mask over the existing pin pts: free verts in free_ids.
+        active = np.ones(self._pin_pts_np.shape[0], dtype=np.int32)
+        active[np.isin(self._pin_pts_np, free_ids)] = 0
+        self.pin_active = wp.array(active, dtype=wp.int32, device=self._device)
+        log.info(f"fascia: freed {len(free_ids)} muscle verts from pin "
+                 f"(ring={free_ring}); {int(active.sum())}/{len(active)} pins active; "
+                 f"surface_mu={surface_mu}, glue_scale={glue_scale}")
         self.pos = self.merged.pos
         self.pos_mid = self.merged.pos_mid
         self.tet_idx = self.merged.tet_idx
@@ -777,12 +869,32 @@ class OneWaySim:
         self.target_pos.assign(targets)
 
     def apply_pintotarget(self) -> None:
-        wp.launch(
-            pintotarget_overwrite_kernel,
-            dim=self.NCONS,
-            inputs=[self.pts, self.target_pos, self.rest_offset, self.pos],
-            device=self._device,
-        )
+        if getattr(self, "pin_active", None) is not None:
+            wp.launch(
+                pintotarget_overwrite_masked_kernel,
+                dim=self.NCONS,
+                inputs=[self.pts, self.target_pos, self.rest_offset,
+                        self.pin_active, self.pos],
+                device=self._device,
+            )
+            # Soft-pull the freed verts toward their bone target so they track
+            # gross body motion (per-frame target jumps) while still yielding
+            # inward to the fascia squeeze.
+            if self.fascia_soft_pin > 0.0:
+                wp.launch(
+                    pintotarget_soft_kernel,
+                    dim=self.NCONS,
+                    inputs=[self.pts, self.target_pos, self.rest_offset,
+                            self.pin_active, self.fascia_soft_pin, self.pos],
+                    device=self._device,
+                )
+        else:
+            wp.launch(
+                pintotarget_overwrite_kernel,
+                dim=self.NCONS,
+                inputs=[self.pts, self.target_pos, self.rest_offset, self.pos],
+                device=self._device,
+            )
 
     def substep(self) -> None:
         # quasi_static=true, no_gravity. Optional multigrid V-cycle:
