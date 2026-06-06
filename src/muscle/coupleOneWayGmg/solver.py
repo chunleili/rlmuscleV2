@@ -762,6 +762,13 @@ class OneWaySim:
         )
         wp.synchronize()
 
+        # Capture the MUSCLE-only fine vertex count for multigrid prolongation.
+        # _init_coarse runs before _init_fascia, so self.NV is still muscle-only
+        # here; _init_fascia later mutates self.NV to the merged total. The
+        # cage_idx/uvw maps only have this many entries, so prolong must launch
+        # with mg_fine_nv (not the merged self.NV) to stay in bounds.
+        self.mg_fine_nv = self.NV
+
     # ------------------------------------------------------------------
 
     def load_frame_targets(self, frame: int) -> None:
@@ -780,6 +787,7 @@ class OneWaySim:
     def substep(self) -> None:
         # quasi_static=true, no_gravity. Optional multigrid V-cycle:
         # restrict (dp) → coarse iters → prolong → fine iters.
+        has_fascia = getattr(self, "merged", None) is not None
         if self.use_multigrid:
             # Direct V-cycle: restrict fine→coarse, relax coarse, prolong
             # back, re-apply pin-to-target (prolong overwrites pinned verts).
@@ -804,12 +812,14 @@ class OneWaySim:
                 )
             wp.launch(
                 prolong_kernel,
-                dim=self.NV,
+                dim=getattr(self, "mg_fine_nv", self.NV),
                 inputs=[self.coarse_pos, self.coarse_tet_idx,
                         self.cage_idx, self.uvw, self.pos],
                 device=self._device,
             )
             self.apply_pintotarget()
+        if has_fascia:
+            apply_anchor(self.merged, self._device)
         self.L.zero_()
         for _ in range(self.fine_iters):
             wp.copy(self.pos_mid, self.pos)
@@ -821,10 +831,15 @@ class OneWaySim:
                         self.dt, self.omega, self.pos],
                 device=self._device,
             )
+        if has_fascia:
+            solve_glue(self.merged, self.dt, self.omega,
+                       self.fascia_glue_iters, self._device)
 
     def step_frame(self, frame: int) -> None:
         self.load_frame_targets(frame)
         self.apply_pintotarget()
+        if getattr(self, "merged", None) is not None:
+            apply_anchor(self.merged, self._device)
         for _ in range(self.nsubsteps):
             self.substep()
 

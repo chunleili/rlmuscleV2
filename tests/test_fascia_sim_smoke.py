@@ -62,3 +62,49 @@ def test_merged_state_handles_unreferenced_and_degenerate(monkeypatch):
     assert np.isfinite(state.B.numpy()).all()
     S.run_substeps(state, nsubsteps=10, fine_iters=2, glue_iters=2, dt=0.004166, omega=0.2)
     assert np.isfinite(state.pos.numpy()).all()
+
+
+def test_substep_runs_glue_when_fascia_present(monkeypatch):
+    """OneWaySim.substep applies glue iters when a merged state exists."""
+    import numpy as np
+    import warp as wp
+    from muscle.coupleOneWayGmg import solver as S
+
+    calls = {"glue": 0}
+    real_solve_glue = S.solve_glue
+
+    def spy(state, dt, omega, iters, device=None):
+        calls["glue"] += 1
+        return real_solve_glue(state, dt, omega, iters, device)
+
+    monkeypatch.setattr(S, "solve_glue", spy)
+
+    sim = S.OneWaySim.__new__(S.OneWaySim)
+    sim.use_multigrid = False
+    sim.fine_iters = 2
+    sim.fascia_glue_iters = 3
+    sim.dt = 0.004166
+    sim.omega = 0.2
+    sim._device = None
+    sim.merged = S.build_merged_state(
+        muscle_pos=np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], np.float32),
+        muscle_tet=np.array([[0, 1, 2, 3]], np.int32),
+        fascia_pos=np.array([[2, 0, 0], [3, 0, 0], [2, 1, 0], [2, 0, 1]], np.float32),
+        fascia_tet=np.array([[0, 1, 2, 3]], np.int32),
+        fascia_rest_scale=0.9, muscle_stiffness=1e9, fascia_stiffness=5000.0,
+        glue_fascia=np.array([0], np.int32), glue_muscle=np.array([1], np.int32),
+        glue_restlen=np.array([0.1], np.float32), glue_stiffness=np.array([1000.0], np.float32),
+        anchor_fascia=np.zeros(0, np.int32), anchor_muscle=np.zeros(0, np.int32),
+        total_mass=1.0, device=None)
+    sim.pos = sim.merged.pos
+    sim.pos_mid = sim.merged.pos_mid
+    sim.tet_idx = sim.merged.tet_idx
+    sim.B = sim.merged.B
+    sim.alpha = sim.merged.alpha
+    sim.L = sim.merged.L
+    sim.inv_mass = sim.merged.inv_mass
+    sim.NT = sim.merged.NT
+
+    sim.substep()
+    assert calls["glue"] == 1
+    assert not np.isnan(sim.pos.numpy()).any()
