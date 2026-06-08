@@ -23,6 +23,22 @@ def _pair_list_to_dict(pairs):
     return dict(zip(pairs[0::2], pairs[1::2]))
 
 
+def _decode_bool_rle(unordered) -> np.ndarray:
+    """Decode Houdini ['boolRLE', [count, bool, count, bool, ...]] to int32 indices."""
+    if not unordered or unordered[0] != "boolRLE":
+        return np.zeros(0, dtype=np.int32)
+    runs = unordered[1]
+    out = []
+    pos = 0
+    for k in range(0, len(runs), 2):
+        count = int(runs[k])
+        val = bool(runs[k + 1])
+        if val:
+            out.extend(range(pos, pos + count))
+        pos += count
+    return np.asarray(out, dtype=np.int32)
+
+
 class GeoFile:
     def __init__(self, path: str):
         with open(path, "r") as fp:
@@ -56,17 +72,55 @@ class GeoFile:
             elif name == "target_pos":
                 target_pos = np.asarray(values[5], dtype=np.float32)
 
+        # Generic named point-attribute capture.
+        self._attrs: dict[str, np.ndarray] = {}
+        for entry in pointattrs:
+            meta = _pair_list_to_dict(entry[0])
+            data = _pair_list_to_dict(entry[1])
+            name = meta["name"]
+            if "values" not in data:
+                continue
+            payload = np.asarray(data["values"][5])
+            if payload.ndim == 2 and payload.shape[0] == 1:   # scalar attr stored (1,NV)
+                payload = payload[0]
+            self._attrs[name] = payload
+
         # Topology / tet indices
         topo = _pair_list_to_dict(root["topology"])
         pointref = _pair_list_to_dict(topo["pointref"])
         indices = np.asarray(pointref["indices"], dtype=np.int32)
-        primitive_count = int(root.get("primitivecount", 0))
 
-        if primitive_count > 0 and indices.size:
-            verts_per_prim = indices.size // primitive_count
-            tet_indices = indices.reshape(primitive_count, verts_per_prim)
+        n_tets = 0
+        prims = root.get("primitives", [])
+        for blk in prims:
+            hdr = _pair_list_to_dict(blk[0])
+            if hdr.get("type") == "Tetrahedron_run":
+                body = _pair_list_to_dict(blk[1])
+                n_tets = int(body["nprimitives"])
+                break
+        if n_tets > 0:
+            tet_indices = indices[: n_tets * 4].reshape(n_tets, 4)
         else:
-            tet_indices = indices.reshape(0, 0)
+            primitive_count = int(root.get("primitivecount", 0))
+            if primitive_count > 0 and indices.size:
+                vpp = indices.size // primitive_count
+                tet_indices = indices.reshape(primitive_count, vpp)
+            else:
+                tet_indices = indices.reshape(0, 0)
+
+        # Point groups.
+        self._groups: dict[str, np.ndarray] = {}
+        for grp in root.get("pointgroups", []):
+            gmeta = _pair_list_to_dict(grp[0])
+            gsel = _pair_list_to_dict(grp[1])["selection"]
+            seld = _pair_list_to_dict(gsel)
+            if "ordered" in seld:
+                idx = np.asarray(seld["ordered"], dtype=np.int32)
+            elif "unordered" in seld:
+                idx = _decode_bool_rle(seld["unordered"])
+            else:
+                continue
+            self._groups[gmeta["name"]] = idx
 
         self._positions = positions
         self._tet_indices = tet_indices
@@ -104,6 +158,19 @@ class GeoFile:
         if self._target_pos is None:
             raise KeyError("attribute 'target_pos' not present in this .geo")
         return self._target_pos
+
+    def point_attr(self, name: str) -> np.ndarray:
+        if name not in self._attrs:
+            raise KeyError(f"point attribute '{name}' not in {sorted(self._attrs)}")
+        return self._attrs[name]
+
+    def has_point_attr(self, name: str) -> bool:
+        return name in self._attrs
+
+    def point_group(self, name: str) -> np.ndarray:
+        if name not in self._groups:
+            raise KeyError(f"point group '{name}' not in {sorted(self._groups)}")
+        return self._groups[name]
 
 
 def read_cons_frame(geo_dir: str, frame: int) -> np.ndarray:

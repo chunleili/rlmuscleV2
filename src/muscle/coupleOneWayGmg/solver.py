@@ -53,6 +53,52 @@ def precompute_rest_kernel(
 
 
 @wp.kernel
+def precompute_rest_scaled_kernel(
+    pos_rest: wp.array(dtype=wp.vec3),
+    tet_indices: wp.array(dtype=wp.vec4i),
+    scale: wp.array(dtype=wp.float32),      # per-tet shrink factor (1.0 = no shrink)
+    stiffness: wp.array(dtype=wp.float32),  # per-tet ARAP stiffness (muscle: mu; fascia: solidshapestiffness)
+    B: wp.array(dtype=wp.mat33),
+    rest_volume: wp.array(dtype=wp.float32),
+    alpha: wp.array(dtype=wp.float32),
+):
+    """Like precompute_rest_kernel but per-tet: B = inv(scale*Dm),
+    rest_volume from UNSCALED Dm (physical mass), alpha = 1/(stiffness*V0)."""
+    t = wp.tid()
+    idx = tet_indices[t]
+    x0 = pos_rest[idx[0]]
+    x1 = pos_rest[idx[1]]
+    x2 = pos_rest[idx[2]]
+    x3 = pos_rest[idx[3]]
+    e1 = x1 - x0
+    e2 = x2 - x0
+    e3 = x3 - x0
+    Dm = wp.mat33(
+        e1[0], e2[0], e3[0],
+        e1[1], e2[1], e3[1],
+        e1[2], e2[2], e3[2],
+    )
+    det = wp.determinant(Dm)
+    V0 = wp.abs(det) / 6.0
+    k = stiffness[t]
+    if V0 < 1.0e-12:
+        # Degenerate tet: make it inert (identity rest, no volume, stiff-inert).
+        B[t] = wp.identity(n=3, dtype=wp.float32)
+        rest_volume[t] = 0.0
+        alpha[t] = 1.0e20
+        return
+    s = scale[t]
+    Dm_s = wp.mat33(
+        s * e1[0], s * e2[0], s * e3[0],
+        s * e1[1], s * e2[1], s * e3[1],
+        s * e1[2], s * e2[2], s * e3[2],
+    )
+    B[t] = wp.inverse(Dm_s)
+    rest_volume[t] = V0
+    alpha[t] = 1.0 / (k * V0)
+
+
+@wp.kernel
 def arap_svd_kernel(
     pos_mid: wp.array(dtype=wp.vec3),
     tet_indices: wp.array(dtype=wp.vec4i),
@@ -161,6 +207,98 @@ def pintotarget_overwrite_kernel(
     i = wp.tid()
     pid = pts[i]
     pos[pid] = target_pos[i] + rest_offset[i]
+
+
+@wp.kernel
+def pintotarget_overwrite_masked_kernel(
+    pts: wp.array(dtype=wp.int32),
+    target_pos: wp.array(dtype=wp.vec3),
+    rest_offset: wp.array(dtype=wp.vec3),
+    active: wp.array(dtype=wp.int32),     # 1 = apply pin, 0 = skip (freed vert)
+    pos: wp.array(dtype=wp.vec3),
+):
+    """Like pintotarget_overwrite_kernel but skips verts whose pin is freed.
+
+    Used when fascia is active: muscle verts the fascia glues to (plus a
+    dilated 1-ring) are freed (active==0) so the two-way glue can pull them
+    inward instead of being hard-overwritten back to the bone target.
+    """
+    i = wp.tid()
+    if active[i] == 0:
+        return
+    pos[pts[i]] = target_pos[i] + rest_offset[i]
+
+
+@wp.kernel
+def pintotarget_soft_kernel(
+    pts: wp.array(dtype=wp.int32),
+    target_pos: wp.array(dtype=wp.vec3),
+    rest_offset: wp.array(dtype=wp.vec3),
+    active: wp.array(dtype=wp.int32),     # 0 = freed vert (gets soft pull), 1 = skip
+    stiffness: float,                     # in [0,1]: fraction toward bone target / substep
+    pos: wp.array(dtype=wp.vec3),
+):
+    """Soft pin for FREED verts: blend pos toward the bone target.
+
+    Freed verts (active==0) are not hard-overwritten by the masked pin, so
+    they can yield to the fascia glue. But without any tie to the bone they
+    drift catastrophically when the per-frame target jumps. This soft pull
+    (a PBD-style partial step toward target) lets them track gross body
+    motion while still yielding inward to the fascia squeeze.
+    """
+    i = wp.tid()
+    if active[i] != 0:
+        return
+    pid = pts[i]
+    tgt = target_pos[i] + rest_offset[i]
+    pos[pid] = pos[pid] + stiffness * (tgt - pos[pid])
+
+
+@wp.kernel
+def solve_glue_kernel(
+    pair_i: wp.array(dtype=wp.int32),    # fascia vertex (unique per pair)
+    pair_j: wp.array(dtype=wp.int32),    # muscle vertex (may repeat across pairs)
+    restlen: wp.array(dtype=wp.float32),
+    compliance: wp.array(dtype=wp.float32),  # 1/stiffness
+    inv_mass: wp.array(dtype=wp.float32),
+    L: wp.array(dtype=wp.float32),
+    dt: float,
+    omega: float,
+    pos: wp.array(dtype=wp.vec3),
+):
+    """XPBD two-way distance constraint between pos[pair_i] and pos[pair_j]."""
+    c = wp.tid()
+    i = pair_i[c]
+    j = pair_j[c]
+    n = pos[i] - pos[j]
+    d = wp.length(n)
+    if d < 1.0e-9:
+        return
+    dirn = n / d
+    C = d - restlen[c]
+    wi = inv_mass[i]
+    wj = inv_mass[j]
+    alpha_tilde = compliance[c] / (dt * dt)
+    denom = wi + wj + alpha_tilde
+    if denom < 1.0e-12:
+        return
+    dlambda = -(C + alpha_tilde * L[c]) / denom
+    L[c] = L[c] + dlambda
+    f = omega * dlambda
+    wp.atomic_add(pos, i, (f * wi) * dirn)
+    wp.atomic_add(pos, j, (-f * wj) * dirn)
+
+
+@wp.kernel
+def fascia_anchor_kernel(
+    anchor_fascia: wp.array(dtype=wp.int32),
+    anchor_muscle: wp.array(dtype=wp.int32),
+    rest_offset: wp.array(dtype=wp.vec3),
+    pos: wp.array(dtype=wp.vec3),
+):
+    """pos[anchor_fascia[i]] = pos[anchor_muscle[i]] + rest_offset[i]."""
+    i = wp.tid()
+    pos[anchor_fascia[i]] = pos[anchor_muscle[i]] + rest_offset[i]
 
 
 @wp.kernel
@@ -279,6 +417,7 @@ def prolong_kernel(
 # ─── Python-side class glue ────────────────────────────────────────────────
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -312,6 +451,131 @@ def _check_unzipped(path: str) -> None:
     raise FileNotFoundError(f"missing asset: {path}")
 
 
+@dataclass
+class MergedState:
+    pos: wp.array
+    pos_mid: wp.array
+    pos_rest: wp.array
+    tet_idx: wp.array
+    B: wp.array
+    rest_volume: wp.array
+    alpha: wp.array
+    L: wp.array
+    inv_mass: wp.array
+    NT: int
+    glue_fascia: wp.array
+    glue_muscle: wp.array
+    glue_restlen: wp.array
+    glue_compliance: wp.array
+    glue_L: wp.array
+    n_glue: int
+    anchor_fascia: wp.array
+    anchor_muscle: wp.array
+    anchor_offset: wp.array
+    n_anchor: int
+
+
+def build_merged_state(muscle_pos, muscle_tet, fascia_pos, fascia_tet,
+                       fascia_rest_scale, muscle_stiffness, fascia_stiffness,
+                       glue_fascia, glue_muscle, glue_restlen, glue_stiffness,
+                       anchor_fascia, anchor_muscle, total_mass, device):
+    """Concatenate muscle+fascia into one particle system and precompute rest.
+
+    glue_fascia/anchor_fascia are LOCAL fascia vertex indices (offset by muscle
+    vertex count here). glue_muscle/anchor_muscle are muscle indices.
+    """
+    nvm = muscle_pos.shape[0]
+    pos_np = np.vstack([muscle_pos, fascia_pos]).astype(np.float32)
+    tet_np = np.vstack([muscle_tet, fascia_tet + nvm]).astype(np.int32)
+    nt_m = muscle_tet.shape[0]
+    NT = tet_np.shape[0]
+    NV = pos_np.shape[0]
+
+    scale_np = np.ones(NT, dtype=np.float32)
+    scale_np[nt_m:] = fascia_rest_scale
+    stiff_np = np.empty(NT, dtype=np.float32)
+    stiff_np[:nt_m] = muscle_stiffness
+    stiff_np[nt_m:] = fascia_stiffness
+
+    pos = wp.array(pos_np, dtype=wp.vec3, device=device)
+    pos_mid = wp.clone(pos)
+    pos_rest = wp.array(pos_np.copy(), dtype=wp.vec3, device=device)
+    tet_idx = wp.array(tet_np, dtype=wp.vec4i, device=device)
+    B = wp.zeros(NT, dtype=wp.mat33, device=device)
+    rest_volume = wp.zeros(NT, dtype=wp.float32, device=device)
+    alpha = wp.zeros(NT, dtype=wp.float32, device=device)
+    L = wp.zeros(NT, dtype=wp.float32, device=device)
+    scale = wp.array(scale_np, dtype=wp.float32, device=device)
+    stiff = wp.array(stiff_np, dtype=wp.float32, device=device)
+    wp.launch(precompute_rest_scaled_kernel, dim=NT,
+              inputs=[pos_rest, tet_idx, scale, stiff, B, rest_volume, alpha],
+              device=device)
+
+    V0 = rest_volume.numpy()
+    density = total_mass / float(V0.sum())
+    mass_v = np.zeros(NV, dtype=np.float32)
+    per_tet_mass = density * V0 / 4.0
+    for k in range(4):
+        np.add.at(mass_v, tet_np[:, k], per_tet_mass)
+    inv_mass_np = np.where(mass_v > 0.0, 1.0 / np.maximum(mass_v, 1e-30), 0.0).astype(np.float32)
+    inv_mass = wp.array(inv_mass_np, dtype=wp.float32, device=device)
+
+    gf = (np.asarray(glue_fascia, np.int32) + nvm)
+    gm = np.asarray(glue_muscle, np.int32)
+    n_glue = len(gf)
+    af = (np.asarray(anchor_fascia, np.int32) + nvm)
+    am = np.asarray(anchor_muscle, np.int32)
+    offset_np = (pos_np[af] - pos_np[am]).astype(np.float32) if len(af) else np.zeros((0, 3), np.float32)
+
+    return MergedState(
+        pos=pos, pos_mid=pos_mid, pos_rest=pos_rest, tet_idx=tet_idx,
+        B=B, rest_volume=rest_volume, alpha=alpha, L=L, inv_mass=inv_mass, NT=NT,
+        glue_fascia=wp.array(gf, dtype=wp.int32, device=device),
+        glue_muscle=wp.array(gm, dtype=wp.int32, device=device),
+        glue_restlen=wp.array(np.asarray(glue_restlen, np.float32), dtype=wp.float32, device=device),
+        glue_compliance=wp.array((1.0 / np.asarray(glue_stiffness, np.float32)).astype(np.float32),
+                                 dtype=wp.float32, device=device),
+        glue_L=wp.zeros(max(n_glue, 1), dtype=wp.float32, device=device),
+        n_glue=n_glue,
+        anchor_fascia=wp.array(af, dtype=wp.int32, device=device),
+        anchor_muscle=wp.array(am, dtype=wp.int32, device=device),
+        anchor_offset=wp.array(offset_np, dtype=wp.vec3, device=device),
+        n_anchor=len(af),
+    )
+
+
+def apply_anchor(state, device=None):
+    if state.n_anchor:
+        wp.launch(fascia_anchor_kernel, dim=state.n_anchor,
+                  inputs=[state.anchor_fascia, state.anchor_muscle,
+                          state.anchor_offset, state.pos], device=device)
+
+
+def solve_glue(state, dt, omega, iters, device=None):
+    for _ in range(iters):
+        state.glue_L.zero_()
+        if state.n_glue:
+            wp.launch(solve_glue_kernel, dim=state.n_glue,
+                      inputs=[state.glue_fascia, state.glue_muscle,
+                              state.glue_restlen, state.glue_compliance,
+                              state.inv_mass, state.glue_L, dt, omega, state.pos],
+                      device=device)
+
+
+def run_substeps(state, nsubsteps, fine_iters, glue_iters, dt, omega, device=None):
+    """Standalone (no multigrid, no pin) loop — used by tests."""
+    for _ in range(nsubsteps):
+        apply_anchor(state, device)
+        state.L.zero_()
+        for _ in range(fine_iters):
+            wp.copy(state.pos_mid, state.pos)
+            wp.launch(arap_svd_kernel, dim=state.NT,
+                      inputs=[state.pos_mid, state.tet_idx, state.B,
+                              state.inv_mass, state.alpha, state.L, dt, omega, state.pos],
+                      device=device)
+        solve_glue(state, dt, omega, glue_iters, device)
+
+
 class OneWaySim:
     """Per-frame ARAP-HPBD driver for the pin-to-target workflow.
 
@@ -333,6 +597,21 @@ class OneWaySim:
         self.geo_dir = str(cfg["geo_dir"])
         self.cons_dir = str(cfg.get("cons_dir", self.geo_dir))
         self.rest_path = str(cfg.get("rest_path", str(Path(self.geo_dir) / "restpos.geo")))
+        # Master switch. When False the fascia layer is fully disabled and the
+        # solver is byte-for-byte the pre-fascia pin-to-target sim (no merged
+        # state, no pin_active mask, no anchor/glue). Defaults to False so any
+        # config lacking the key reproduces the original behaviour exactly.
+        self.use_fascia = bool(cfg.get("use_fascia", False))
+        self.fascia_path = cfg.get("fascia_path") if self.use_fascia else None
+        if self.fascia_path is not None and not Path(self.fascia_path).is_absolute():
+            self.fascia_path = str(Path.cwd() / self.fascia_path)
+        self.fascia_rest_scale = float(cfg.get("fascia_rest_scale", 0.95))
+        self.fascia_glue_iters = int(cfg.get("fascia_glue_iterations", self.fine_iters))
+        # Soft-pin stiffness for FREED muscle verts (fraction toward bone target
+        # per substep). Keeps freed verts tracking gross body motion so they
+        # don't tear loose when the per-frame target jumps, while still letting
+        # the fascia glue pull them inward. 0 disables (pure free).
+        self.fascia_soft_pin = float(cfg.get("fascia_soft_pin", 0.5))
         self.dt = self.dt_frame / self.nsubsteps
         self.end_frame = int(cfg.get("end_frame", 90))
         self.start_frame = int(cfg.get("start_frame", 1))
@@ -386,6 +665,8 @@ class OneWaySim:
         cons0 = GeoFile(cons0_path)
         self.NCONS = int(cons0.pts.shape[0])
         self.pts = wp.array(cons0.pts, dtype=wp.int32, device=device)
+        self._pin_pts_np = np.asarray(cons0.pts, dtype=np.int64)
+        self.pin_active = None  # set by _init_fascia when fascia is active
         rest_offset_np = (rest.positions[cons0.pts] - cons0.target_pos).astype(np.float32)
         self.rest_offset = wp.array(rest_offset_np, dtype=wp.vec3, device=device)
         self.target_pos = wp.array(cons0.target_pos.copy(), dtype=wp.vec3, device=device)
@@ -397,6 +678,162 @@ class OneWaySim:
                     "coarse_model_path in config"
                 )
             self._init_coarse(rest.positions)
+
+        if self.fascia_path:
+            self._init_fascia(rest.positions.copy())
+
+    # ------------------------------------------------------------------
+
+    def _init_fascia(self, rest_muscle_pos):
+        from scipy.spatial import cKDTree
+        import logging
+        log = logging.getLogger(__name__)
+
+        _check_unzipped(self.fascia_path)
+        fg = GeoFile(self.fascia_path)
+        fascia_pos = fg.positions
+        fascia_tet = fg.tet_indices
+
+        mrest = GeoFile(self.rest_path)
+
+        # glue_scale is needed by both pairing modes (surface uses it for the
+        # uniform stiffness); read it here so _pair_surface can see it.
+        glue_scale = float(self.cfg.get("fascia_glue_stiffness_scale", 0.001))
+
+        glue_mode = str(self.cfg.get("fascia_glue_mode", "groups"))
+        if glue_mode == "surface":
+            glue_fascia, glue_muscle, glue_restlen, glue_stiff = self._pair_surface(
+                fg, fascia_pos, mrest, rest_muscle_pos, glue_scale)
+        else:
+            surf = mrest.point_group("surface_points")
+            surf_tree = cKDTree(rest_muscle_pos[surf])
+
+            def pair(group_name, dist_attr, stiff_attr):
+                if group_name not in fg._groups:
+                    return (np.zeros(0, np.int32), np.zeros(0, np.int32),
+                            np.zeros(0, np.float32), np.zeros(0, np.float32))
+                fids = fg.point_group(group_name)
+                d, loc = surf_tree.query(fascia_pos[fids], k=1)
+                mids = surf[loc].astype(np.int32)
+                want = fg.point_attr(dist_attr)[fids].astype(np.float32)
+                restlen = np.minimum(want, d.astype(np.float32))  # don't yank distant pts
+                stiff = fg.point_attr(stiff_attr)[fids].astype(np.float32)
+                return fids.astype(np.int32), mids, restlen, stiff
+
+            gi_f, gi_m, gi_r, gi_s = pair("tissue_inner_points",
+                                          "tissuetomuscledistance", "tissuetomusclestiffness")
+            gb_f, gb_m, gb_r, gb_s = pair("tissue_bone_points",
+                                          "tissuetobonedistance", "tissuetobonestiffness")
+            glue_fascia = np.concatenate([gi_f, gb_f])
+            glue_muscle = np.concatenate([gi_m, gb_m])
+            glue_restlen = np.concatenate([gi_r, gb_r])
+            glue_stiff = np.concatenate([gi_s, gb_s]) * glue_scale
+
+        if "rigid" in fg._groups:
+            rid = fg.point_group("rigid")
+            full_tree = cKDTree(rest_muscle_pos)
+            _, aloc = full_tree.query(fascia_pos[rid], k=1)
+            anchor_fascia = rid.astype(np.int32)
+            anchor_muscle = aloc.astype(np.int32)
+        else:
+            anchor_fascia = np.zeros(0, np.int32)
+            anchor_muscle = np.zeros(0, np.int32)
+
+        log.info(f"fascia: {fascia_pos.shape[0]} verts, {fascia_tet.shape[0]} tets; "
+                 f"glue mode={glue_mode}, glue pairs={len(glue_fascia)}; "
+                 f"anchors={len(anchor_fascia)}; rest_scale={self.fascia_rest_scale}")
+
+        # --- Free the muscle verts the fascia glues to (+dilated ring) from the
+        # pin overwrite, and soften the surface muscle tets so the glue can pull
+        # them inward. See Task 9. ---
+        free_ring = int(self.cfg.get("fascia_free_ring", 1))
+        surface_mu = float(self.cfg.get("fascia_surface_mu", 1.0e5))
+
+        muscle_tet = mrest.tet_indices  # (nt_m, 4)
+        nvm = rest_muscle_pos.shape[0]
+        free_mask = np.zeros(nvm, dtype=bool)
+        seed = np.unique(glue_muscle.astype(np.int64))
+        free_mask[seed[(seed >= 0) & (seed < nvm)]] = True
+        # Dilate by `free_ring` rings via muscle-tet adjacency.
+        if free_ring > 0:
+            from collections import defaultdict
+            v2t = defaultdict(list)
+            for ti, tet in enumerate(muscle_tet):
+                for v in tet:
+                    v2t[int(v)].append(ti)
+            for _ in range(free_ring):
+                cur = np.where(free_mask)[0]
+                for v in cur:
+                    for ti in v2t[int(v)]:
+                        for w in muscle_tet[ti]:
+                            free_mask[int(w)] = True
+        free_ids = np.where(free_mask)[0].astype(np.int32)
+
+        # Per-muscle-tet stiffness: soft where a tet touches a freed vert.
+        muscle_stiff = np.full(muscle_tet.shape[0], self.mu, dtype=np.float32)
+        tet_touches_free = free_mask[muscle_tet].any(axis=1)
+        muscle_stiff[tet_touches_free] = surface_mu
+
+        self.nvm = rest_muscle_pos.shape[0]
+        self.merged = build_merged_state(
+            muscle_pos=rest_muscle_pos, muscle_tet=mrest.tet_indices,
+            fascia_pos=fascia_pos, fascia_tet=fascia_tet,
+            fascia_rest_scale=self.fascia_rest_scale,
+            muscle_stiffness=muscle_stiff,
+            fascia_stiffness=float(fg.point_attr("solidshapestiffness").mean()),
+            glue_fascia=glue_fascia, glue_muscle=glue_muscle,
+            glue_restlen=glue_restlen, glue_stiffness=glue_stiff,
+            anchor_fascia=anchor_fascia, anchor_muscle=anchor_muscle,
+            total_mass=self.total_mass, device=self._device)
+
+        # Build the pin_active mask over the existing pin pts: free verts in free_ids.
+        active = np.ones(self._pin_pts_np.shape[0], dtype=np.int32)
+        active[np.isin(self._pin_pts_np, free_ids)] = 0
+        self.pin_active = wp.array(active, dtype=wp.int32, device=self._device)
+        log.info(f"fascia: freed {len(free_ids)} muscle verts from pin "
+                 f"(ring={free_ring}); {int(active.sum())}/{len(active)} pins active; "
+                 f"surface_mu={surface_mu}, glue_scale={glue_scale}")
+        self.pos = self.merged.pos
+        self.pos_mid = self.merged.pos_mid
+        self.tet_idx = self.merged.tet_idx
+        self.B = self.merged.B
+        self.alpha = self.merged.alpha
+        self.L = self.merged.L
+        self.inv_mass = self.merged.inv_mass
+        self.NT = self.merged.NT
+        self.NV = self.pos.shape[0]
+
+    # ------------------------------------------------------------------
+
+    def _pair_surface(self, fg, fascia_pos, mrest, rest_muscle_pos, glue_scale):
+        """Build glue pairs from the MUSCLE side (full-surface glue mode).
+
+        Instead of pairing the small tissue_inner/tissue_bone fascia groups to
+        their nearest muscle vert (groups mode, ~4252 pairs), this pairs EVERY
+        muscle surface vertex to its nearest fascia vertex (~119482 pairs). This
+        un-dilutes the global mean-radius squeeze metric by gluing the whole
+        surface, not just a small patch. See Task 10.
+
+        Returns (glue_fascia LOCAL ids, glue_muscle GLOBAL ids, glue_restlen,
+        glue_stiff) — same convention as groups mode; build_merged_state offsets
+        glue_fascia by nvm.
+        """
+        from scipy.spatial import cKDTree
+
+        surf = mrest.point_group("surface_points")  # global muscle vert ids
+        fascia_tree = cKDTree(fascia_pos)
+        d, floc = fascia_tree.query(rest_muscle_pos[surf], k=1)  # floc: LOCAL fascia ids
+
+        want = float(self.cfg.get("fascia_glue_target_distance", 0.01))
+        glue_muscle = surf.astype(np.int32)
+        glue_fascia = floc.astype(np.int32)
+        glue_restlen = np.minimum(want, d.astype(np.float32)).astype(np.float32)
+
+        base_stiff = float(self.cfg.get(
+            "fascia_glue_stiffness",
+            float(fg.point_attr("tissuetomusclestiffness").mean())))
+        glue_stiff = np.full(len(surf), base_stiff * glue_scale, dtype=np.float32)
+        return glue_fascia, glue_muscle, glue_restlen, glue_stiff
 
     # ------------------------------------------------------------------
 
@@ -463,6 +900,13 @@ class OneWaySim:
         )
         wp.synchronize()
 
+        # Capture the MUSCLE-only fine vertex count for multigrid prolongation.
+        # _init_coarse runs before _init_fascia, so self.NV is still muscle-only
+        # here; _init_fascia later mutates self.NV to the merged total. The
+        # cage_idx/uvw maps only have this many entries, so prolong must launch
+        # with mg_fine_nv (not the merged self.NV) to stay in bounds.
+        self.mg_fine_nv = self.NV
+
     # ------------------------------------------------------------------
 
     def load_frame_targets(self, frame: int) -> None:
@@ -471,16 +915,37 @@ class OneWaySim:
         self.target_pos.assign(targets)
 
     def apply_pintotarget(self) -> None:
-        wp.launch(
-            pintotarget_overwrite_kernel,
-            dim=self.NCONS,
-            inputs=[self.pts, self.target_pos, self.rest_offset, self.pos],
-            device=self._device,
-        )
+        if getattr(self, "pin_active", None) is not None:
+            wp.launch(
+                pintotarget_overwrite_masked_kernel,
+                dim=self.NCONS,
+                inputs=[self.pts, self.target_pos, self.rest_offset,
+                        self.pin_active, self.pos],
+                device=self._device,
+            )
+            # Soft-pull the freed verts toward their bone target so they track
+            # gross body motion (per-frame target jumps) while still yielding
+            # inward to the fascia squeeze.
+            if self.fascia_soft_pin > 0.0:
+                wp.launch(
+                    pintotarget_soft_kernel,
+                    dim=self.NCONS,
+                    inputs=[self.pts, self.target_pos, self.rest_offset,
+                            self.pin_active, self.fascia_soft_pin, self.pos],
+                    device=self._device,
+                )
+        else:
+            wp.launch(
+                pintotarget_overwrite_kernel,
+                dim=self.NCONS,
+                inputs=[self.pts, self.target_pos, self.rest_offset, self.pos],
+                device=self._device,
+            )
 
     def substep(self) -> None:
         # quasi_static=true, no_gravity. Optional multigrid V-cycle:
         # restrict (dp) → coarse iters → prolong → fine iters.
+        has_fascia = getattr(self, "merged", None) is not None
         if self.use_multigrid:
             # Direct V-cycle: restrict fine→coarse, relax coarse, prolong
             # back, re-apply pin-to-target (prolong overwrites pinned verts).
@@ -505,12 +970,14 @@ class OneWaySim:
                 )
             wp.launch(
                 prolong_kernel,
-                dim=self.NV,
+                dim=getattr(self, "mg_fine_nv", self.NV),
                 inputs=[self.coarse_pos, self.coarse_tet_idx,
                         self.cage_idx, self.uvw, self.pos],
                 device=self._device,
             )
             self.apply_pintotarget()
+        if has_fascia:
+            apply_anchor(self.merged, self._device)
         self.L.zero_()
         for _ in range(self.fine_iters):
             wp.copy(self.pos_mid, self.pos)
@@ -522,10 +989,15 @@ class OneWaySim:
                         self.dt, self.omega, self.pos],
                 device=self._device,
             )
+        if has_fascia:
+            solve_glue(self.merged, self.dt, self.omega,
+                       self.fascia_glue_iters, self._device)
 
     def step_frame(self, frame: int) -> None:
         self.load_frame_targets(frame)
         self.apply_pintotarget()
+        if getattr(self, "merged", None) is not None:
+            apply_anchor(self.merged, self._device)
         for _ in range(self.nsubsteps):
             self.substep()
 
@@ -536,7 +1008,7 @@ class OneWaySim:
 def load_config(config_path: str) -> dict:
     """Load a JSON scene config and resolve relative paths against cwd."""
     cfg = json.load(open(config_path))
-    for key in ("geo_dir", "cons_dir", "rest_path"):
+    for key in ("geo_dir", "cons_dir", "rest_path", "fascia_path"):
         if key in cfg and not Path(cfg[key]).is_absolute():
             cfg[key] = str(Path.cwd() / cfg[key])
     return cfg
