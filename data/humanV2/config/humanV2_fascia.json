@@ -5,6 +5,7 @@
     "cons_dir": "data/humanV2/model/cons",
     "rest_path": "data/humanV2/model/muscle/restpos.geo",
     "coarse_rest_path": "data/humanV2/model/muscle/restpos_lowres.geo",
+    "use_fascia": true,
     "fascia_path": "data/humanV2/model/fascia/fascia.geo",
     "fascia_rest_scale": 0.95,
     "fascia_glue_mode": "surface",

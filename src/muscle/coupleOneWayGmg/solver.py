@@ -597,7 +597,12 @@ class OneWaySim:
         self.geo_dir = str(cfg["geo_dir"])
         self.cons_dir = str(cfg.get("cons_dir", self.geo_dir))
         self.rest_path = str(cfg.get("rest_path", str(Path(self.geo_dir) / "restpos.geo")))
-        self.fascia_path = cfg.get("fascia_path")
+        # Master switch. When False the fascia layer is fully disabled and the
+        # solver is byte-for-byte the pre-fascia pin-to-target sim (no merged
+        # state, no pin_active mask, no anchor/glue). Defaults to False so any
+        # config lacking the key reproduces the original behaviour exactly.
+        self.use_fascia = bool(cfg.get("use_fascia", False))
+        self.fascia_path = cfg.get("fascia_path") if self.use_fascia else None
         if self.fascia_path is not None and not Path(self.fascia_path).is_absolute():
             self.fascia_path = str(Path.cwd() / self.fascia_path)
         self.fascia_rest_scale = float(cfg.get("fascia_rest_scale", 0.95))
