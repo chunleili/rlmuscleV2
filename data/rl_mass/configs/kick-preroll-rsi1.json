@@ -4,8 +4,12 @@
     "simulation_hz": 600,
     "skeleton_file": "data/rl_mass/humanoid.xml",
     "muscle_file": "data/rl_mass/muscle284.xml",
-    "bvh_file": "data/rl_mass/motion/walk.bvh",
+    "bvh_file": "data/rl_mass/motion/kick-preroll.bvh",
     "bvh_cyclic": true,
+    "bvh_naming": "native",
+    "track_root_rotation": true,
+    "track_root_translation": true,
+    "rsi_max_ratio": 1.0,
     "reward_param": {
         "w_q": 0.75,
         "w_v": 0.1,
