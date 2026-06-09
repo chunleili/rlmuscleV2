@@ -2854,6 +2854,11 @@ def solve_tetfibermillard_kernel(
     acti = activation[tetid]
     sigma0 = cons[c].restdir[0]
 
+    # Active force only in the muscle belly: scale by belly_factor = 1 - tendonmask
+    # (matches solve_tetfibernorm_kernel). Without this, tendon-end tets get full
+    # active stress and over-contract against the rigid end attach -> distortion.
+    acti = acti * (1.0 - tendonmask[tetid])
+
     # Skip if no activation (no energy → C=0)
     if acti < 1.0e-6:
         return
