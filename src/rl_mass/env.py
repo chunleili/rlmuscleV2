@@ -120,6 +120,11 @@ class MassEnv:
             float(pet) if pet is not None else None
         )
 
+        # RSI sampling upper bound as a fraction of clip duration. Default 0.9
+        # keeps initialization away from the clip boundary/wrap seam; set to
+        # 1.0 to sample uniformly over the whole clip [0, T].
+        self.rsi_max_ratio: float = float(cfg.get("rsi_max_ratio", 0.9))
+
         # SPD parameters
         kp = cfg.get("spd", {}).get("kp", 300.0)
 
@@ -269,7 +274,7 @@ class MassEnv:
             start_time = t
         elif rsi:
             max_time = self.character.bvh.max_time
-            start_time = random.uniform(0.0, max_time * 0.9)
+            start_time = random.uniform(0.0, max_time * self.rsi_max_ratio)
         else:
             start_time = 0.0
 
