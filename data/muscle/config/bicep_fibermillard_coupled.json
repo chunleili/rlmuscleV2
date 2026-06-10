@@ -19,6 +19,7 @@
   "repair_iters": 1,
   "repair_sigma_min": 0.05,
   "fiber_stiffness_scale": 10000.0,
+  "millard_stiffness_scale": 1.0,
   "coupling": {
     "preset": "smooth_nonlinear",
     "k_coupling": 100000.0,

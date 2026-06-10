@@ -97,29 +97,41 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(1, 2, figsize=(13, 5))
+    plt.rcParams.update({
+        "font.size": 20,
+        "axes.titlesize": 24,
+        "axes.labelsize": 22,
+        "xtick.labelsize": 20,
+        "ytick.labelsize": 20,
+        "legend.fontsize": 20,
+    })
+    from matplotlib.ticker import MaxNLocator
 
-    ax[0].plot(lam, os_act, "k-", lw=3, alpha=0.4, label="OpenSim")
-    ax[0].plot(lam, mil_act, "C0--", lw=2, label="Ours")
-    ax[0].plot(lam, fad_act, "C3-", lw=2, label="Plain Fiber")
-    ax[0].axvline(1.0, color="gray", ls=":", lw=1)
-    ax[0].set_title("Active force-length  (a = 1)")
-    ax[0].set_xlabel("normalized fiber length")
-    ax[0].set_ylabel(r"normalized active force  $f_L$")
-    ax[0].legend()
+    fig, ax0 = plt.subplots(1, 1, figsize=(8, 6.5))
 
-    ax[1].plot(lam, os_pas, "k-", lw=3, alpha=0.4, label="OpenSim")
-    ax[1].plot(lam, mil_pas, "C0--", lw=2, label="Ours")
-    ax[1].plot(lam, fad_pas, "C3-", lw=2, label="Plain Fiber")
-    ax[1].axvline(1.0, color="gray", ls=":", lw=1)
-    ax[1].set_title("Passive force-length")
-    ax[1].set_xlabel("normalized fiber length")
-    ax[1].set_ylabel(r"normalized passive force  $f_{PE}$")
-    ax[1].set_ylim(-0.05, 1.6)
-    ax[1].legend()
+    ax0.plot(lam, os_act, "k-", lw=3, alpha=0.4, label="OpenSim")
+    ax0.plot(lam, mil_act, "C0--", lw=2, label="Ours")
+    ax0.plot(lam, fad_act, "C3-", lw=2, label="Plain Fiber")
+    ax0.axvline(1.0, color="gray", ls=":", lw=1)
+    ax0.set_title("Active force-length  (a = 1)")
+    ax0.set_xlabel("normalized fiber length")
+    ax0.set_ylabel(r"normalized active force  $f_L$")
+    ax0.legend()
 
-    fig.suptitle("Bicep muscle force-length: Millard constraint matches OpenSim; plain F@d does not",
-                 fontsize=12)
+    # --- passive plot (disabled; backup) ---
+    # ax[1].plot(lam, os_pas, "k-", lw=3, alpha=0.4, label="OpenSim")
+    # ax[1].plot(lam, mil_pas, "C0--", lw=2, label="Ours")
+    # ax[1].plot(lam, fad_pas, "C3-", lw=2, label="Plain Fiber")
+    # ax[1].axvline(1.0, color="gray", ls=":", lw=1)
+    # ax[1].set_title("Passive force-length")
+    # ax[1].set_xlabel("normalized fiber length")
+    # ax[1].set_ylabel(r"normalized passive force  $f_{PE}$")
+    # ax[1].set_ylim(-0.05, 1.6)
+    # ax[1].legend()
+
+    ax0.xaxis.set_major_locator(MaxNLocator(nbins=5))
+    ax0.yaxis.set_major_locator(MaxNLocator(nbins=5))
+
     fig.tight_layout()
     fig.savefig(OUT_PNG, dpi=130)
     print(f"wrote {OUT_PNG}")

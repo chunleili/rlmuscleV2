@@ -48,3 +48,9 @@ data/minotaur/model/
 data/minotaur/model.zip
 data/minotaur_leg/model/
 data/minotaur_leg/model.zip
+
+# bicep_fl comparison outputs — regenerated from tools/bicep_fl/*.py
+tools/bicep_fl/*.png
+tools/bicep_fl/*.ply
+tools/bicep_fl/bicep_fl_compare.csv
+tools/bicep_fl/opensim_ref.csv

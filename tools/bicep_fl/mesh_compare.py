@@ -45,6 +45,9 @@ NUM_SUBSTEPS = 50
 TENDON_PIN_THRESHOLD = 0.9  # freeze verts with tendonmask above this
 
 
+SMOOTH_RELAX_STEPS = 10   # passive ARAP+volume Jacobi sweeps after settle (0 = off)
+
+
 def apply_stab(cfg):
     cfg.num_substeps = NUM_SUBSTEPS
 
@@ -83,6 +86,15 @@ def run(cfg, nsteps, act=1.0):
         wp.launch(fill_float_kernel, dim=sim.activation.shape[0],
                   inputs=[sim.activation, float(act)])
         sim.step()
+    # passive relax: activation->0 so the fiber kernel early-returns (acti<1e-6);
+    # only volume + tetarap(ARAP) + attach keep solving -> Jacobi smoothing of the
+    # junction spikes while volume preservation holds the belly bulge.
+    for _ in range(SMOOTH_RELAX_STEPS):
+        wp.launch(fill_float_kernel, dim=sim.activation.shape[0],
+                  inputs=[sim.activation, 0.0])
+        sim.step()
+    if SMOOTH_RELAX_STEPS:
+        print(f"  passive ARAP+volume relax: {SMOOTH_RELAX_STEPS} sweeps")
     pos = sim.pos.numpy().copy()
     faces = np.asarray(sim.surface_tris)
     return pos, faces, sim.pos0_np.copy()

@@ -2816,7 +2816,7 @@ def solve_tetfibermillard_kernel(
     tendonmask: wp.array(dtype=wp.float32),
     dt: float,
     use_jacobi: int,
-    fiber_stiffness_scale: float,
+    millard_stiffness_scale: float,
     offset: int,
     # Millard active f_L curve data (force)
     fl_x_coeffs: wp.array(dtype=wp.float32),
@@ -2930,7 +2930,10 @@ def solve_tetfibermillard_kernel(
         return
 
     # Compliance: alpha = 1/(k * V0 * dt^2)
-    stiffness_val = cstiffness * fiber_stiffness_scale
+    # Uniform stiffness (no tendonmask scaling): softening tendon-junction tets made
+    # them floppy and over-distort, so keep full stiffness everywhere. Active FORCE is
+    # already belly-only via acti *= (1 - tendonmask) above.
+    stiffness_val = cstiffness * millard_stiffness_scale
     restlength = cons[c].restlength  # V0 (tet volume)
     alpha = 1.0 / stiffness_val
     alpha = alpha / restlength
@@ -3582,6 +3585,9 @@ class MuscleSim(ConstraintBuilderMixin):
         self.build_constraints()
         self.contraction_ratio = getattr(self.cfg, 'contraction_ratio', 0.4)
         self.fiber_stiffness_scale = getattr(self.cfg, 'fiber_stiffness_scale', 10000.0)
+        # Millard fiber constraint uses its OWN stiffness scale (separate from the shared
+        # fiber_stiffness_scale used by fibernorm/dgf). Default smaller to reduce belly distortion.
+        self.millard_stiffness_scale = getattr(self.cfg, 'millard_stiffness_scale', 1.0)
         self.has_compressstiffness = getattr(self.cfg, 'HAS_compressstiffness', False)
         self.dt = self.cfg.dt / self.cfg.num_substeps
         self.step_cnt = 0
@@ -4410,7 +4416,7 @@ class MuscleSim(ConstraintBuilderMixin):
                     self.rest_matrix, self.v_fiber_dir,
                     self.activation, self.tendonmask,
                     self.dt, use_jacobi_int,
-                    self.fiber_stiffness_scale,
+                    self.millard_stiffness_scale,
                     offset,
                     # Millard f_L curve data (force + energy)
                     self._millard_fl_x_coeffs, self._millard_fl_y_coeffs,

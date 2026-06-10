@@ -191,6 +191,190 @@ def arap_svd_kernel(
 
 
 @wp.kernel
+def solve_volume_kernel(
+    pos_mid: wp.array(dtype=wp.vec3),
+    tet_indices: wp.array(dtype=wp.vec4i),
+    B: wp.array(dtype=wp.mat33),
+    inv_mass: wp.array(dtype=wp.float32),
+    alpha: wp.array(dtype=wp.float32),
+    L: wp.array(dtype=wp.float32),
+    dt: float,
+    omega: float,
+    pos: wp.array(dtype=wp.vec3),
+):
+    """XPBD hydrostatic volume constraint ``C = det(F) - 1``, ``F = Ds·B``.
+
+    Parallel-Jacobi (atomic) projection mirroring :func:`arap_svd_kernel`:
+    reads positions from ``pos_mid`` (a snapshot) and accumulates corrections
+    into ``pos``. ARAP-SVD matches shape only and does not strictly preserve
+    per-tet volume; this adds the missing incompressibility term. ``alpha`` is
+    the per-tet XPBD compliance ``1/(k_vol·V0)`` and ``L`` the per-tet
+    Lagrange-multiplier accumulator (one slot per tet — no race).
+
+    Gradient mapping is identical to the ARAP kernel: with ``F = Ds·B`` and
+    ``Ds_{i,m} = (x_{m+1}-x_0)_i`` we have
+    ``dC/d(x_{m+1}) = dCdF · B[m,:]^T``, where for the volume term
+    ``dCdF = d det(F)/dF = det(F)·F^{-T}`` (the cofactor matrix).
+    """
+    t = wp.tid()
+    idx = tet_indices[t]
+    p0i = idx[0]
+    p1i = idx[1]
+    p2i = idx[2]
+    p3i = idx[3]
+
+    x0 = pos_mid[p0i]
+    x1 = pos_mid[p1i]
+    x2 = pos_mid[p2i]
+    x3 = pos_mid[p3i]
+    e1 = x1 - x0
+    e2 = x2 - x0
+    e3 = x3 - x0
+    Ds = wp.mat33(
+        e1[0], e2[0], e3[0],
+        e1[1], e2[1], e3[1],
+        e1[2], e2[2], e3[2],
+    )
+    Bt = B[t]
+    F = Ds * Bt
+
+    J = wp.determinant(F)
+    C = J - 1.0
+    if wp.abs(C) < 1.0e-9:
+        return
+    # dC/dF = det(F) · F^{-T}  (cofactor of F)
+    dCdF = J * wp.transpose(wp.inverse(F))
+
+    row0 = wp.vec3(Bt[0, 0], Bt[0, 1], Bt[0, 2])
+    row1 = wp.vec3(Bt[1, 0], Bt[1, 1], Bt[1, 2])
+    row2 = wp.vec3(Bt[2, 0], Bt[2, 1], Bt[2, 2])
+    g1 = dCdF * row0
+    g2 = dCdF * row1
+    g3 = dCdF * row2
+    g0 = -(g1 + g2 + g3)
+
+    w0 = inv_mass[p0i]
+    w1 = inv_mass[p1i]
+    w2 = inv_mass[p2i]
+    w3 = inv_mass[p3i]
+    denom = (
+        w0 * wp.dot(g0, g0)
+        + w1 * wp.dot(g1, g1)
+        + w2 * wp.dot(g2, g2)
+        + w3 * wp.dot(g3, g3)
+    )
+    alpha_tilde = alpha[t] / (dt * dt)
+    dlambda = -(C + alpha_tilde * L[t]) / (denom + alpha_tilde)
+    L[t] = L[t] + dlambda
+
+    f = omega * dlambda
+    wp.atomic_add(pos, p0i, (f * w0) * g0)
+    wp.atomic_add(pos, p1i, (f * w1) * g1)
+    wp.atomic_add(pos, p2i, (f * w2) * g2)
+    wp.atomic_add(pos, p3i, (f * w3) * g3)
+
+
+@wp.kernel
+def solve_fibermillard_kernel(
+    pos_mid: wp.array(dtype=wp.vec3),
+    tet_indices: wp.array(dtype=wp.vec4i),
+    B: wp.array(dtype=wp.mat33),
+    inv_mass: wp.array(dtype=wp.float32),
+    alpha: wp.array(dtype=wp.float32),
+    L: wp.array(dtype=wp.float32),
+    v_fiber_dir: wp.array(dtype=wp.vec3),     # per-vertex rest fiber direction
+    activation: wp.array(dtype=wp.float32),   # per-tet activation a in [0,1]
+    tendonmask: wp.array(dtype=wp.float32),   # per-tet tendon fraction in [0,1]
+    contraction_ratio: float,
+    dt: float,
+    omega: float,
+    pos: wp.array(dtype=wp.vec3),
+):
+    """STUB — FiberMillard active-contraction constraint (NOT yet enabled).
+
+    Drives the fiber stretch ``s = |F·f0|`` toward an activation-dependent
+    target ``s* = 1 - (1-tendonmask)·a·contraction_ratio`` (the Millard-style
+    along-fiber shortening). Same XPBD Jacobi/atomic projection as the volume
+    and ARAP kernels.
+
+    *** UNTESTED / GATED OFF. *** It requires per-vertex fiber direction
+    (``v_fiber_dir``) and per-tet ``activation`` arrays, which the humanV2 GMG
+    asset (``restpos.geo``) does NOT currently carry — it has only
+    ``tendonmask``. Until those attributes are baked into the geo (fiber field
+    from the muscle mesh + activation from the RL trajectory) and the loader is
+    extended, ``__init__`` raises on ``use_fiber=True``. Kept here so the
+    constitutive model and wiring are documented in one place.
+    """
+    t = wp.tid()
+    idx = tet_indices[t]
+    p0i = idx[0]
+    p1i = idx[1]
+    p2i = idx[2]
+    p3i = idx[3]
+
+    f0 = (v_fiber_dir[p0i] + v_fiber_dir[p1i]
+          + v_fiber_dir[p2i] + v_fiber_dir[p3i]) / 4.0
+    fn = wp.length(f0)
+    if fn < 1.0e-9:
+        return
+    f0 = f0 / fn
+
+    x0 = pos_mid[p0i]
+    x1 = pos_mid[p1i]
+    x2 = pos_mid[p2i]
+    x3 = pos_mid[p3i]
+    e1 = x1 - x0
+    e2 = x2 - x0
+    e3 = x3 - x0
+    Ds = wp.mat33(
+        e1[0], e2[0], e3[0],
+        e1[1], e2[1], e3[1],
+        e1[2], e2[2], e3[2],
+    )
+    Bt = B[t]
+    F = Ds * Bt
+
+    d = F * f0                      # current fiber vector
+    s = wp.length(d)                # current stretch ratio
+    if s < 1.0e-9:
+        return
+    acti = activation[t]
+    belly = 1.0 - tendonmask[t]
+    s_target = 1.0 - belly * acti * contraction_ratio
+    C = s - s_target
+
+    # dC/dF = (1/s)·(F f0) f0^T  →  map to verts via dCdF·B[m,:]^T
+    dCdF = wp.outer(d / s, f0)
+    row0 = wp.vec3(Bt[0, 0], Bt[0, 1], Bt[0, 2])
+    row1 = wp.vec3(Bt[1, 0], Bt[1, 1], Bt[1, 2])
+    row2 = wp.vec3(Bt[2, 0], Bt[2, 1], Bt[2, 2])
+    g1 = dCdF * row0
+    g2 = dCdF * row1
+    g3 = dCdF * row2
+    g0 = -(g1 + g2 + g3)
+
+    w0 = inv_mass[p0i]
+    w1 = inv_mass[p1i]
+    w2 = inv_mass[p2i]
+    w3 = inv_mass[p3i]
+    denom = (
+        w0 * wp.dot(g0, g0)
+        + w1 * wp.dot(g1, g1)
+        + w2 * wp.dot(g2, g2)
+        + w3 * wp.dot(g3, g3)
+    )
+    alpha_tilde = alpha[t] / (dt * dt)
+    dlambda = -(C + alpha_tilde * L[t]) / (denom + alpha_tilde)
+    L[t] = L[t] + dlambda
+
+    f = omega * dlambda
+    wp.atomic_add(pos, p0i, (f * w0) * g0)
+    wp.atomic_add(pos, p1i, (f * w1) * g1)
+    wp.atomic_add(pos, p2i, (f * w2) * g2)
+    wp.atomic_add(pos, p3i, (f * w3) * g3)
+
+
+@wp.kernel
 def pintotarget_overwrite_kernel(
     pts: wp.array(dtype=wp.int32),
     target_pos: wp.array(dtype=wp.vec3),
@@ -626,6 +810,32 @@ class OneWaySim:
         if self.coarse_rest_path is not None:
             self.coarse_rest_path = str(self.coarse_rest_path)
 
+        # Optional explicit hydrostatic volume constraint (incompressibility).
+        # ARAP-SVD matches shape only; with use_volume the fine loop adds a
+        # det(F)=1 XPBD constraint at stiffness volume_stiffness. Off by default
+        # so existing configs reproduce the pure ARAP-HPBD behaviour exactly.
+        self.use_volume = bool(cfg.get("use_volume", False))
+        self.volume_stiffness = float(cfg.get("volume_stiffness", 1.0e10))
+
+        # Optional FiberMillard active-contraction constraint. SCAFFOLD ONLY:
+        # the humanV2 GMG asset lacks per-vertex fiber direction and per-tet
+        # activation, so enabling this raises until that data is baked in (see
+        # solve_fibermillard_kernel). Flags parsed here so configs/docs are ready.
+        self.use_fiber = bool(cfg.get("use_fiber", False))
+        self.fiber_model = str(cfg.get("fiber_model", "fibermillard"))
+        self.fiber_stiffness = float(cfg.get("fiber_stiffness", 1.0e4))
+        self.contraction_ratio = float(cfg.get("contraction_ratio", 0.4))
+        if self.use_fiber:
+            raise NotImplementedError(
+                "use_fiber=true is not yet supported by the OneWayGmg solver: "
+                "the FiberMillard constraint needs per-vertex fiber direction "
+                "and per-tet activation, which the humanV2 asset (restpos.geo) "
+                "does not carry (only tendonmask is present). Bake fiber "
+                "direction (from the muscle fiber field) and activation (from "
+                "the RL trajectory) into the geo, extend the loader to read "
+                "them, then enable solve_fibermillard_kernel in substep()."
+            )
+
         _check_unzipped(self.rest_path)
         rest = GeoFile(self.rest_path)
         self.NV = int(rest.positions.shape[0])
@@ -657,6 +867,18 @@ class OneWaySim:
             np.add.at(mass_v, rest.tet_indices[:, k], per_tet_mass)
         inv_mass_np = (1.0 / mass_v).astype(np.float32)
         self.inv_mass = wp.array(inv_mass_np, dtype=wp.float32, device=device)
+
+        # Per-tet compliance + Lagrange accumulator for the optional volume
+        # constraint: alpha_vol = 1/(k_vol·V0). Degenerate tets (V0<=0) are made
+        # inert with a large compliance so they contribute no correction.
+        if self.use_volume:
+            with np.errstate(divide="ignore"):
+                vol_alpha_np = 1.0 / (self.volume_stiffness * V0)
+            vol_alpha_np[~np.isfinite(vol_alpha_np)] = 1.0e30
+            vol_alpha_np[V0 <= 0.0] = 1.0e30
+            self.vol_alpha = wp.array(vol_alpha_np.astype(np.float32),
+                                      dtype=wp.float32, device=device)
+            self.vol_L = wp.zeros(self.NT, dtype=wp.float32, device=device)
 
         # Pin-to-target: topology (pts) is constant across all cons_<frame>.geo
         # files; only target_pos varies.
@@ -979,6 +1201,8 @@ class OneWaySim:
         if has_fascia:
             apply_anchor(self.merged, self._device)
         self.L.zero_()
+        if self.use_volume:
+            self.vol_L.zero_()
         for _ in range(self.fine_iters):
             wp.copy(self.pos_mid, self.pos)
             wp.launch(
@@ -989,6 +1213,17 @@ class OneWaySim:
                         self.dt, self.omega, self.pos],
                 device=self._device,
             )
+            # Optional incompressibility: project det(F)=1 from the same
+            # pos_mid snapshot (parallel-Jacobi over constraint types).
+            if self.use_volume:
+                wp.launch(
+                    solve_volume_kernel,
+                    dim=self.NT,
+                    inputs=[self.pos_mid, self.tet_idx, self.B,
+                            self.inv_mass, self.vol_alpha, self.vol_L,
+                            self.dt, self.omega, self.pos],
+                    device=self._device,
+                )
         if has_fascia:
             solve_glue(self.merged, self.dt, self.omega,
                        self.fascia_glue_iters, self._device)
