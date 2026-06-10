@@ -1227,6 +1227,11 @@ class OneWaySim:
         if has_fascia:
             solve_glue(self.merged, self.dt, self.omega,
                        self.fascia_glue_iters, self._device)
+        # Optional collision pass (e.g. muscle vs rigid SDF). Runs AFTER ARAP /
+        # glue each substep so it pushes against the relaxed geometry; pinned
+        # verts are protected by the collider's own inv_mass=0 mask.
+        for fn in getattr(self, "collision_solvers", None) or []:
+            fn()
 
     def step_frame(self, frame: int) -> None:
         self.load_frame_targets(frame)

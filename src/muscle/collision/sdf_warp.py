@@ -90,6 +90,36 @@ def solve_sdf_contact_kernel(
 
 
 @wp.kernel
+def solve_sdf_contact_pos_kernel(
+    pos: wp.array(dtype=wp.vec3),
+    inv_mass: wp.array(dtype=wp.float32),
+    shape_type: wp.int32,            # 0 = plane, 1 = sphere
+    plane_y: wp.float32,
+    sphere_c: wp.vec3,
+    sphere_r: wp.float32,
+    contact_offset: wp.float32,
+):
+    """Position-only SDF push for quasi-static solvers (no velocity / pprev).
+
+    For relaxation solvers like the GMG ``OneWaySim`` there is no velocity
+    state — collision is just a positional projection: push every penetrating
+    vertex out of the rigid SDF along the gradient. ``inv_mass == 0`` verts
+    (e.g. bone-pinned attachment points) are skipped so the push never fights
+    the pin-to-target overwrite.
+    """
+    i = wp.tid()
+    if inv_mass[i] == 0.0:
+        return
+    p = pos[i]
+    if shape_type == 1:
+        phi, n = sdf_sphere(p, sphere_c, sphere_r)
+    else:
+        phi, n = sdf_plane(p, plane_y)
+    if phi < contact_offset:
+        pos[i] = p + n * (contact_offset - phi)
+
+
+@wp.kernel
 def solve_sphere_soft_contact_kernel(
     pos: wp.array(dtype=wp.vec3),
     pprev: wp.array(dtype=wp.vec3),
