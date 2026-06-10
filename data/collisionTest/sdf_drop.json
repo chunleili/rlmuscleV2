@@ -1,0 +1,42 @@
+{
+  "metainfo": {
+    "description": "U-shape soft tet body falling under gravity onto a rigid analytic SDF (plane or sphere). Simplest soft-vs-rigid PBD contact: each vertex queries the SDF and is pushed out along the gradient; normal restitution + tangential friction handled by MuscleSim.update_velocities. Base for muscle-bone coupling. No self-collision (that's the UDCF path).",
+    "used_by": ["src/muscle/collision/example_sdf_drop.py"],
+    "created": "2026-06-10"
+  },
+  "name": "sdf_drop",
+  "geo_path": "data/collisionTest/U.geo",
+  "dt": 0.016666666666666666,
+  "nsteps": 240,
+  "num_substeps": 20,
+  "gravity_z": -9.8,
+  "density": 1060.0,
+  "veldamping": 0.002,
+  "arch": "cpu",
+  "render_mode": "usd",
+  "output_path": "output/sdf_drop.usd",
+  "render_fps": 24,
+
+  "collision": {
+    "shape": "plane",
+    "drop_height": 0.5,
+    "contact_offset": 0.0,
+    "restitution_n": 0.0,
+    "restitution_t": 0.8,
+    "log_every": 10,
+    "plane": {
+      "y": 0.0,
+      "half_extent": 1.5,
+      "subdiv": 8
+    },
+    "sphere": {
+      "center": [0.0, -0.6, 0.0],
+      "radius": 0.6
+    }
+  },
+
+  "constraints": [
+    {"type": "volume",  "name": "volume",  "stiffness": 1000.0, "dampingratio": 0.2},
+    {"type": "tetarap", "name": "tetarap", "stiffness": 1000.0, "dampingratio": 0.2}
+  ]
+}

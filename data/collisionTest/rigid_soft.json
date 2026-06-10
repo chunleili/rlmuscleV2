@@ -1,0 +1,55 @@
+{
+  "metainfo": {
+    "description": "Replica of Newton's example_rigid_soft_contact: a dynamic rigid sphere falls off-center onto a soft tet box resting on the ground, squishes it, and is pushed back up by the soft body (two-way position-based contact). Soft body recovers via volume + ARAP. y-up (MuscleSim convention).",
+    "used_by": ["src/muscle/collision/example_rigid_soft.py"],
+    "created": "2026-06-10",
+    "ref": "~/Dev/newton/newton/examples/multiphysics/example_rigid_soft_contact.py"
+  },
+  "name": "rigid_soft",
+  "dt": 0.016666666666666666,
+  "nsteps": 180,
+  "num_substeps": 32,
+  "gravity_z": -9.8,
+  "density": 100.0,
+  "veldamping": 0.01,
+  "arch": "cpu",
+  "render_mode": "usd",
+  "output_path": "output/rigid_soft.usd",
+  "render_fps": 60,
+
+  "soft_grid": {
+    "dim_x": 12,
+    "dim_y": 8,
+    "dim_z": 6,
+    "cell": 0.1
+  },
+
+  "repair_alpha": 1.0,
+  "repair_iters": 2,
+  "repair_sigma_min": 0.1,
+
+  "ground": {
+    "y": 0.0,
+    "half_extent": 1.5,
+    "subdiv": 8
+  },
+
+  "sphere": {
+    "radius": 0.35,
+    "density": 40.0,
+    "init_offset": [0.2, 1.2, 0.0],
+    "restitution_ground": 0.0
+  },
+
+  "collision": {
+    "contact_offset": 0.0,
+    "restitution_n": 0.0,
+    "restitution_t": 0.9,
+    "log_every": 20
+  },
+
+  "constraints": [
+    {"type": "volume",  "name": "volume",  "stiffness": 40000.0, "dampingratio": 0.2},
+    {"type": "tetarap", "name": "tetarap", "stiffness": 40000.0, "dampingratio": 0.2}
+  ]
+}
