@@ -34,7 +34,7 @@ import warp as wp
 from muscle.coupleOneWayGmg.solver import OneWaySim, load_config
 from muscle.coupleOneWayGmg.example import _vectorized_surface_tris
 from muscle.collision.sdf_warp import solve_mesh_contact_pos_kernel
-from muscle.util.geo_io import GeoFile
+from muscle.util.geo_io import GeoFile, GeoWriter
 
 
 @wp.kernel
@@ -78,6 +78,16 @@ def _set_is_collide_primvar(stage, prim_path, flag01, time):
         pv = UsdGeom.PrimvarsAPI(prim).CreatePrimvar(
             "is_collide", Sdf.ValueTypeNames.IntArray, UsdGeom.Tokens.vertex)
     pv.Set(Vt.IntArray.FromNumpy(flag01.astype(np.int32)), time)
+
+
+def _set_sum_is_collide(stage, prim_path, total, time):
+    """Write a per-frame scalar custom attr ``sum_is_collide`` on a prim."""
+    from pxr import Sdf
+    prim = stage.GetPrimAtPath(prim_path)
+    attr = prim.GetAttribute("sum_is_collide")
+    if not attr:
+        attr = prim.CreateAttribute("sum_is_collide", Sdf.ValueTypeNames.Int)
+    attr.Set(int(total), time)
 
 
 
@@ -173,6 +183,9 @@ def main():
     ap.add_argument("--static_bone", action="store_true",
                     help="freeze bones at frame 1 (for A/B vs animated)")
     ap.add_argument("--usd", default="output/humanV2_bone_anim.usd")
+    ap.add_argument("--geo_out", default=None,
+                    help="dir for per-frame .geo (in-place P + is_collide). "
+                         "Template = cfg rest_path. ~37MB/frame.")
     args = ap.parse_args()
 
     wp.init()
@@ -200,6 +213,13 @@ def main():
     renderer = WarpRenderer(mode="usd", stage_path=args.usd)
     print(f"[render] writing USD to {args.usd}")
 
+    geo_writer = None
+    if args.geo_out:
+        tpl = cfg["rest_path"]
+        geo_writer = GeoWriter(tpl)
+        Path(args.geo_out).mkdir(parents=True, exist_ok=True)
+        print(f"[geo] in-place .geo (template {tpl}) -> {args.geo_out}/")
+
     t0 = time.perf_counter()
     for frame in range(sim.start_frame, sim.end_frame + 1):
         if not args.static_bone:
@@ -215,9 +235,14 @@ def main():
         muscle_path = inner.render_mesh(name="muscle", points=pos_np,
                                         indices=surf_flat, colors=(0.8, 0.3, 0.25))
         _set_is_collide_primvar(inner.stage, muscle_path, is_collide, inner.time)
+        _set_sum_is_collide(inner.stage, muscle_path, int(is_collide.sum()), inner.time)
         inner.render_mesh(name="bones", points=collider._cur_verts,
                           indices=collider.tris_flat, colors=(0.9, 0.88, 0.8))
         inner.end_frame()
+
+        if geo_writer is not None:
+            geo_writer.write(str(Path(args.geo_out) / f"muscle_{frame}.geo"),
+                             pos_np, is_collide)
         if frame % 5 == 0 or frame == sim.end_frame:
             elapsed = time.perf_counter() - t0
             print(f"  frame {frame:>3d}  {elapsed:6.1f}s  "

@@ -173,6 +173,83 @@ class GeoFile:
         return self._groups[name]
 
 
+def _find_point_attr(pointattrs, name):
+    """Return the [meta, data] entry for point attribute *name*, or None."""
+    for entry in pointattrs:
+        if _pair_list_to_dict(entry[0]).get("name") == name:
+            return entry
+    return None
+
+
+def _set_pairlist_value(pairlist, key, value):
+    """Set ``pairlist[i+1] = value`` for the flat [k0,v0,...] where vk==key."""
+    for i in range(0, len(pairlist), 2):
+        if pairlist[i] == key:
+            pairlist[i + 1] = value
+            return True
+    return False
+
+
+def _make_int_point_attr(name, values):
+    """Build a Houdini int32 scalar point-attribute entry [meta, data]."""
+    vals = [int(v) for v in values]
+    meta = ["scope", "public", "type", "numeric", "name", name, "options", {}]
+    data = [
+        "size", 1, "storage", "int32",
+        "defaults", ["size", 1, "storage", "int32", "values", [0]],
+        "values", ["size", 1, "storage", "int32", "arrays", [vals]],
+    ]
+    return [meta, data]
+
+
+class GeoWriter:
+    """In-place .geo writer: parse a template once, then rewrite per frame.
+
+    Everything in the template (topology, primitives, groups, all other point
+    attributes) is preserved verbatim. Each :meth:`write` only overwrites the
+    ``P`` position tuples and an optional integer ``is_collide`` point attribute
+    (created if the template lacks it, overwritten if present). This keeps the
+    asset a faithful Houdini round-trip — load it back and only P / is_collide
+    have changed.
+    """
+
+    def __init__(self, template_path: str):
+        with open(template_path, "r") as fp:
+            self._root = json.load(fp)
+        root = _pair_list_to_dict(self._root)
+        self._npoints = int(root["pointcount"])
+        attrs = _pair_list_to_dict(root["attributes"])
+        self._pointattrs = attrs["pointattributes"]   # live ref into self._root
+
+        p_entry = _find_point_attr(self._pointattrs, "P")
+        if p_entry is None:
+            raise KeyError("template .geo has no 'P' attribute")
+        self._p_values = _pair_list_to_dict(p_entry[1])["values"]  # flat list ref
+
+    def write(self, out_path: str, positions: np.ndarray,
+              is_collide: np.ndarray | None = None):
+        pos = np.asarray(positions, dtype=np.float32)
+        if pos.shape[0] != self._npoints:
+            raise ValueError(
+                f"positions has {pos.shape[0]} points, template has "
+                f"{self._npoints}")
+        _set_pairlist_value(self._p_values, "tuples", pos.tolist())
+
+        if is_collide is not None:
+            flag = np.asarray(is_collide).astype(np.int32)
+            if flag.shape[0] != self._npoints:
+                raise ValueError("is_collide length != pointcount")
+            entry = _find_point_attr(self._pointattrs, "is_collide")
+            if entry is None:
+                self._pointattrs.append(_make_int_point_attr("is_collide", flag))
+            else:
+                vvals = _pair_list_to_dict(entry[1])["values"]
+                _set_pairlist_value(vvals, "arrays", [flag.tolist()])
+
+        with open(out_path, "w") as fp:
+            json.dump(self._root, fp)
+
+
 def read_cons_frame(geo_dir: str, frame: int) -> np.ndarray:
     """Return the (NCONS,3) target_pos array from `cons_<frame>.geo`.
 
