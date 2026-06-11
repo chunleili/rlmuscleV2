@@ -202,6 +202,31 @@ def _make_int_point_attr(name, values):
     return [meta, data]
 
 
+def _make_float_point_attr(name, values):
+    """Build a Houdini fpreal32 scalar point-attribute entry [meta, data]."""
+    vals = [float(v) for v in values]
+    meta = ["scope", "public", "type", "numeric", "name", name, "options", {}]
+    data = [
+        "size", 1, "storage", "fpreal32",
+        "defaults", ["size", 1, "storage", "fpreal64", "values", [0]],
+        "values", ["size", 1, "storage", "fpreal32", "arrays", [vals]],
+    ]
+    return [meta, data]
+
+
+def _upsert_scalar_attr(pointattrs, name, values, npoints, maker):
+    """Create *name* point attr if absent, else overwrite its array values."""
+    arr = np.asarray(values)
+    if arr.shape[0] != npoints:
+        raise ValueError(f"{name} length {arr.shape[0]} != pointcount {npoints}")
+    entry = _find_point_attr(pointattrs, name)
+    if entry is None:
+        pointattrs.append(maker(name, arr))
+    else:
+        vvals = _pair_list_to_dict(entry[1])["values"]
+        _set_pairlist_value(vvals, "arrays", [arr.tolist()])
+
+
 class GeoWriter:
     """In-place .geo writer: parse a template once, then rewrite per frame.
 
@@ -227,7 +252,8 @@ class GeoWriter:
         self._p_values = _pair_list_to_dict(p_entry[1])["values"]  # flat list ref
 
     def write(self, out_path: str, positions: np.ndarray,
-              is_collide: np.ndarray | None = None):
+              is_collide: np.ndarray | None = None,
+              pen_depth: np.ndarray | None = None):
         pos = np.asarray(positions, dtype=np.float32)
         if pos.shape[0] != self._npoints:
             raise ValueError(
@@ -236,15 +262,13 @@ class GeoWriter:
         _set_pairlist_value(self._p_values, "tuples", pos.tolist())
 
         if is_collide is not None:
-            flag = np.asarray(is_collide).astype(np.int32)
-            if flag.shape[0] != self._npoints:
-                raise ValueError("is_collide length != pointcount")
-            entry = _find_point_attr(self._pointattrs, "is_collide")
-            if entry is None:
-                self._pointattrs.append(_make_int_point_attr("is_collide", flag))
-            else:
-                vvals = _pair_list_to_dict(entry[1])["values"]
-                _set_pairlist_value(vvals, "arrays", [flag.tolist()])
+            _upsert_scalar_attr(self._pointattrs, "is_collide",
+                                np.asarray(is_collide).astype(np.int32),
+                                self._npoints, _make_int_point_attr)
+        if pen_depth is not None:
+            _upsert_scalar_attr(self._pointattrs, "pen_depth",
+                                np.asarray(pen_depth).astype(np.float32),
+                                self._npoints, _make_float_point_attr)
 
         with open(out_path, "w") as fp:
             json.dump(self._root, fp)

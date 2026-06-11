@@ -80,6 +80,17 @@ def _set_is_collide_primvar(stage, prim_path, flag01, time):
     pv.Set(Vt.IntArray.FromNumpy(flag01.astype(np.int32)), time)
 
 
+def _set_pen_depth_primvar(stage, prim_path, depth, time):
+    """Write a per-vertex float primvar ``pen_depth`` (metres) on a mesh prim."""
+    from pxr import UsdGeom, Sdf, Vt
+    prim = stage.GetPrimAtPath(prim_path)
+    pv = UsdGeom.PrimvarsAPI(prim).GetPrimvar("pen_depth")
+    if not pv:
+        pv = UsdGeom.PrimvarsAPI(prim).CreatePrimvar(
+            "pen_depth", Sdf.ValueTypeNames.FloatArray, UsdGeom.Tokens.vertex)
+    pv.Set(Vt.FloatArray.FromNumpy(depth.astype(np.float32)), time)
+
+
 def _set_sum_is_collide(stage, prim_path, total, time):
     """Write a per-frame scalar custom attr ``sum_is_collide`` on a prim."""
     from pxr import Sdf
@@ -235,6 +246,7 @@ def main():
         muscle_path = inner.render_mesh(name="muscle", points=pos_np,
                                         indices=surf_flat, colors=(0.8, 0.3, 0.25))
         _set_is_collide_primvar(inner.stage, muscle_path, is_collide, inner.time)
+        _set_pen_depth_primvar(inner.stage, muscle_path, depth, inner.time)
         _set_sum_is_collide(inner.stage, muscle_path, int(is_collide.sum()), inner.time)
         inner.render_mesh(name="bones", points=collider._cur_verts,
                           indices=collider.tris_flat, colors=(0.9, 0.88, 0.8))
@@ -242,7 +254,7 @@ def main():
 
         if geo_writer is not None:
             geo_writer.write(str(Path(args.geo_out) / f"muscle_{frame}.geo"),
-                             pos_np, is_collide)
+                             pos_np, is_collide, depth)
         if frame % 5 == 0 or frame == sim.end_frame:
             elapsed = time.perf_counter() - t0
             print(f"  frame {frame:>3d}  {elapsed:6.1f}s  "
