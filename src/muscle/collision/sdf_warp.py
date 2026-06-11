@@ -120,6 +120,39 @@ def solve_sdf_contact_pos_kernel(
 
 
 @wp.kernel
+def solve_mesh_contact_pos_kernel(
+    pos: wp.array(dtype=wp.vec3),
+    inv_mass: wp.array(dtype=wp.float32),
+    mesh: wp.uint64,                 # wp.Mesh.id of the rigid collider (e.g. bone)
+    max_dist: wp.float32,            # closest-point search radius
+    contact_offset: wp.float32,      # keep verts this far outside the surface
+):
+    """Position-only push of verts out of a rigid TRIANGLE-MESH collider.
+
+    The general-geometry counterpart of :func:`solve_sdf_contact_pos_kernel`:
+    instead of an analytic SDF it queries a ``wp.Mesh`` (e.g. the skeleton)
+    via ``mesh_query_point_sign_normal``. A vertex inside the mesh (or within
+    ``contact_offset`` of it) is pushed back out along the surface normal. For
+    quasi-static solvers — no velocity, position only. ``inv_mass == 0`` verts
+    are skipped. The host owns the mesh and ``refit()``s it when the collider
+    moves (e.g. per animation frame).
+    """
+    i = wp.tid()
+    if inv_mass[i] == 0.0:
+        return
+    x = pos[i]
+    query = wp.mesh_query_point_sign_normal(mesh, x, max_dist)
+    if query.result:
+        cp = wp.mesh_eval_position(mesh, query.face, query.u, query.v)
+        delta = x - cp
+        dist = wp.length(delta) * query.sign      # signed: < 0 inside the mesh
+        err = dist - contact_offset
+        if err < 0.0:
+            n = wp.normalize(delta) * query.sign   # outward surface normal
+            pos[i] = x - n * err                    # push out to offset surface
+
+
+@wp.kernel
 def solve_sphere_soft_contact_kernel(
     pos: wp.array(dtype=wp.vec3),
     pprev: wp.array(dtype=wp.vec3),
