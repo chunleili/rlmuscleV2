@@ -15,12 +15,12 @@ import warp.render
 
 from muscle.util.util import SimConfig
 from muscle.util.mesh_io import build_surface_tris, load_mesh, load_bone_mesh
-from muscle.muscle.dgf import (
+from muscle.fiber.dgf import (
     dgf_active_force_length_wp,
     dgf_passive_force_length_wp,
     dgf_force_velocity_wp,
 )
-from muscle.muscle.millard import (
+from muscle.fiber.millard import (
     MillardCurve,
     MillardCurves,
     millard_equilibrium_fiber_length,
