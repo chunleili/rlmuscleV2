@@ -463,16 +463,18 @@ class MeshExporter:
     def __init__(self, path="output/anim", format="ply", tet_indices=None, positions=None,
                  fps=24, prim_path="/tet"):
         import os
-        os.makedirs(path, exist_ok=True)
         self.format = format
         self.abspath = Path(path).absolute()
         self._extra_meshes = {}  # name -> {faces, usd_points_attr (usd only)}
         if format == "usd":
+            # USD writes a single file "<path>.usd"; only the parent dir is needed.
+            os.makedirs(self.abspath.parent, exist_ok=True)
             usd_path = str(self.abspath) + ".usd"
             self.usdexporter = UsdTetExporter(
                 tet_indices=tet_indices, usd_path=usd_path,
                 prim_path=prim_path, fps=fps)
         elif format == "ply":
+            os.makedirs(self.abspath, exist_ok=True)
             if tet_indices is None:
                 raise ValueError("tet_indices is required for PLY export.")
             self.surface_faces = build_surface_tris(tet_indices, positions)

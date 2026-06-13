@@ -1,9 +1,76 @@
-# Code for "RLMuscle: Physics-Based Muscle-Driven Character Animation via Reinforcement Learning"
+# A Warp-Based XPBD Physics Engine for Muscle-Skeletal Character Animation
+
+
+It is also the code for "RLMuscle: Physics-Based Muscle-Driven Character Animation via Reinforcement Learning"
 
 ## Examples
 
 All examples default to writing a **USD mesh sequence** under `output/`.
 Run from the repo root with `PYTHONPATH=src` (commands below already include it).
+
+### ⭐ Core demo — humanV2 muscle vs animated bone (SDF collision handling)
+
+<p align="center">
+  <a href="src/muscle/collision/sdf/example/humanV2.py">
+    <img width="560" src="docs/images/sdf_humanv2.png" alt="humanV2 muscle vs animated bone, SDF collision handling">
+  </a>
+</p>
+
+Muscles driven by an animated skeleton, with per-vertex SDF collision pushing
+muscle off bone every substep. This is the flagship scenario; the one-way
+`humanV2` below is the same scene **without** collision handling, for comparison.
+
+```bash
+PYTHONPATH=src python -m muscle.collision.sdf.example.humanV2 \
+    --config data/humanV2/config/humanV2_gmg.json \
+    --bone_dir data/humanV2/model/bone --end_frame 20
+# → output/humanV2_sdf_coll.usd
+```
+
+<table>
+  <tr>
+    <td colspan="3"><h3>Muscle / One-Way Coupling</h3></td>
+  </tr>
+  <tr>
+    <td colspan="3">
+      ARAP-HPBD muscle pinned one-way to a target pose, <b>no collision handling</b>.
+      <code>bicep</code> runs on <code>MuscleSim</code>; the creature cases run on
+      <code>OneWaySim</code> — both on the shared <code>XpbdEngine</code>. Compare the
+      <code>humanV2</code> case here against the collision-handling version in the SDF
+      section below.
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%"><img width="320" src="docs/images/humanv2_oneway.png" alt="humanV2 one-way"><br><b>humanV2 muscle vs animated bone (No collision handling)</b></td>
+    <td align="center" width="33%"><img width="320" src="docs/images/bicep_oneway.png" alt="bicep one-way"><br><b>bicep (one-way)</b></td>
+    <td align="center" width="33%"><img width="320" src="docs/images/lion_oneway.png" alt="lion one-way"><br><b>lion (one-way)</b></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%"><code>PYTHONPATH=src python -m muscle.coupleOneWayGmg.example --config data/humanV2/config/humanV2_gmg.json --out output/humanv2_oneway.usd</code></td>
+    <td align="center" width="33%"><code>PYTHONPATH=src python -m muscle.example --auto</code></td>
+    <td align="center" width="33%"><code>PYTHONPATH=src python -m muscle.coupleOneWayGmg.example --config data/lion/config/lion_nomg.json --out output/lion_oneway.usd</code></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%"><sub>→ <code>output/humanv2_oneway.usd</code></sub></td>
+    <td align="center" width="33%"><sub>→ <code>output/bicep_oneway.usd</code></sub></td>
+    <td align="center" width="33%"><sub>→ <code>output/lion_oneway.usd</code></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%"><img width="320" src="docs/images/minotaur_oneway.png" alt="minotaur one-way"><br><b>minotaur (one-way)</b></td>
+    <td align="center" width="33%"><img width="320" src="docs/images/minotaur_leg_oneway.png" alt="minotaur leg one-way"><br><b>minotaur leg (one-way)</b></td>
+    <td align="center" width="33%"></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%"><code>PYTHONPATH=src python -m muscle.coupleOneWayGmg.example --config data/minotaur/config/minotaur.json --out output/minotaur_oneway.usd</code></td>
+    <td align="center" width="33%"><code>PYTHONPATH=src python -m muscle.coupleOneWayGmg.example --config data/minotaur_leg/config/minotaur_leg.json --out output/minotaur_leg_oneway.usd</code></td>
+    <td align="center" width="33%"></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%"><sub>→ <code>output/minotaur_oneway.usd</code></sub></td>
+    <td align="center" width="33%"><sub>→ <code>output/minotaur_leg_oneway.usd</code></sub></td>
+    <td align="center" width="33%"></td>
+  </tr>
+</table>
 
 <table>
   <tr>
@@ -29,7 +96,7 @@ Run from the repo root with `PYTHONPATH=src` (commands below already include it)
     <td align="center" width="33%">
       <a href="src/muscle/collision/sdf/example/humanV2.py">
         <img width="320" src="docs/images/sdf_humanv2.png" alt="SDF muscle-bone">
-      </a><br><b>humanV2 muscle vs animated bone</b>
+      </a><br><b>humanV2 muscle vs animated bone (Collision handling)</b>
     </td>
   </tr>
   <tr>
@@ -46,7 +113,7 @@ Run from the repo root with `PYTHONPATH=src` (commands below already include it)
   <tr>
     <td align="center" width="33%"><sub>→ <code>output/sdf_drop.usd</code></sub></td>
     <td align="center" width="33%"><sub>→ <code>output/rigid_soft.usd</code></sub></td>
-    <td align="center" width="33%"><sub>→ <code>output/humanV2_bone_anim.usd</code></sub></td>
+    <td align="center" width="33%"><sub>→ <code>output/humanV2_sdf_coll.usd</code></sub></td>
   </tr>
   <tr>
     <td colspan="3"><h3>DCD Collision</h3></td>

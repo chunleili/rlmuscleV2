@@ -4429,7 +4429,7 @@ class MuscleSim(XpbdEngine):
         self.renderer = None
         if self.cfg.gui and self.cfg.render_mode in ("human", "usd"):
             if self.cfg.render_mode == "usd":
-                stage_path = getattr(self.cfg, "output_path", None) or "muscle_sim.usd"
+                stage_path = getattr(self.cfg, "output_path", None) or "output/bicep_oneway.usd"
                 os.makedirs(os.path.dirname(stage_path) or ".", exist_ok=True)
             else:
                 stage_path = None

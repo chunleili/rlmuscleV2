@@ -18,9 +18,8 @@ Run::
 
     PYTHONPATH=src .venv/bin/python -m muscle.collision.sdf.example.humanV2 \\
         --config data/humanV2/config/humanV2_gmg.json \\
-        --bone_dir data/humanV2/model/bone \\
-        --out_dir result/humanV2_bone_anim --end_frame 20 \\
-        --usd output/humanV2_bone_anim.usd
+        --bone_dir data/humanV2/model/bone --end_frame 20 \\
+        --usd output/humanV2_sdf_coll.usd
 """
 from __future__ import annotations
 
@@ -193,7 +192,7 @@ def main():
     ap.add_argument("--no_collision", action="store_true")
     ap.add_argument("--static_bone", action="store_true",
                     help="freeze bones at frame 1 (for A/B vs animated)")
-    ap.add_argument("--usd", default="output/humanV2_bone_anim.usd")
+    ap.add_argument("--usd", default="output/humanV2_sdf_coll.usd")
     ap.add_argument("--geo_out", default=None,
                     help="dir for per-frame .geo (in-place P + is_collide). "
                          "Template = cfg rest_path. ~37MB/frame.")
