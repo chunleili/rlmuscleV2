@@ -274,9 +274,30 @@ class GeoWriter:
             json.dump(self._root, fp)
 
 
-def read_cons_frame(geo_dir: str, frame: int) -> np.ndarray:
-    """Return the (NCONS,3) target_pos array from `cons_<frame>.geo`.
+def read_geo_attr_cached(geo_path: str, attr: str) -> np.ndarray:
+    """Return one point attribute from a `.geo`, cached as binary `.npy`.
 
-    Parses the whole file each call — fine for the lion sim's 90 frames.
+    Houdini `.geo` files are large JSON (a cons frame is ~20 MB / 157k points);
+    `json.load` dominates per-frame cost in animated sims. We cache the single
+    extracted array next to the source as ``_npy_cache/<stem>_<attr>.npy`` and
+    reload that on subsequent calls, guarded by mtime so an edited `.geo`
+    re-parses. ``attr`` is ``"P"`` (positions) or ``"target_pos"``.
     """
-    return GeoFile(str(Path(geo_dir) / f"cons_{frame}.geo")).target_pos
+    geo = Path(geo_path)
+    cache = geo.parent / "_npy_cache" / f"{geo.stem}_{attr}.npy"
+    if cache.exists() and cache.stat().st_mtime >= geo.stat().st_mtime:
+        return np.load(cache)
+    g = GeoFile(str(geo))
+    arr = g.positions if attr == "P" else getattr(g, attr)
+    cache.parent.mkdir(exist_ok=True)
+    # atomic write so a killed run can't leave a truncated cache file.
+    # tmp must end in .npy or np.save appends a second .npy to the name.
+    tmp = cache.with_suffix(".tmp.npy")
+    np.save(tmp, arr)
+    tmp.replace(cache)
+    return arr
+
+
+def read_cons_frame(geo_dir: str, frame: int) -> np.ndarray:
+    """Return the (NCONS,3) target_pos array from `cons_<frame>.geo` (cached)."""
+    return read_geo_attr_cached(str(Path(geo_dir) / f"cons_{frame}.geo"), "target_pos")

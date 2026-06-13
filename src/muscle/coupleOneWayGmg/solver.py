@@ -1131,10 +1131,27 @@ class OneWaySim(XpbdEngine):
 
     # ------------------------------------------------------------------
 
+    def preload_targets(self, frames=None) -> None:
+        """Parse every frame's cons target_pos once and hold it in RAM.
+
+        Per-frame ``.geo`` is large JSON; parsing it inside the step loop is the
+        dominant cost. Preloading lifts all of it out of the loop (and, via the
+        ``.npy`` cache, off disk after the first ever run), so stepping is pure
+        GPU work — independent of any warm/cold cache state.
+        """
+        if frames is None:
+            frames = range(self.start_frame, self.end_frame + 1)
+        self._target_stack = {f: read_cons_frame(self.cons_dir, f) for f in frames}
+
     def load_frame_targets(self, frame: int) -> None:
-        targets = read_cons_frame(self.cons_dir, frame)
+        stack = getattr(self, "_target_stack", None)
+        if stack is None or frame not in stack:
+            # lazy fallback for callers that did not preload (also memoizes)
+            if stack is None:
+                stack = self._target_stack = {}
+            stack[frame] = read_cons_frame(self.cons_dir, frame)
         # In-place copy preserves the GPU buffer identity / device.
-        self.target_pos.assign(targets)
+        self.target_pos.assign(stack[frame])
 
     def apply_pintotarget(self) -> None:
         if getattr(self, "pin_active", None) is not None:

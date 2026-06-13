@@ -33,7 +33,7 @@ import warp as wp
 from muscle.coupleOneWayGmg.solver import OneWaySim, load_config
 from muscle.coupleOneWayGmg.example import _vectorized_surface_tris
 from muscle.collision.sdf.kernel import solve_mesh_contact_pos_kernel
-from muscle.util.geo_io import GeoFile, GeoWriter
+from muscle.util.geo_io import GeoFile, GeoWriter, read_geo_attr_cached
 
 
 @wp.kernel
@@ -103,8 +103,8 @@ def _set_sum_is_collide(stage, prim_path, total, time):
 
 
 def _load_bone_verts(bone_dir: Path, frame: int) -> np.ndarray:
-    g = GeoFile(str(bone_dir / f"bone_{frame}.geo"))
-    return np.ascontiguousarray(np.asarray(g.positions, dtype=np.float32))
+    pos = read_geo_attr_cached(str(bone_dir / f"bone_{frame}.geo"), "P")
+    return np.ascontiguousarray(np.asarray(pos, dtype=np.float32))
 
 
 class AnimatedBoneMeshCollider:
@@ -142,10 +142,20 @@ class AnimatedBoneMeshCollider:
         self._count = wp.zeros(1, dtype=wp.int32, device=self.device)
         self._depth = wp.zeros(sim.NV, dtype=wp.float32, device=self.device)
         self._cur_verts = verts0  # for viz / dump
+        self._bone_stack = None   # frame -> verts, filled by preload()
+
+    def preload(self, frames):
+        """Parse every frame's bone pose once and hold it in RAM (see
+        OneWaySim.preload_targets — same rationale, lifts JSON parse out of the
+        step loop so only the upload + BVH refit remain per frame)."""
+        self._bone_stack = {f: _load_bone_verts(self.bone_dir, f) for f in frames}
 
     def set_frame(self, frame: int):
         """Load this frame's bone pose into the mesh and rebuild the BVH."""
-        verts = _load_bone_verts(self.bone_dir, frame)
+        if self._bone_stack is not None and frame in self._bone_stack:
+            verts = self._bone_stack[frame]
+        else:
+            verts = _load_bone_verts(self.bone_dir, frame)
         if verts.shape[0] != self.n_bone_verts:
             raise ValueError(
                 f"bone_{frame}.geo has {verts.shape[0]} verts, "
@@ -182,7 +192,7 @@ class AnimatedBoneMeshCollider:
         return self.mesh.indices.numpy().astype(np.int32)
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="data/humanV2/config/humanV2_gmg.json")
     ap.add_argument("--bone_dir", default="data/humanV2/model/bone")
@@ -193,10 +203,12 @@ def main():
     ap.add_argument("--static_bone", action="store_true",
                     help="freeze bones at frame 1 (for A/B vs animated)")
     ap.add_argument("--usd", default="output/humanV2_sdf_coll.usd")
+    ap.add_argument("--no_export", action="store_true",
+                    help="skip all USD/geo output (measure pure sim time)")
     ap.add_argument("--geo_out", default=None,
                     help="dir for per-frame .geo (in-place P + is_collide). "
                          "Template = cfg rest_path. ~37MB/frame.")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     wp.init()
     cfg = load_config(args.config)
@@ -215,16 +227,44 @@ def main():
           f"push={'OFF' if args.no_collision else 'ON'})")
     print(f"NV={sim.NV}  NT={sim.NT}  frames={sim.start_frame}..{sim.end_frame}")
 
-    surface_faces = _vectorized_surface_tris(sim.tet_idx.numpy())
-    surf_flat = surface_faces.reshape(-1).astype(np.int32)
+    # Parse all per-frame cons/bone .geo up front (RAM-resident, .npy-backed) so
+    # the step loop below is pure GPU work — no disk / JSON parse interleaved.
+    t_load = time.perf_counter()
+    frames = range(sim.start_frame, sim.end_frame + 1)
+    sim.preload_targets(frames)
+    if not args.static_bone:
+        collider.preload(frames)
+    print(f"[preload] {len(frames)} frames of targets+bones "
+          f"in {time.perf_counter() - t_load:.1f}s")
 
-    from muscle.engine import WarpRenderer
-    Path(args.usd).parent.mkdir(parents=True, exist_ok=True)
-    renderer = WarpRenderer(mode="usd", stage_path=args.usd)
-    print(f"[render] writing USD to {args.usd}")
+    # When fascia is active (use_fascia) the tet set is muscle + an outer fascia
+    # shell. Split by vertex range so each renders as its own USD prim; nvm is
+    # the muscle vertex count (fascia verts are appended above it).
+    tets = sim.tet_idx.numpy()
+    nvm = getattr(sim, "nvm", sim.NV)
+    has_fascia = nvm < sim.NV
+    if has_fascia:
+        muscle_tets = tets[(tets < nvm).all(axis=1)]
+        fascia_tets = tets[(tets >= nvm).all(axis=1)]
+        surf_flat = _vectorized_surface_tris(muscle_tets).reshape(-1).astype(np.int32)
+        fascia_flat = _vectorized_surface_tris(fascia_tets).reshape(-1).astype(np.int32)
+        print(f"fascia: {muscle_tets.shape[0]} muscle tets, "
+              f"{fascia_tets.shape[0]} fascia tets ({sim.NV - nvm} fascia verts)")
+    else:
+        surf_flat = _vectorized_surface_tris(tets).reshape(-1).astype(np.int32)
+        fascia_flat = None
+
+    renderer = None
+    if not args.no_export:
+        from muscle.engine import WarpRenderer
+        Path(args.usd).parent.mkdir(parents=True, exist_ok=True)
+        renderer = WarpRenderer(mode="usd", stage_path=args.usd)
+        print(f"[render] writing USD to {args.usd}")
+    else:
+        print("[no_export] pure-sim timing, no USD/geo output")
 
     geo_writer = None
-    if args.geo_out:
+    if args.geo_out and not args.no_export:
         tpl = cfg["rest_path"]
         geo_writer = GeoWriter(tpl)
         Path(args.geo_out).mkdir(parents=True, exist_ok=True)
@@ -235,32 +275,38 @@ def main():
         if not args.static_bone:
             collider.set_frame(frame)              # move bones BEFORE solving
         sim.step_frame(frame)
-        pos_np = sim.positions_np()
         depth = collider.inside_depth()             # >0 = inside bone
         is_collide = (depth > 0.0).astype(np.int32)  # per-vertex 0/1
-        inner = renderer.renderer
-        # One USD timecode per sim frame. (begin_frame does round(time*fps);
-        # passing frame*sim.dt collapses frames since sim.dt is the SUBSTEP dt.)
-        inner.begin_frame(frame / inner.fps)
-        muscle_path = inner.render_mesh(name="muscle", points=pos_np,
-                                        indices=surf_flat, colors=(0.8, 0.3, 0.25))
-        _set_is_collide_primvar(inner.stage, muscle_path, is_collide, inner.time)
-        _set_pen_depth_primvar(inner.stage, muscle_path, depth, inner.time)
-        _set_sum_is_collide(inner.stage, muscle_path, int(is_collide.sum()), inner.time)
-        inner.render_mesh(name="bones", points=collider._cur_verts,
-                          indices=collider.tris_flat, colors=(0.9, 0.88, 0.8))
-        inner.end_frame()
 
-        if geo_writer is not None:
-            geo_writer.write(str(Path(args.geo_out) / f"muscle_{frame}.geo"),
-                             pos_np, is_collide, depth)
+        if renderer is not None:
+            pos_np = sim.positions_np()
+            inner = renderer.renderer
+            # One USD timecode per sim frame. (begin_frame does round(time*fps);
+            # passing frame*sim.dt collapses frames since sim.dt is the SUBSTEP dt.)
+            inner.begin_frame(frame / inner.fps)
+            muscle_path = inner.render_mesh(name="muscle", points=pos_np,
+                                            indices=surf_flat, colors=(0.8, 0.3, 0.25))
+            _set_is_collide_primvar(inner.stage, muscle_path, is_collide, inner.time)
+            _set_pen_depth_primvar(inner.stage, muscle_path, depth, inner.time)
+            _set_sum_is_collide(inner.stage, muscle_path, int(is_collide.sum()), inner.time)
+            if fascia_flat is not None:
+                inner.render_mesh(name="fascia", points=pos_np,
+                                  indices=fascia_flat, colors=(0.55, 0.75, 0.9))
+            inner.render_mesh(name="bones", points=collider._cur_verts,
+                              indices=collider.tris_flat, colors=(0.9, 0.88, 0.8))
+            inner.end_frame()
+
+            if geo_writer is not None:
+                geo_writer.write(str(Path(args.geo_out) / f"muscle_{frame}.geo"),
+                                 pos_np, is_collide, depth)
         if frame % 5 == 0 or frame == sim.end_frame:
             elapsed = time.perf_counter() - t0
             print(f"  frame {frame:>3d}  {elapsed:6.1f}s  "
                   f"is_collide={int(is_collide.sum())}  "
                   f"max_depth={depth.max()*1000:.1f}mm")
-    renderer.save()
-    print(f"USD saved -> {args.usd}")
+    if renderer is not None:
+        renderer.save()
+        print(f"USD saved -> {args.usd}")
 
 
 if __name__ == "__main__":

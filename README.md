@@ -1,31 +1,54 @@
-# A Warp-Based XPBD Physics Engine for Muscle-Skeletal Character Animation
+# A GPU XPBD Physics Engine for Muscle-Skeletal Character Animation
 
+It is also the code for paper **"RLMuscle: Physics-Based Muscle-Driven Character Animation via Reinforcement Learning"**
 
-It is also the code for "RLMuscle: Physics-Based Muscle-Driven Character Animation via Reinforcement Learning"
+Based on NVIDIA Warp, which is capable for **all platforms (Windows, Linux, MacOS)** and **GPU as well as CPU** parallelization.
+
+## ✨ Features
+
+- 🚀 **Fast & cheap** — 18 ms/frame, 98 MB GPU memory for a 172k-vert human muscle sim on a 4090.
+- 🌍 **Runs anywhere** — built on NVIDIA Warp: CPU **and** GPU, on Windows, Linux & macOS.
+- 💥 **Collision handling** — per-vertex SDF push-out today; DCD & CCD on the way.
+- 🫀 **Tissue + fascia** — one tetrahedral mesh; the fascia shell prevents splaying and reduces penetration.
+- 📦 **Flexible export** — USD (default & recommended), PLY, and Houdini `.geo` (round-trips with all attributes intact).
 
 ## Examples
 
-All examples default to writing a **USD mesh sequence** under `output/`.
+All examples default to writing a **single USD file with animation** under `output/`.
 Run from the repo root with `PYTHONPATH=src` (commands below already include it).
 
-### ⭐ Core demo — humanV2 muscle vs animated bone (SDF collision handling)
+### ⭐ Core demo — humanV2 muscle 
 
 <p align="center">
-  <a href="src/muscle/collision/sdf/example/humanV2.py">
-    <img width="560" src="docs/images/sdf_humanv2.png" alt="humanV2 muscle vs animated bone, SDF collision handling">
+  <a href="src/muscle/collision/sdf/example/humanV2_fascia.py">
+    <img width="560" src="docs/images/humanv2_fascia_coll.png" alt="humanV2 muscle with fascia shell and animated-bone SDF collision">
   </a>
 </p>
 
-Muscles driven by an animated skeleton, with per-vertex SDF collision pushing
-muscle off bone every substep. This is the flagship scenario; the one-way
-`humanV2` below is the same scene **without** collision handling, for comparison.
+Human muscle with the **tissue-fascia** and animated-bone SDF **collision**. Runs 10 substeps XPBD per frame, only costs **18ms/frame** **98MB GPU memory on a 4090**. 
+
+Fascia is an auxiliary mesh to prevent muscle splaying and reduce penetration. We integrate fascia and tissue into one tetrahedral mesh, where fascia is its surface triangle mesh. Fascia should be deleted in the final render, but is useful for simulation. 
 
 ```bash
-PYTHONPATH=src python -m muscle.collision.sdf.example.humanV2 \
-    --config data/humanV2/config/humanV2_gmg.json \
-    --bone_dir data/humanV2/model/bone --end_frame 20
-# → output/humanV2_sdf_coll.usd
+PYTHONPATH=src python -m muscle.collision.sdf.example.humanV2_fascia --end_frame 50
+# → output/humanV2_fascia_coll.usd
 ```
+
+<table>
+  <tr><th colspan="2">Performance — 50 frames, RTX 4090</th></tr>
+  <tr><td>verts</td><td>172,717 (muscle 157,369 + fascia 15,348)</td></tr>
+  <tr><td>tets</td><td>534,947 (muscle 468,162 + fascia 66,785)</td></tr>
+  <tr><td>pure sim (<code>--no_export</code>, warm cache)</td><td>0.9 s — 18 ms/frame</td></tr>
+  <tr><td>with USD export (warm cache)</td><td>1.6 s — 32 ms/frame</td></tr>
+  <tr><td>first run (cold, builds <code>.npy</code> cache)</td><td>37.5 s — per-frame cost is JSON <code>.geo</code> parsing, cached after</td></tr>
+  <tr><td>peak GPU memory</td><td>484 MiB process (~98 MiB sim arrays + CUDA/Warp context)</td></tr>
+  <tr><td>contacts/frame</td><td>~1,300–1,600 verts</td></tr>
+  <tr><td>max penetration</td><td>0.0 mm (resolved each frame)</td></tr>
+</table>
+
+> Per-frame bone/cons targets are Houdini `.geo` (large JSON). They are parsed
+> once and cached as binary `.npy` (`geo_io.read_geo_attr_cached`); warm runs
+> load the cache, making the GPU solve (~18 ms/frame) the bottleneck.
 
 <table>
   <tr>
