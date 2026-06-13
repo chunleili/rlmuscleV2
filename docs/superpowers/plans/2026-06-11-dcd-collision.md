@@ -88,6 +88,16 @@ namespace {
     int udcfDumpCount = 0;
     int udcfRejectSkip = 0;
     const int UDCF_DUMP_MAX = 200000;
+    inline int udcfEnvInt(const char* name, int dflt) {
+        const char* p = std::getenv(name);
+        return p ? std::atoi(p) : dflt;
+    }
+    // Frame window gate (0-based frameId; defaults dump every frame).
+    inline bool udcfFrameInWindow(int frameId) {
+        static int lo = udcfEnvInt("UDCF_DUMP_FRAME_MIN", -1);
+        static int hi = udcfEnvInt("UDCF_DUMP_FRAME_MAX", 1 << 30);
+        return frameId >= lo && frameId <= hi;
+    }
 }
 ```
 
@@ -105,6 +115,7 @@ In `narrowPhase()`, immediately after the line `float d2 = -N2.dot(q[1][0]);` (P
                             int frictionMeshID) {
             FILE* fdump = udcfDumpFile();
             if (!fdump || udcfDumpCount >= UDCF_DUMP_MAX) return;
+            if (!udcfFrameInWindow(frameId)) return;  // frameId is a PBDPhysics member
             ++udcfDumpCount;
             Vec3I v0ids = m_faces0->surfaceFacesTetMeshVIds.col(iSurfV0);
             Vec3I v1ids = m_faces1->surfaceFacesTetMeshVIds.col(iSurfV1);
@@ -214,22 +225,29 @@ make -j --directory ~/Dev/Gaia_UDCF/Simulator/PBDDynamics/build
 
 Expected: links `PBDDynamics` with no errors. If `objectParamsList.getObjectParam` or `isFixed`/`vertexPrevPos` names fail to compile, grep their actual spelling in `PBDPhysics.cpp` (they are all used elsewhere in the file: `getObjectParam` at the friction lookup in `applyNarrowCollisionConstraintsCPU` ~:3042, `isFixed` ~:2958, `vertexPrevPos` ~:3011) and match it.
 
-- [ ] **Step 7: Run the SquishyBall scene with dumping on**
+- [ ] **Step 7: Run the S01_UCollisionDemo scene with dumping on**
+
+The golden scene is `Simulator/PBDDynamics/ParameterExamples/S01_UCollisionDemo` (U-shape drop, 60 frames, 20 substeps, self-collision; mirrors our own `data/collisionTest/u_collision.json`). Contacts are richest in frames 55-60, so the dump is gated to 0-based `frameId` 54-59:
 
 ```bash
 cd ~/Dev/Gaia_UDCF
-sed 's/"numFrames":300/"numFrames":60/' \
-  Simulator/PBDDynamics/ParameterExamples/S02_SquishyBallDropping/4LowResSquishyBallColliding_SeeNumCollisions/Parameters.json \
-  > /tmp/Parameters_golden.json
 mkdir -p /tmp/udcf_out
-UDCF_DUMP=/tmp/udcf_golden.csv ./Simulator/PBDDynamics/build/PBDDynamics \
-  Simulator/PBDDynamics/ParameterExamples/S02_SquishyBallDropping/4LowResSquishyBallColliding_SeeNumCollisions/Models_sphere_col2.json \
-  /tmp/Parameters_golden.json /tmp/udcf_out -R ~/Dev/Gaia_UDCF --CPU
+UDCF_DUMP=/tmp/udcf_golden.csv UDCF_DUMP_FRAME_MIN=54 UDCF_DUMP_FRAME_MAX=59 \
+./Simulator/PBDDynamics/build/PBDDynamics \
+  Simulator/PBDDynamics/ParameterExamples/S01_UCollisionDemo/Models.json \
+  Simulator/PBDDynamics/ParameterExamples/S01_UCollisionDemo/Parameters.json \
+  /tmp/udcf_out -R ~/Dev/Gaia_UDCF --CPU
 wc -l /tmp/udcf_golden.csv
 awk -F, '{c[$1]++} END {for (s in c) print "stage", s, c[s]}' /tmp/udcf_golden.csv
 ```
 
-Expected: tens of thousands of lines; stages 0, 1 present and at least ~1000 records with stage 2 or 3. If stage 2/3 counts are near zero, raise `numFrames` to 120 and rerun (the balls need time to collide).
+Run this in the BACKGROUND (`run_in_background` Bash) and poll its output — it is a 60-frame CPU sim and may take many minutes; do not block on it.
+
+Notes:
+- The scene sets `allowCCD: true`. That is fine for golden capture: every record snapshots its own inputs (q/prev) at narrow time and its own post-apply outputs inside `narrowPhase()`, so CCD elsewhere in the step cannot contaminate a record. Do NOT edit the scene JSONs.
+- `collisionConstraintMultiplier` is absent from this Parameters.json; the dump records whatever default the build uses, and downstream tasks read the recorded value — no action needed.
+
+Expected: stages 0, 1 present and at least ~1000 records with stage 2 or 3. If stage 2/3 counts are near zero, widen the window (`UDCF_DUMP_FRAME_MIN=40`) and rerun; if still near zero, STOP and report — the scene may not be self-colliding the way we expect.
 
 - [ ] **Step 8: Save the instrumentation diff into our repo**
 
@@ -387,6 +405,8 @@ skip_no_golden = pytest.mark.skipif(not GOLDEN.exists(),
 
 ATOL = 2e-5          # absolute tolerance on depths / barys / normals
 PASS_RATE = 0.999    # allowed mismatch budget
+TIE_EPS = 5e-8       # C1-vs-C2 tie window: below this the branch pick is
+                     # fp noise (CPU-Eigen vs GPU-Warp last-bit divergence)
 
 
 def _load():
@@ -452,12 +472,21 @@ def test_narrow_golden_replay():
     for ci, ri in enumerate(rec_of_contact):
         got[ri] = True
         st = 2 if (out["cur"][ci, 0] % 6) < 3 else 3   # cur==T0 → stage2
-        ok = (st == g["stage"][ri]
-              and abs(out["C1"][ci] - g["C1"][ri]) <= ATOL
-              and abs(out["C2"][ci] - g["C2"][ri]) <= ATOL
-              and np.allclose(out["n"][ci], g["n"][ri], atol=ATOL)
-              and np.allclose(out["b1"][ci], g["bary_cur"][ri], atol=1e-3)
-              and np.allclose(out["b2"][ci], g["bary_closest"][ri], atol=1e-3))
+        depths_ok = (abs(out["C1"][ci] - g["C1"][ri]) <= ATOL
+                     and abs(out["C2"][ci] - g["C2"][ri]) <= ATOL)
+        if st == g["stage"][ri]:
+            ok = (depths_ok
+                  and np.allclose(out["n"][ci], g["n"][ri], atol=ATOL)
+                  and np.allclose(out["b1"][ci], g["bary_cur"][ri], atol=1e-3)
+                  and np.allclose(out["b2"][ci], g["bary_closest"][ri], atol=1e-3))
+        else:
+            # Branch flip is acceptable ONLY on a C1≈C2 tie (≤ TIE_EPS, on
+            # either side's arithmetic): the reference's pick is last-bit fp
+            # noise there, and the golden n/bary belong to the other branch
+            # so only the depths are comparable.
+            ok = depths_ok and (
+                abs(g["C1"][ri] - g["C2"][ri]) <= TIE_EPS
+                or abs(out["C1"][ci] - out["C2"][ci]) <= TIE_EPS)
         if not ok:
             mismatches.append(ri)
 

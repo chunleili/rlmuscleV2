@@ -16,7 +16,7 @@ the solver, so the bones track the muscle and penetration stays shallow / local
 
 Run::
 
-    PYTHONPATH=src .venv/bin/python -m muscle.collision.example_humanV2_bone_anim \\
+    PYTHONPATH=src .venv/bin/python -m muscle.collision.sdf.example.humanV2 \\
         --config data/humanV2/config/humanV2_gmg.json \\
         --bone_dir data/humanV2/model/bone \\
         --out_dir result/humanV2_bone_anim --end_frame 20 \\
@@ -33,7 +33,7 @@ import warp as wp
 
 from muscle.coupleOneWayGmg.solver import OneWaySim, load_config
 from muscle.coupleOneWayGmg.example import _vectorized_surface_tris
-from muscle.collision.sdf_warp import solve_mesh_contact_pos_kernel
+from muscle.collision.sdf.kernel import solve_mesh_contact_pos_kernel
 from muscle.util.geo_io import GeoFile, GeoWriter
 
 

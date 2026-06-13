@@ -2,7 +2,7 @@
 
 Simplest classic PBD soft-vs-rigid contact, and the base for muscle-bone
 coupling. Each muscle vertex queries the rigid SDF every substep and is pushed
-out along the gradient (``muscle.collision.sdf_warp``); normal restitution +
+out along the gradient (``muscle.collision.sdf.kernel``); normal restitution +
 tangential friction come from ``MuscleSim.update_velocities``'s contact branch.
 
 Contrast with ``example_u_collision`` (triangle-triangle UDCF, with broadphase +
@@ -11,7 +11,7 @@ self-collision): here there is no broadphase, no pair list, no winding — one
 
 Run::
 
-    PYTHONPATH=src .venv/bin/python -m muscle.collision.example_sdf_drop \\
+    PYTHONPATH=src .venv/bin/python -m muscle.collision.sdf.example.u_drop \\
         --config data/collisionTest/sdf_drop.json --shape plane
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ import os
 import numpy as np
 import warp as wp
 
-from muscle.collision.sdf_warp import solve_sdf_contact_kernel
+from muscle.collision.sdf.kernel import solve_sdf_contact_kernel
 from muscle.util.util import load_config, setup_logging
 from muscle.util.geo_io import GeoFile
 from muscle.util.mesh_io import build_surface_tris

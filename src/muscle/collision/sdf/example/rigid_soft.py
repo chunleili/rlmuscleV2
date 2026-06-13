@@ -5,7 +5,7 @@ A soft tet box rests on the ground. A rigid sphere (mass + gravity) drops
 off-centre onto it, squishes it, and is pushed back up by the soft body — the
 soft-vertex/sphere contact splits each penetration correction by inverse mass
 (Newton's third law in position-based form, see
-``muscle.collision.sdf_warp.solve_sphere_soft_contact_kernel``). The soft body
+``muscle.collision.sdf.kernel.solve_sphere_soft_contact_kernel``). The soft body
 recovers its shape via volume + ARAP.
 
 Two SDFs act on the soft body each substep:
@@ -17,7 +17,7 @@ irrelevant for a sphere on near-vertical contact).
 
 Run::
 
-    PYTHONPATH=src .venv/bin/python -m muscle.collision.example_rigid_soft \\
+    PYTHONPATH=src .venv/bin/python -m muscle.collision.sdf.example.rigid_soft \\
         --config data/collisionTest/rigid_soft.json
 """
 from __future__ import annotations
@@ -30,11 +30,11 @@ import os
 import numpy as np
 import warp as wp
 
-from muscle.collision.sdf_warp import (
+from muscle.collision.sdf.kernel import (
     solve_sdf_contact_kernel,           # soft vs static ground plane
     solve_sphere_soft_contact_kernel,   # soft vs dynamic sphere (two-way)
 )
-from muscle.collision.example_sdf_drop import (
+from muscle.collision.sdf.example.u_drop import (
     _build_plane_mesh_xz, _build_uv_sphere,
 )
 from muscle.util.util import load_config, setup_logging

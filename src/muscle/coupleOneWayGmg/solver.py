@@ -1203,7 +1203,7 @@ class OneWaySim:
         self.L.zero_()
         if self.use_volume:
             self.vol_L.zero_()
-        for _ in range(self.fine_iters):
+        for it in range(self.fine_iters):
             wp.copy(self.pos_mid, self.pos)
             wp.launch(
                 arap_svd_kernel,
@@ -1224,6 +1224,11 @@ class OneWaySim:
                             self.dt, self.omega, self.pos],
                     device=self._device,
                 )
+            # Per-iteration collision hook (UDCF DCD): interleaves contact
+            # resolution with ARAP/volume the way the reference PBD loop
+            # interleaves narrowPhase() with projectConstraints().
+            for fn in getattr(self, "collision_solvers_iter", None) or []:
+                fn(it)
         if has_fascia:
             solve_glue(self.merged, self.dt, self.omega,
                        self.fascia_glue_iters, self._device)

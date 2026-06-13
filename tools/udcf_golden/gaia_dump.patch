@@ -1,0 +1,141 @@
+--- /home/chunleli/Dev/Gaia_UDCF/Simulator/Modules/PBD/PBDPhysics.cpp.orig	2026-06-12 15:13:19.724636009 +0100
++++ /home/chunleli/Dev/Gaia_UDCF/Simulator/Modules/PBD/PBDPhysics.cpp	2026-06-12 15:14:19.364714790 +0100
+@@ -23,6 +23,35 @@
+ 
+ #include "../CollisionDetector/DiscreteCollisionDetector.h"
+ 
++// ---- UDCF golden dump (enable with env UDCF_DUMP=<csv path>) ----
++#include <cstdio>
++#include <cstdlib>
++namespace {
++    inline FILE* udcfDumpFile() {
++        static FILE* f = nullptr;
++        static bool tried = false;
++        if (!tried) {
++            tried = true;
++            const char* p = std::getenv("UDCF_DUMP");
++            if (p) f = fopen(p, "w");
++        }
++        return f;
++    }
++    int udcfDumpCount = 0;
++    int udcfRejectSkip = 0;
++    const int UDCF_DUMP_MAX = 200000;
++    inline int udcfEnvInt(const char* name, int dflt) {
++        const char* p = std::getenv(name);
++        return p ? std::atoi(p) : dflt;
++    }
++    // Frame window gate (0-based frameId; defaults dump every frame).
++    inline bool udcfFrameInWindow(int frameId) {
++        static int lo = udcfEnvInt("UDCF_DUMP_FRAME_MIN", -1);
++        static int hi = udcfEnvInt("UDCF_DUMP_FRAME_MAX", 1 << 30);
++        return frameId >= lo && frameId <= hi;
++    }
++}
++
+ namespace py = pybind11;
+ py::scoped_interpreter guard{};
+ py::module_ module;
+@@ -1518,6 +1547,57 @@
+ 			N2 = -N2;
+ 		float d2 = -N2.dot(q[1][0]);
+ 
++        // ---- golden dump lambda: writes one CSV record in the layout
++        // documented in docs/superpowers/plans/2026-06-11-dcd-collision.md.
++        // For stage>=2 call it AFTER applyNarrowCollisionConstraintsCPU so
++        // the post columns hold post-response positions.
++        auto udcfDump = [&](int stage, float C1v, float C2v,
++                            const Vec3& nrm, const Vec3& bCur, const Vec3& bClo,
++                            int frictionMeshID) {
++            FILE* fdump = udcfDumpFile();
++            if (!fdump || udcfDumpCount >= UDCF_DUMP_MAX) return;
++            if (!udcfFrameInWindow(frameId)) return;  // frameId is a PBDPhysics member
++            ++udcfDumpCount;
++            Vec3I v0ids = m_faces0->surfaceFacesTetMeshVIds.col(iSurfV0);
++            Vec3I v1ids = m_faces1->surfaceFacesTetMeshVIds.col(iSurfV1);
++            int fixed0 = 0, fixed1 = 0;
++            for (int j = 0; j < 3; j++) {
++                if (m_particles0->isFixed(v0ids[j])) fixed0 = 1;
++                if (m_particles1->isFixed(v1ids[j])) fixed1 = 1;
++            }
++            FloatingType mus = objectParamsList.getObjectParam(frictionMeshID).friction_static;
++            FloatingType mud = objectParamsList.getObjectParam(frictionMeshID).friction_dynamic;
++            fprintf(fdump, "%d", stage);
++            for (int j = 0; j < 3; j++)
++                fprintf(fdump, ",%.9g,%.9g,%.9g", q[0][j][0], q[0][j][1], q[0][j][2]);
++            for (int j = 0; j < 3; j++)
++                fprintf(fdump, ",%.9g,%.9g,%.9g", q[1][j][0], q[1][j][1], q[1][j][2]);
++            for (int j = 0; j < 3; j++) {
++                Vec3 pv = m_particles0->vertexPrevPos(v0ids[j]);
++                fprintf(fdump, ",%.9g,%.9g,%.9g", pv[0], pv[1], pv[2]);
++            }
++            for (int j = 0; j < 3; j++) {
++                Vec3 pv = m_particles1->vertexPrevPos(v1ids[j]);
++                fprintf(fdump, ",%.9g,%.9g,%.9g", pv[0], pv[1], pv[2]);
++            }
++            fprintf(fdump, ",%d,%d,%.9g,%.9g", fixed0, fixed1, C1v, C2v);
++            fprintf(fdump, ",%.9g,%.9g,%.9g", nrm[0], nrm[1], nrm[2]);
++            fprintf(fdump, ",%.9g,%.9g,%.9g", bCur[0], bCur[1], bCur[2]);
++            fprintf(fdump, ",%.9g,%.9g,%.9g", bClo[0], bClo[1], bClo[2]);
++            fprintf(fdump, ",%.9g,%.9g,%.9g", mus, mud,
++                    physicsParams().collisionConstraintMultiplier);
++            for (int j = 0; j < 3; j++) {
++                Vec3 pp = m_particles0->vertex(v0ids[j]);
++                fprintf(fdump, ",%.9g,%.9g,%.9g", pp[0], pp[1], pp[2]);
++            }
++            for (int j = 0; j < 3; j++) {
++                Vec3 pp = m_particles1->vertex(v1ids[j]);
++                fprintf(fdump, ",%.9g,%.9g,%.9g", pp[0], pp[1], pp[2]);
++            }
++            fprintf(fdump, "\n");
++        };
++        const Vec3 udcfZero3(0.0f, 0.0f, 0.0f);
++
+ 		// float d0_ = (N2).dot(q[0][0]) + d2;
+ 		// float d1_ = (N2).dot(q[0][1]) + d2;
+ 		// float d2_ = (N2).dot(q[0][2]) + d2;
+@@ -1558,12 +1638,12 @@
+ 		Eigen::Matrix<float, 3, 1, Eigen::DontAlign> t3pos = {t[2], t[3], t[4]};
+ 		Eigen::Matrix<float, 3, 1, Eigen::DontAlign> t4pos = {t[5], t[6], t[7]};
+ 		TOCK_STRUCT(timeStatistics, timeCsmpColDetectDCD)
+-		if (t1 == -1 && t2 == -1)
+-			continue;
+-		if (t3 == -1 && t4 == -1)
+-			continue;
+-		if (!(t2 >= t3 && t4 >= t1))
++		if ((t1 == -1 && t2 == -1) || (t3 == -1 && t4 == -1) || !(t2 >= t3 && t4 >= t1))
++		{
++			if (++udcfRejectSkip % 97 == 0)
++				udcfDump(0, 0.0f, 0.0f, udcfZero3, udcfZero3, udcfZero3, iMesh0);
+ 			continue;
++		}
+ 		// if ((t3 - t2) < 1e-6)	continue; // Warning!!
+ 		// std::cout << "here" << " " << m_faces1 << "\n";
+ 		// }
+@@ -1697,7 +1777,10 @@
+ 
+ 		offset = 1e-6;
+ 		if (C1 <= offset || C2 <= offset)
++		{
++			udcfDump(1, C1, C2, udcfZero3, udcfZero3, udcfZero3, iMesh0);
+ 			continue;
++		}
+ 		// std::cout << "==================== " << C1 << ", " << C2 << std::endl;
+ 		TOCK_STRUCT(timeStatistics, timeCsmpShortestPathSearchDCD);
+ 
+@@ -1725,6 +1808,7 @@
+ 			// std::cout << iMesh0 << " " << iMesh1 << " " << grads << std::endl;
+ 			// std::cout << "C1 " << closestFaceVIds << ", " << curFaceVIds << std::endl;
+ 			applyNarrowCollisionConstraintsCPU(curFaceVIds, closestFaceVIds, iMesh0, iMesh1, C, iType0, iType1, C, dt, barycentric1, barycentric2, grads); // barycentrics, grads);
++			udcfDump(2, C1, C2, grads, barycentric1, barycentric2, iMesh0);
+ 		}
+ 		else if (C2 > offset)
+ 		{
+@@ -1742,6 +1826,7 @@
+ 			// std::cout << iMesh0 << " " << iMesh1 << " " << grads << std::endl;
+ 			// std::cout << "C2 " << C2 << " " << closestFaceVIds << ", " << curFaceVIds << std::endl;
+ 			applyNarrowCollisionConstraintsCPU(closestFaceVIds, curFaceVIds, iMesh1, iMesh0, C, iType1, iType0, C, dt, barycentric1, barycentric2, grads); // barycentrics, grads);
++			udcfDump(3, C1, C2, grads, barycentric1, barycentric2, iMesh1);
+ 		}
+ 		TOCK_STRUCT(timeStatistics, timeCsmpCollisionSolve);
+ 
