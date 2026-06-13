@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 import warp as wp
 
-from muscle.muscle_warp import XpbdEngine
+from muscle.engine import XpbdEngine
 from muscle.collision.udcf.massspring import MassSpringTet, MassSpringParams
 from muscle.collision.udcf.solver import UdcfDcdCollider, UdcfParams
 from muscle.collision.udcf.kernel import box_boundary_kernel

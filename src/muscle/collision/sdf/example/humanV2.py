@@ -218,7 +218,7 @@ def main():
     surface_faces = _vectorized_surface_tris(sim.tet_idx.numpy())
     surf_flat = surface_faces.reshape(-1).astype(np.int32)
 
-    from muscle.muscle_warp import WarpRenderer
+    from muscle.engine import WarpRenderer
     Path(args.usd).parent.mkdir(parents=True, exist_ok=True)
     renderer = WarpRenderer(mode="usd", stage_path=args.usd)
     print(f"[render] writing USD to {args.usd}")

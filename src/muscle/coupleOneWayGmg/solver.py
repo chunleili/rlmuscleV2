@@ -9,15 +9,15 @@ quasi-static, no gravity, no multigrid, ``nsubsteps=10``,
 ``fine_iterations=1``, SOR ``omega=0.1``, ``mu=1e9``.
 
 This module is intentionally self-contained — it does NOT inherit from or
-modify ``muscle.muscle_warp.MuscleSim`` so the fiber/Millard/DGF pipeline
+modify ``muscle.engine.MuscleSim`` so the fiber/Millard/DGF pipeline
 stays untouched. The only shared symbol is ``ssvd_fn`` (oriented SVD)
-imported from ``muscle.muscle_warp``.
+imported from ``muscle.engine``.
 """
 from __future__ import annotations
 
 import warp as wp
 
-from muscle.muscle_warp import ssvd_fn, XpbdEngine
+from muscle.engine import ssvd_fn, XpbdEngine
 
 
 @wp.kernel

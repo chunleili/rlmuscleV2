@@ -70,7 +70,7 @@ def capture_oneway_fascia():
 
 
 def capture_musclesim():
-    from muscle.muscle_warp import MuscleSim
+    from muscle.engine import MuscleSim
     from muscle.util.util import load_config
     cfg = load_config(str(ROOT / "data/muscle/config/bicep.json"))
     cfg.gui = False

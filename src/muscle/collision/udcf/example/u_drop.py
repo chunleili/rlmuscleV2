@@ -30,7 +30,7 @@ import numpy as np
 import warp as wp
 
 from muscle.collision.udcf.massspring_sim import MassSpringSim
-from muscle.muscle_warp import WarpRenderer
+from muscle.engine import WarpRenderer
 
 
 def write_ply(path, pos_np, tris):

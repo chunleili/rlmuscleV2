@@ -21,7 +21,7 @@ import numpy as np
 import warp as wp
 
 from muscle.util.util import load_config, setup_logging
-from muscle.muscle_warp import MuscleSim, activation_ramp, fill_float_kernel
+from muscle.engine import MuscleSim, activation_ramp, fill_float_kernel
 from muscle.util.mesh_io import save_ply
 
 HERE = os.path.dirname(__file__)

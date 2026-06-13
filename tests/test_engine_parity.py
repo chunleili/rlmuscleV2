@@ -92,7 +92,7 @@ def test_musclesim_bicep_parity():
     if not cfg_path.exists():
         pytest.skip("bicep config absent")
     g = _need("musclesim_bicep")
-    from muscle.muscle_warp import MuscleSim
+    from muscle.engine import MuscleSim
     from muscle.util.util import load_config
     cfg = load_config(str(cfg_path))
     cfg.gui = False

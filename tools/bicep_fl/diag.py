@@ -5,7 +5,7 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, REPO); sys.path.insert(0, os.path.join(REPO, "src"))
 import warp as wp
 from muscle.util.util import load_config
-from muscle.muscle_warp import MuscleSim
+from muscle.engine import MuscleSim
 
 wp.init(); wp.set_device("cpu")
 cfg = load_config("data/muscle/config/bicep.json")

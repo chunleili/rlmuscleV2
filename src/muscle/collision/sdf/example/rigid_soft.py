@@ -38,7 +38,7 @@ from muscle.collision.sdf.example.u_drop import (
     _build_plane_mesh_xz, _build_uv_sphere,
 )
 from muscle.util.util import load_config, setup_logging
-from muscle.muscle_warp import MuscleSim, WarpRenderer
+from muscle.engine import MuscleSim, WarpRenderer
 
 log = logging.getLogger(__name__)
 

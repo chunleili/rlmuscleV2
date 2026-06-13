@@ -28,7 +28,7 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "src"))
 
-from muscle.muscle_warp import MillardCurves           # noqa: E402
+from muscle.engine import MillardCurves           # noqa: E402
 from rl_mass.muscle import g_al, g_pl                  # noqa: E402
 
 HERE = os.path.dirname(__file__)
