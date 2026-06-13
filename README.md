@@ -57,6 +57,8 @@ Run from the repo root with `PYTHONPATH=src` (commands below already include it)
       <b>handles self-collision</b> (U arms fold and press without crossing).
       Material is Gaia's MassSpring (XPBD springs + hard volume + inversion).
       DCD cannot perfectly erase contacts either, which requiring CCD. But most penatrations are shallow.
+      The U-drop runs on the shared <code>XpbdEngine</code> (<code>MassSpringSim</code>) —
+      the same substep-program engine as <code>MuscleSim</code> and <code>OneWaySim</code>.
     </td>
   </tr>
   <tr>

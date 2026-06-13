@@ -29,12 +29,8 @@ import os
 import numpy as np
 import warp as wp
 
-from muscle.collision.udcf.kernel import box_boundary_kernel
-from muscle.collision.udcf.solver import UdcfDcdCollider, UdcfParams
-from muscle.collision.udcf.massspring import MassSpringTet, MassSpringParams
+from muscle.collision.udcf.massspring_sim import MassSpringSim
 from muscle.muscle_warp import WarpRenderer
-from muscle.util.geo_io import GeoFile
-from muscle.util.mesh_io import build_surface_tris
 
 
 def write_ply(path, pos_np, tris):
@@ -82,54 +78,26 @@ def main():
     args = ap.parse_args()
 
     wp.init()
-    g = GeoFile(args.geo)
-    verts = np.asarray(g.positions, np.float32)
-    tets = np.asarray(g.tet_indices, np.int32)
-    n_v = verts.shape[0]
 
-    init_vel = None
+    # --init_state: load recovery pose BEFORE construction so it becomes the
+    # MassSpringTet rest state (zero pre-strain), matching pre-refactor semantics.
+    init_verts = init_vel = None
     if args.init_state:
+        from muscle.util.geo_io import GeoFile as _GeoFile
+        n_v_geo = np.asarray(_GeoFile(args.geo).positions, np.float32).shape[0]
         st = json.load(open(args.init_state))["meshesState"][0]
-        verts = np.asarray(st["position"], np.float32)[:n_v]
-        init_vel = np.asarray(st["velocity"], np.float32)[:n_v]
-    else:
-        verts = verts.copy()
-        verts[:, 1] += args.translate_y
+        init_verts = np.asarray(st["position"], np.float32)[:n_v_geo]
+        init_vel = np.asarray(st["velocity"], np.float32)[:n_v_geo]
 
-    dt_sub = args.dt / args.num_substeps
-    msp = MassSpringParams(spring_compliance=args.spring_compliance,
-                           spring_damping=args.spring_damping,
-                           density=args.density, gravity=args.gravity)
-    ms = MassSpringTet(verts, tets, dt_sub, params=msp, device=args.device)
-
-    if args.init_state:
-        ms.vel.assign(init_vel)
-    elif args.init_vel_y != 0.0:
-        v0 = np.zeros((n_v, 3), np.float32)
-        v0[:, 1] = args.init_vel_y
-        ms.vel.assign(v0)
-
-    surf = build_surface_tris(tets, verts).astype(np.int32)
-    n_surf = surf.shape[0]
-    max_pairs = max(65536, n_surf * (n_surf - 1) // 2)
-
-    dummy_v = np.array([[1e4, 1e4, 1e4], [1e4 + 1, 1e4, 1e4],
-                        [1e4, 1e4, 1e4 + 1]], np.float32)
-    dummy_t = np.array([[0, 1, 2]], np.int32)
-
-    dcd = None
-    if not args.no_dcd:
-        dcd = UdcfDcdCollider(
-            ms.pos, ms.inv_mass, surface_tris=surf,
-            static_verts=dummy_v, static_tris=dummy_t,
-            params=UdcfParams(allow_self=True, max_pairs=max_pairs,
-                              thickness=args.thickness, jacobi_avg=False,
-                              gauss_seidel=True, max_push=0.0),
-            device=args.device)
-
-    n_mov = n_v
-    bounds_lo = wp.vec3(-2.0, 0.0, -2.0)
-    bounds_hi = wp.vec3(2.0, 5.0e4, 2.0)
+    sim = MassSpringSim.u_drop(
+        args.geo, dt=args.dt, n_substeps=args.num_substeps, density=args.density,
+        gravity=args.gravity, init_vel_y=args.init_vel_y, translate_y=args.translate_y,
+        spring_compliance=args.spring_compliance, spring_damping=args.spring_damping,
+        mu_s=args.mu_s, mu_d=args.mu_d, thickness=args.thickness,
+        no_dcd=args.no_dcd, no_inversion=args.no_inversion,
+        init_verts=init_verts, init_vel=init_vel, device=args.device)
+    ms = sim.ms
+    surf = sim.surf
 
     surf_flat = surf.reshape(-1).astype(np.int32)
     # Static ground quad at y=0 for visual context (the box-boundary floor).
@@ -160,22 +128,8 @@ def main():
     render_frame(0, ms.pos.numpy())
     ref = args.ref_dir
 
-    def substep():
-        ms.integrate()
-        ms.solve_material()            # spring -> volume
-        wp.launch(box_boundary_kernel, dim=n_mov,
-                  inputs=[ms.pos, ms.pprev, bounds_lo, bounds_hi,
-                          wp.float32(args.mu_s), wp.float32(args.mu_d)],
-                  device=args.device)
-        if not args.no_inversion:
-            ms.solve_inversion()
-        if dcd is not None:
-            dcd.solve(0)               # narrowPhase once (iterations=1)
-        ms.update_velocities()
-
     for step in range(1, args.steps + 1):
-        for _ in range(args.num_substeps):
-            substep()
+        sim.step()
         p = ms.pos.numpy()
         if step % args.out_every == 0 or step == args.steps:
             render_frame(step, p)

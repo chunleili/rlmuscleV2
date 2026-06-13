@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import warp as wp
 
-from muscle.muscle_warp import ssvd_fn
+from muscle.muscle_warp import ssvd_fn, XpbdEngine
 
 
 @wp.kernel
@@ -760,7 +760,7 @@ def run_substeps(state, nsubsteps, fine_iters, glue_iters, dt, omega, device=Non
         solve_glue(state, dt, omega, glue_iters, device)
 
 
-class OneWaySim:
+class OneWaySim(XpbdEngine):
     """Per-frame ARAP-HPBD driver for the pin-to-target workflow.
 
     Lifecycle (one frame):
@@ -1164,79 +1164,91 @@ class OneWaySim:
                 device=self._device,
             )
 
-    def substep(self) -> None:
-        # quasi_static=true, no_gravity. Optional multigrid V-cycle:
-        # restrict (dp) → coarse iters → prolong → fine iters.
-        has_fascia = getattr(self, "merged", None) is not None
-        if self.use_multigrid:
-            # Direct V-cycle: restrict fine→coarse, relax coarse, prolong
-            # back, re-apply pin-to-target (prolong overwrites pinned verts).
-            wp.launch(
-                restrict_direct_kernel,
-                dim=self.coarse_NV,
-                inputs=[self.pos, self.tet_idx,
-                        self.cage_idx_c2f, self.uvw_c2f, self.coarse_pos],
-                device=self._device,
-            )
-            self.coarse_L.zero_()
-            for _ in range(self.coarse_iters):
-                wp.copy(self.coarse_pos_mid, self.coarse_pos)
+    def build_program(self):
+        s = self
+
+        def pre_phase():
+            if s.use_multigrid:
+                # Direct V-cycle: restrict fine→coarse, relax coarse, prolong
+                # back, re-apply pin-to-target (prolong overwrites pinned verts).
+                wp.launch(
+                    restrict_direct_kernel,
+                    dim=s.coarse_NV,
+                    inputs=[s.pos, s.tet_idx,
+                            s.cage_idx_c2f, s.uvw_c2f, s.coarse_pos],
+                    device=s._device,
+                )
+                s.coarse_L.zero_()
+                for _ in range(s.coarse_iters):
+                    wp.copy(s.coarse_pos_mid, s.coarse_pos)
+                    wp.launch(
+                        arap_svd_kernel,
+                        dim=s.coarse_NT,
+                        inputs=[s.coarse_pos_mid, s.coarse_tet_idx,
+                                s.coarse_B, s.coarse_inv_mass,
+                                s.coarse_alpha, s.coarse_L,
+                                s.dt, s.omega, s.coarse_pos],
+                        device=s._device,
+                    )
+                wp.launch(
+                    prolong_kernel,
+                    dim=getattr(s, "mg_fine_nv", s.NV),
+                    inputs=[s.coarse_pos, s.coarse_tet_idx,
+                            s.cage_idx, s.uvw, s.pos],
+                    device=s._device,
+                )
+                s.apply_pintotarget()
+            if getattr(s, "merged", None) is not None:
+                apply_anchor(s.merged, s._device)
+            s.L.zero_()
+            if s.use_volume:
+                s.vol_L.zero_()
+
+        def iter_phase():
+            for it in range(s.fine_iters):
+                wp.copy(s.pos_mid, s.pos)
                 wp.launch(
                     arap_svd_kernel,
-                    dim=self.coarse_NT,
-                    inputs=[self.coarse_pos_mid, self.coarse_tet_idx,
-                            self.coarse_B, self.coarse_inv_mass,
-                            self.coarse_alpha, self.coarse_L,
-                            self.dt, self.omega, self.coarse_pos],
-                    device=self._device,
+                    dim=s.NT,
+                    inputs=[s.pos_mid, s.tet_idx, s.B,
+                            s.inv_mass, s.alpha, s.L,
+                            s.dt, s.omega, s.pos],
+                    device=s._device,
                 )
-            wp.launch(
-                prolong_kernel,
-                dim=getattr(self, "mg_fine_nv", self.NV),
-                inputs=[self.coarse_pos, self.coarse_tet_idx,
-                        self.cage_idx, self.uvw, self.pos],
-                device=self._device,
-            )
-            self.apply_pintotarget()
-        if has_fascia:
-            apply_anchor(self.merged, self._device)
-        self.L.zero_()
-        if self.use_volume:
-            self.vol_L.zero_()
-        for it in range(self.fine_iters):
-            wp.copy(self.pos_mid, self.pos)
-            wp.launch(
-                arap_svd_kernel,
-                dim=self.NT,
-                inputs=[self.pos_mid, self.tet_idx, self.B,
-                        self.inv_mass, self.alpha, self.L,
-                        self.dt, self.omega, self.pos],
-                device=self._device,
-            )
-            # Optional incompressibility: project det(F)=1 from the same
-            # pos_mid snapshot (parallel-Jacobi over constraint types).
-            if self.use_volume:
-                wp.launch(
-                    solve_volume_kernel,
-                    dim=self.NT,
-                    inputs=[self.pos_mid, self.tet_idx, self.B,
-                            self.inv_mass, self.vol_alpha, self.vol_L,
-                            self.dt, self.omega, self.pos],
-                    device=self._device,
-                )
-            # Per-iteration collision hook (UDCF DCD): interleaves contact
-            # resolution with ARAP/volume the way the reference PBD loop
-            # interleaves narrowPhase() with projectConstraints().
-            for fn in getattr(self, "collision_solvers_iter", None) or []:
-                fn(it)
-        if has_fascia:
-            solve_glue(self.merged, self.dt, self.omega,
-                       self.fascia_glue_iters, self._device)
-        # Optional collision pass (e.g. muscle vs rigid SDF). Runs AFTER ARAP /
-        # glue each substep so it pushes against the relaxed geometry; pinned
-        # verts are protected by the collider's own inv_mass=0 mask.
-        for fn in getattr(self, "collision_solvers", None) or []:
-            fn()
+                # Optional incompressibility: project det(F)=1 from the same
+                # pos_mid snapshot (parallel-Jacobi over constraint types).
+                if s.use_volume:
+                    wp.launch(
+                        solve_volume_kernel,
+                        dim=s.NT,
+                        inputs=[s.pos_mid, s.tet_idx, s.B,
+                                s.inv_mass, s.vol_alpha, s.vol_L,
+                                s.dt, s.omega, s.pos],
+                        device=s._device,
+                    )
+                # Per-iteration collision hook (UDCF DCD): interleaves contact
+                # resolution with ARAP/volume the way the reference PBD loop
+                # interleaves narrowPhase() with projectConstraints().
+                for fn in getattr(s, "collision_solvers_iter", None) or []:
+                    fn(it)
+
+        def post_phase():
+            if getattr(s, "merged", None) is not None:
+                solve_glue(s.merged, s.dt, s.omega,
+                           s.fascia_glue_iters, s._device)
+            # Optional collision pass (e.g. muscle vs rigid SDF). Runs AFTER ARAP /
+            # glue each substep so it pushes against the relaxed geometry; pinned
+            # verts are protected by the collider's own inv_mass=0 mask.
+            for fn in getattr(s, "collision_solvers", None) or []:
+                fn()
+
+        self.program = [pre_phase, iter_phase, post_phase]
+
+    def substep(self) -> None:
+        if not hasattr(self, "program"):
+            self.build_program()
+        for phase in self.program:
+            phase()
 
     def step_frame(self, frame: int) -> None:
         self.load_frame_targets(frame)

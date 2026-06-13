@@ -3545,13 +3545,308 @@ def solve_tetsnh_kernel(
 # MuscleSim (Warp backend)
 # ---------------------------------------------------------------------------
 
-class MuscleSim(ConstraintBuilderMixin):
+class XpbdEngine(ConstraintBuilderMixin):
+    """Shared XPBD substep engine for the muscle/oneway/massspring sims.
+
+    Owns the state-independent substep primitives: ``integrate``,
+    ``clear``, ``apply_dP``, ``solve_constraints`` /
+    ``_dispatch_constraints``, ``solve_extras``, ``post_smooth``,
+    ``freeze_near_inverted``, ``repair_inverted_tets``,
+    ``apply_pintotarget``, ``update_velocities``, and the program runner
+    ``run_program``.  Subclasses own their loaders/kernels and define
+    ``build_program()`` to set ``self.program`` — an ordered list of
+    bound-method phase closures whose default reproduces that sim's
+    substep order."""
+
+    def integrate(self):
+        gravity_vec = getattr(self, '_gravity_vec', None)
+        if gravity_vec is None:
+            # Default: Y-axis gravity (legacy behavior)
+            gravity_vec = wp.vec3(0.0, self.cfg.gravity, 0.0)
+        wp.launch(integrate_kernel, dim=self.n_verts,
+                  inputs=[self.pos, self.pprev, self.vel,
+                          self.force, self.mass, self.stopped,
+                          gravity_vec, self.cfg.veldamping, self.dt])
+
+    def update_velocities(self):
+        is_collide = getattr(self, "is_collide", None)
+        contact_normal = getattr(self, "contact_normal", None)
+        if is_collide is None or contact_normal is None:
+            wp.launch(update_velocities_kernel, dim=self.n_verts,
+                      inputs=[self.pos, self.pprev, self.vel, self.dt])
+            return
+        rn = float(getattr(self, "restitution_n", 0.0))
+        rt = float(getattr(self, "restitution_t", 1.0))
+        wp.launch(update_velocities_with_contact_kernel, dim=self.n_verts,
+                  inputs=[self.pos, self.pprev, self.vel, self.dt,
+                          is_collide, contact_normal, rn, rt])
+
+    def repair_inverted_tets(self):
+        """SVD-based inversion repair: clamp F singular values and project positions.
+
+        Uses Jacobi-style accumulation (like XPBD) to avoid race conditions
+        when multiple tets share vertices.  Each iteration: clear dP/dPw →
+        accumulate SVD clamp corrections → apply weighted average.
+        """
+        repair_alpha = getattr(self.cfg, 'repair_alpha', 0.0)
+        repair_iters = int(getattr(self.cfg, 'repair_iters', 0))
+        sigma_min = getattr(self.cfg, 'repair_sigma_min', 0.1)
+        if repair_alpha <= 0.0 or repair_iters <= 0:
+            return
+        n_tet = self.tet_np.shape[0]
+        for _ in range(repair_iters):
+            # Clear accumulation buffers (reuse XPBD dP/dPw)
+            wp.launch(clear_dP_kernel, dim=self.n_verts,
+                      inputs=[self.dP, self.dPw])
+            # Accumulate SVD clamp corrections
+            wp.launch(_svd_clamp_accumulate_kernel, dim=n_tet,
+                      inputs=[self.tet_indices, self.pos, self.rest_matrix,
+                              self.stopped, self.dP, self.dPw,
+                              wp.float32(sigma_min)])
+            # Apply weighted average with blending factor alpha
+            wp.launch(_apply_svd_clamp_kernel, dim=self.n_verts,
+                      inputs=[self.pos, self.dP, self.dPw,
+                              wp.float32(repair_alpha)])
+
+    def clear(self):
+        wp.launch(clear_dP_kernel, dim=self.n_verts,
+                  inputs=[self.dP, self.dPw])
+        if self.n_cons > 0:
+            wp.launch(clear_cons_L_kernel, dim=self.n_cons,
+                      inputs=[self.cons])
+
+    def apply_dP(self):
+        wp.launch(apply_dP_kernel, dim=self.n_verts,
+                  inputs=[self.pos, self.dP, self.dPw])
+
+    def apply_pintotarget(self):
+        """Hard pin pass: directly snap pinned source verts to bone target.
+
+        Runs AFTER apply_dP so the snap is final — apply_dP would otherwise
+        add accumulated Jacobi deltas on top and undo the pin (NaN on GPU).
+        """
+        if not getattr(self, "pintotarget_constraints", None):
+            return
+        rng = self.cons_ranges.get(PINTOTARGET) if hasattr(self, "cons_ranges") else None
+        if rng is None:
+            return
+        offset, count = rng
+        if count <= 0:
+            return
+        if not getattr(self, "_pintotarget_stopped_marked", False):
+            self._mark_pintotarget_stopped()
+            self._pintotarget_stopped_marked = True
+        wp.launch(solve_pintotarget_kernel, dim=count,
+                  inputs=[self.cons, self.pos, offset])
+
+    def _dispatch_constraints(self, type_ranges):
+        """Dispatch constraint solver kernels for a given {type: (offset, count)} mapping."""
+        has_compress = 1 if self.has_compressstiffness else 0
+        use_jacobi_int = 1 if self.use_jacobi else 0
+        for ctype, (offset, count) in type_ranges.items():
+            if ctype == TETVOLUME:
+                wp.launch(solve_tetvolume_kernel, dim=count, inputs=[
+                    self.cons, self.pos, self.pprev,
+                    self.dP, self.dPw, self.mass, self.stopped,
+                    self.dt, use_jacobi_int, has_compress, offset])
+            elif ctype == TETFIBERNORM:
+                wp.launch(solve_tetfibernorm_kernel, dim=count, inputs=[
+                    self.cons, self.pos, self.pprev,
+                    self.dP, self.dPw, self.mass, self.stopped,
+                    self.rest_matrix, self.v_fiber_dir,
+                    self.activation, self.tendonmask,
+                    self.dt, use_jacobi_int,
+                    self.contraction_ratio, self.fiber_stiffness_scale,
+                    offset])
+            elif ctype == ATTACH:
+                wp.launch(solve_attach_kernel, dim=count, inputs=[
+                    self.cons, self.pos, self.pprev,
+                    self.dP, self.dPw, self.mass, self.stopped,
+                    self.reaction_accum,
+                    self.dt, use_jacobi_int, has_compress, offset])
+            elif ctype == PIN:
+                wp.launch(solve_pin_kernel, dim=count, inputs=[
+                    self.cons, self.pos, self.pprev,
+                    self.dP, self.dPw, self.mass, self.stopped,
+                    self.dt, use_jacobi_int, has_compress, offset])
+            elif ctype == PINTOTARGET:
+                # Skipped here — pintotarget is a kinematic post-pass run by
+                # apply_pintotarget() AFTER apply_dP, so Jacobi accumulation
+                # cannot undo the snap.
+                continue
+            elif ctype == DISTANCELINE:
+                wp.launch(solve_distanceline_kernel, dim=count, inputs=[
+                    self.cons, self.pos, self.pprev,
+                    self.dP, self.dPw, self.mass, self.stopped,
+                    self.dt, use_jacobi_int, has_compress, offset])
+            elif ctype == TETARAP:
+                wp.launch(solve_tetarap_kernel, dim=count, inputs=[
+                    self.cons, self.pos, self.pprev,
+                    self.dP, self.dPw, self.mass, self.stopped,
+                    self.rest_matrix,
+                    self.dt, use_jacobi_int, offset])
+            elif ctype == TETARAPSVD:
+                wp.launch(solve_tetarap_svd_kernel, dim=count, inputs=[
+                    self.cons, self.pos, self.pprev,
+                    self.dP, self.dPw, self.mass, self.stopped,
+                    self.rest_matrix,
+                    self.dt, use_jacobi_int, offset])
+            elif ctype == TETFIBERDGF:
+                wp.launch(solve_tetfiberdgf_kernel, dim=count, inputs=[
+                    self.cons, self.pos, self.pprev,
+                    self.dP, self.dPw, self.mass, self.stopped,
+                    self.rest_matrix, self.v_fiber_dir,
+                    self.activation, self.tendonmask,
+                    self.dt, use_jacobi_int,
+                    self.fiber_stiffness_scale,
+                    offset])
+            elif ctype == TETFIBERMILLARD:
+                wp.launch(solve_tetfibermillard_kernel, dim=count, inputs=[
+                    self.cons, self.pos, self.pprev,
+                    self.dP, self.dPw, self.mass, self.stopped,
+                    self.rest_matrix, self.v_fiber_dir,
+                    self.activation, self.tendonmask,
+                    self.dt, use_jacobi_int,
+                    self.millard_stiffness_scale,
+                    offset,
+                    # Millard f_L curve data (force + energy)
+                    self._millard_fl_x_coeffs, self._millard_fl_y_coeffs,
+                    self._millard_fl_seg_bounds, self._millard_fl_n_segments,
+                    self._millard_fl_x_lo, self._millard_fl_x_hi,
+                    self._millard_fl_y_lo, self._millard_fl_y_hi,
+                    self._millard_fl_dydx_lo, self._millard_fl_dydx_hi,
+                    self._millard_fl_F_coeffs,
+                    self._millard_fl_energy_offset,
+                    # Millard f_PE curve data
+                    self._millard_fpe_x_coeffs, self._millard_fpe_y_coeffs,
+                    self._millard_fpe_seg_bounds, self._millard_fpe_n_segments,
+                    self._millard_fpe_x_lo, self._millard_fpe_x_hi,
+                    self._millard_fpe_y_lo, self._millard_fpe_y_hi,
+                    self._millard_fpe_dydx_lo, self._millard_fpe_dydx_hi,
+                    float(getattr(self.cfg, 'fiber_skip_detF', 0.0)),
+                    ])
+            elif ctype == TETSNH:
+                wp.launch(solve_tetsnh_kernel, dim=count, inputs=[
+                    self.cons, self.pos, self.pprev,
+                    self.dP, self.dPw, self.mass, self.stopped,
+                    self.rest_matrix,
+                    self.dt, use_jacobi_int, offset])
+
+    def solve_constraints(self, run_extras: bool = True):
+        """Dispatch built-in constraints; optionally also run registered
+        ``constraint_solvers`` extras.
+
+        ``run_extras=False`` is used when the caller wants the extras
+        (typically collision) to run AFTER ``apply_dP`` so they push against
+        the post-ARAP geometry rather than competing with the stale
+        pre-solve gradient. The caller should follow up with
+        ``solve_extras()``.
+        """
+        extras = getattr(self, "constraint_solvers", None)
+        if self.n_cons == 0 and (not run_extras or not extras):
+            return
+        if self.n_cons > 0:
+            if self.use_colored_gs and hasattr(self, 'color_type_ranges'):
+                for type_ranges in self.color_type_ranges:
+                    self._dispatch_constraints(type_ranges)
+            else:
+                self._dispatch_constraints(self.cons_ranges)
+        if run_extras and extras:
+            for fn in extras:
+                fn()
+            if not self.use_jacobi:
+                self.apply_dP()
+
+    def solve_extras(self):
+        """Run only the registered ``constraint_solvers`` (e.g., collision).
+        Intended to be called AFTER ``apply_dP`` so extras see post-ARAP
+        positions. In GS mode (``use_jacobi=False``) the built-in path's
+        apply_dP has already been invoked by the caller, so here we just
+        run extras and (for GS) flush any extras-generated dP again.
+        """
+        extras = getattr(self, "constraint_solvers", None)
+        if not extras:
+            return
+        for fn in extras:
+            fn()
+        if not self.use_jacobi:
+            self.apply_dP()
+
+    # Fiber constraint types to exclude during post-smoothing
+    _FIBER_TYPES = frozenset([TETFIBERNORM, TETFIBERDGF, TETFIBERMILLARD])
+
+    def post_smooth(self):
+        """Jacobi post-smoothing pass: solve only non-fiber constraints
+        (volume, ARAP, attach) to recover mesh quality after fiber contraction.
+        Runs post_smooth_iters iterations, each doing clear→solve→apply.
+
+        On GPU, forces Jacobi mode to avoid race conditions (post_smooth does
+        NOT use colored GS).  On CPU, respects the global use_jacobi setting.
+        """
+        n_iters = int(getattr(self.cfg, 'post_smooth_iters', 0))
+        if n_iters <= 0 or self.n_cons == 0:
+            return
+        # Build filtered type_ranges once and cache
+        if not hasattr(self, '_smooth_ranges'):
+            self._smooth_ranges = {
+                k: v for k, v in self.cons_ranges.items()
+                if k not in self._FIBER_TYPES
+            }
+        # Force Jacobi on GPU to prevent race conditions
+        need_jacobi = self.use_jacobi or self.pos.device.is_cuda
+        saved_jacobi = self.use_jacobi
+        if need_jacobi:
+            self.use_jacobi = True
+        for _ in range(n_iters):
+            self.clear()
+            self._dispatch_constraints(self._smooth_ranges)
+            if self.use_jacobi:
+                self.apply_dP()
+            self.apply_pintotarget()
+        self.use_jacobi = saved_jacobi
+
+    def freeze_near_inverted(self):
+        """Revert vertices of near-inverted tets to their pre-substep positions.
+        Controlled by cfg.freeze_detF_threshold (default 0 = disabled).
+
+        WARNING: Not GPU-safe (race condition on shared vertices). Skipped on
+        CUDA devices with a one-time warning.
+        """
+        threshold = getattr(self.cfg, 'freeze_detF_threshold', 0.0)
+        if threshold <= 0.0:
+            return
+        device = self.pos.device
+        if device.is_cuda:
+            if not getattr(self, '_freeze_gpu_warned', False):
+                import logging
+                logging.getLogger(__name__).warning(
+                    "freeze_near_inverted skipped on GPU (race condition on shared vertices)")
+                self._freeze_gpu_warned = True
+            return
+        n_tet = self.tet_np.shape[0]
+        wp.launch(_freeze_near_inverted_kernel, dim=n_tet,
+                  inputs=[self.tet_indices, self.pos, self.pprev,
+                          self.rest_matrix, self.stopped,
+                          wp.float32(threshold)])
+
+    def run_program(self):
+        """Execute self.program (list of zero-arg phase closures) once per
+        substep for cfg.num_substeps. Subclasses set self.program in
+        build_program(); self._program_sub holds the current substep index
+        for phases that need it (e.g. debug)."""
+        for _sub in range(self.cfg.num_substeps):
+            self._program_sub = _sub
+            for phase in self.program:
+                phase()
+
+
+class MuscleSim(XpbdEngine):
     """Warp-backed muscle simulator.
 
     Holds init + a hook-free step loop alongside all Warp kernels.
     Bone-coupled scenarios (LBS predictor → constraint corrector) compose
     their own per-substep loop using the public methods (integrate,
-    solve_constraints, …) — see coupleOneWay/example.py.
+    solve_constraints, …) — see coupleOneWayGmg/example.py.
     """
 
     def __init__(self, cfg: SimConfig):
@@ -3614,33 +3909,42 @@ class MuscleSim(ConstraintBuilderMixin):
             self._load_bone(target_path)
         return self.bone_geo, self.bone_pos
 
+    def build_program(self):
+        """Default program: reproduces the standalone substep order exactly
+        (see git history of step()). Phases are closures over self."""
+        s = self
+        def integrate_phase():
+            s.clear_forces()
+            s.accumulate_active_fiber_force()
+            s.integrate()
+            if hasattr(s, "apply_pintotarget"):
+                s.apply_pintotarget()
+            s.clear()
+        def solve_phase():
+            s.solve_constraints(run_extras=False)
+            if s.use_jacobi:
+                s.apply_dP()
+            s.solve_extras()
+        def finalize_phase():
+            s.post_smooth()
+            s.freeze_near_inverted()
+            s.repair_inverted_tets()
+            if hasattr(s, "apply_pintotarget"):
+                s.apply_pintotarget()
+            s.update_velocities()
+        self.program = [integrate_phase, solve_phase, finalize_phase]
+        if bool(getattr(self.cfg, "debug_per_substep", False)):
+            def debug_phase():
+                s._debug_check_substep(s._program_sub, s.cfg.num_substeps)
+            self.program.append(debug_phase)
+
     def step(self):
-        """Run one frame. Standalone (no bone coupling) substep loop."""
+        """Run one frame. Standalone (no bone coupling) substep loop, driven
+        by the phase program built in build_program()."""
         self.update_attach_targets()
-        debug_per_sub = bool(getattr(self.cfg, "debug_per_substep", False))
-        n_sub = self.cfg.num_substeps
-        for sub_i in range(n_sub):
-            self.clear_forces()
-            self.accumulate_active_fiber_force()
-            self.integrate()
-            # Hard-pin snap before solve so ARAP/vol see kinematic verts at
-            # their new bone-driven position.
-            if hasattr(self, "apply_pintotarget"):
-                self.apply_pintotarget()
-            self.clear()
-            self.solve_constraints(run_extras=False)
-            if self.use_jacobi:
-                self.apply_dP()
-            # Extras (collision) AFTER apply_dP — see _capturable_substep.
-            self.solve_extras()
-            self.post_smooth()
-            self.freeze_near_inverted()
-            self.repair_inverted_tets()
-            if hasattr(self, "apply_pintotarget"):
-                self.apply_pintotarget()
-            self.update_velocities()
-            if debug_per_sub:
-                self._debug_check_substep(sub_i, n_sub)
+        if not hasattr(self, "program"):
+            self.build_program()
+        self.run_program()
 
     def _debug_check_substep(self, sub_i, n_sub):
         """Per-substep mesh-quality + state logging. cfg.debug_per_substep."""
@@ -4155,16 +4459,6 @@ class MuscleSim(ConstraintBuilderMixin):
             wp.launch(update_attach_targets_kernel, dim=self.n_cons,
                       inputs=[self.cons, self.bone_pos_field, self.n_cons])
 
-    def integrate(self):
-        gravity_vec = getattr(self, '_gravity_vec', None)
-        if gravity_vec is None:
-            # Default: Y-axis gravity (legacy behavior)
-            gravity_vec = wp.vec3(0.0, self.cfg.gravity, 0.0)
-        wp.launch(integrate_kernel, dim=self.n_verts,
-                  inputs=[self.pos, self.pprev, self.vel,
-                          self.force, self.mass, self.stopped,
-                          gravity_vec, self.cfg.veldamping, self.dt])
-
     def clear_forces(self):
         """Zero the per-vertex force accumulator."""
         self.force.zero_()
@@ -4220,19 +4514,6 @@ class MuscleSim(ConstraintBuilderMixin):
 
         return (-forces.sum(axis=0)).astype(np.float32)
 
-    def update_velocities(self):
-        is_collide = getattr(self, "is_collide", None)
-        contact_normal = getattr(self, "contact_normal", None)
-        if is_collide is None or contact_normal is None:
-            wp.launch(update_velocities_kernel, dim=self.n_verts,
-                      inputs=[self.pos, self.pprev, self.vel, self.dt])
-            return
-        rn = float(getattr(self, "restitution_n", 0.0))
-        rt = float(getattr(self, "restitution_t", 1.0))
-        wp.launch(update_velocities_with_contact_kernel, dim=self.n_verts,
-                  inputs=[self.pos, self.pprev, self.vel, self.dt,
-                          is_collide, contact_normal, rn, rt])
-
     def set_lbs_T_rel(self, T_rel_flat_np):
         """Upload (n_bones * 12,) float32 row-major T_rel buffer to GPU.
 
@@ -4256,33 +4537,6 @@ class MuscleSim(ConstraintBuilderMixin):
                   inputs=[self.pos, self.pos0, vertex_bone_field,
                           self._lbs_T_rel_field, float(blend)])
 
-    def repair_inverted_tets(self):
-        """SVD-based inversion repair: clamp F singular values and project positions.
-
-        Uses Jacobi-style accumulation (like XPBD) to avoid race conditions
-        when multiple tets share vertices.  Each iteration: clear dP/dPw →
-        accumulate SVD clamp corrections → apply weighted average.
-        """
-        repair_alpha = getattr(self.cfg, 'repair_alpha', 0.0)
-        repair_iters = int(getattr(self.cfg, 'repair_iters', 0))
-        sigma_min = getattr(self.cfg, 'repair_sigma_min', 0.1)
-        if repair_alpha <= 0.0 or repair_iters <= 0:
-            return
-        n_tet = self.tet_np.shape[0]
-        for _ in range(repair_iters):
-            # Clear accumulation buffers (reuse XPBD dP/dPw)
-            wp.launch(clear_dP_kernel, dim=self.n_verts,
-                      inputs=[self.dP, self.dPw])
-            # Accumulate SVD clamp corrections
-            wp.launch(_svd_clamp_accumulate_kernel, dim=n_tet,
-                      inputs=[self.tet_indices, self.pos, self.rest_matrix,
-                              self.stopped, self.dP, self.dPw,
-                              wp.float32(sigma_min)])
-            # Apply weighted average with blending factor alpha
-            wp.launch(_apply_svd_clamp_kernel, dim=self.n_verts,
-                      inputs=[self.pos, self.dP, self.dPw,
-                              wp.float32(repair_alpha)])
-
     def calc_vol_error(self):
         total_vol = wp.zeros(1, dtype=wp.float32)
         n_tet = self.tet_np.shape[0]
@@ -4294,41 +4548,10 @@ class MuscleSim(ConstraintBuilderMixin):
             return 0.0
         return (total_vol_np - total_rest_np) / total_rest_np
 
-    def clear(self):
-        wp.launch(clear_dP_kernel, dim=self.n_verts,
-                  inputs=[self.dP, self.dPw])
-        if self.n_cons > 0:
-            wp.launch(clear_cons_L_kernel, dim=self.n_cons,
-                      inputs=[self.cons])
-
     def clear_reaction(self):
         if self.n_cons > 0:
             wp.launch(clear_reaction_kernel, dim=max(self.n_cons, 1),
                       inputs=[self.reaction_accum])
-
-    def apply_dP(self):
-        wp.launch(apply_dP_kernel, dim=self.n_verts,
-                  inputs=[self.pos, self.dP, self.dPw])
-
-    def apply_pintotarget(self):
-        """Hard pin pass: directly snap pinned source verts to bone target.
-
-        Runs AFTER apply_dP so the snap is final — apply_dP would otherwise
-        add accumulated Jacobi deltas on top and undo the pin (NaN on GPU).
-        """
-        if not getattr(self, "pintotarget_constraints", None):
-            return
-        rng = self.cons_ranges.get(PINTOTARGET) if hasattr(self, "cons_ranges") else None
-        if rng is None:
-            return
-        offset, count = rng
-        if count <= 0:
-            return
-        if not getattr(self, "_pintotarget_stopped_marked", False):
-            self._mark_pintotarget_stopped()
-            self._pintotarget_stopped_marked = True
-        wp.launch(solve_pintotarget_kernel, dim=count,
-                  inputs=[self.cons, self.pos, offset])
 
     def _mark_pintotarget_stopped(self):
         """Mark all pintotarget source verts as `stopped=1`.
@@ -4347,196 +4570,6 @@ class MuscleSim(ConstraintBuilderMixin):
         stopped_np = self.stopped.numpy()
         stopped_np[src_idx] = 1
         self.stopped = wp.from_numpy(stopped_np, dtype=wp.int32)
-
-    def _dispatch_constraints(self, type_ranges):
-        """Dispatch constraint solver kernels for a given {type: (offset, count)} mapping."""
-        has_compress = 1 if self.has_compressstiffness else 0
-        use_jacobi_int = 1 if self.use_jacobi else 0
-        for ctype, (offset, count) in type_ranges.items():
-            if ctype == TETVOLUME:
-                wp.launch(solve_tetvolume_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
-                    self.dP, self.dPw, self.mass, self.stopped,
-                    self.dt, use_jacobi_int, has_compress, offset])
-            elif ctype == TETFIBERNORM:
-                wp.launch(solve_tetfibernorm_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
-                    self.dP, self.dPw, self.mass, self.stopped,
-                    self.rest_matrix, self.v_fiber_dir,
-                    self.activation, self.tendonmask,
-                    self.dt, use_jacobi_int,
-                    self.contraction_ratio, self.fiber_stiffness_scale,
-                    offset])
-            elif ctype == ATTACH:
-                wp.launch(solve_attach_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
-                    self.dP, self.dPw, self.mass, self.stopped,
-                    self.reaction_accum,
-                    self.dt, use_jacobi_int, has_compress, offset])
-            elif ctype == PIN:
-                wp.launch(solve_pin_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
-                    self.dP, self.dPw, self.mass, self.stopped,
-                    self.dt, use_jacobi_int, has_compress, offset])
-            elif ctype == PINTOTARGET:
-                # Skipped here — pintotarget is a kinematic post-pass run by
-                # apply_pintotarget() AFTER apply_dP, so Jacobi accumulation
-                # cannot undo the snap.
-                continue
-            elif ctype == DISTANCELINE:
-                wp.launch(solve_distanceline_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
-                    self.dP, self.dPw, self.mass, self.stopped,
-                    self.dt, use_jacobi_int, has_compress, offset])
-            elif ctype == TETARAP:
-                wp.launch(solve_tetarap_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
-                    self.dP, self.dPw, self.mass, self.stopped,
-                    self.rest_matrix,
-                    self.dt, use_jacobi_int, offset])
-            elif ctype == TETARAPSVD:
-                wp.launch(solve_tetarap_svd_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
-                    self.dP, self.dPw, self.mass, self.stopped,
-                    self.rest_matrix,
-                    self.dt, use_jacobi_int, offset])
-            elif ctype == TETFIBERDGF:
-                wp.launch(solve_tetfiberdgf_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
-                    self.dP, self.dPw, self.mass, self.stopped,
-                    self.rest_matrix, self.v_fiber_dir,
-                    self.activation, self.tendonmask,
-                    self.dt, use_jacobi_int,
-                    self.fiber_stiffness_scale,
-                    offset])
-            elif ctype == TETFIBERMILLARD:
-                wp.launch(solve_tetfibermillard_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
-                    self.dP, self.dPw, self.mass, self.stopped,
-                    self.rest_matrix, self.v_fiber_dir,
-                    self.activation, self.tendonmask,
-                    self.dt, use_jacobi_int,
-                    self.millard_stiffness_scale,
-                    offset,
-                    # Millard f_L curve data (force + energy)
-                    self._millard_fl_x_coeffs, self._millard_fl_y_coeffs,
-                    self._millard_fl_seg_bounds, self._millard_fl_n_segments,
-                    self._millard_fl_x_lo, self._millard_fl_x_hi,
-                    self._millard_fl_y_lo, self._millard_fl_y_hi,
-                    self._millard_fl_dydx_lo, self._millard_fl_dydx_hi,
-                    self._millard_fl_F_coeffs,
-                    self._millard_fl_energy_offset,
-                    # Millard f_PE curve data
-                    self._millard_fpe_x_coeffs, self._millard_fpe_y_coeffs,
-                    self._millard_fpe_seg_bounds, self._millard_fpe_n_segments,
-                    self._millard_fpe_x_lo, self._millard_fpe_x_hi,
-                    self._millard_fpe_y_lo, self._millard_fpe_y_hi,
-                    self._millard_fpe_dydx_lo, self._millard_fpe_dydx_hi,
-                    float(getattr(self.cfg, 'fiber_skip_detF', 0.0)),
-                    ])
-            elif ctype == TETSNH:
-                wp.launch(solve_tetsnh_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
-                    self.dP, self.dPw, self.mass, self.stopped,
-                    self.rest_matrix,
-                    self.dt, use_jacobi_int, offset])
-
-    def solve_constraints(self, run_extras: bool = True):
-        """Dispatch built-in constraints; optionally also run registered
-        ``constraint_solvers`` extras.
-
-        ``run_extras=False`` is used when the caller wants the extras
-        (typically collision) to run AFTER ``apply_dP`` so they push against
-        the post-ARAP geometry rather than competing with the stale
-        pre-solve gradient. The caller should follow up with
-        ``solve_extras()``.
-        """
-        extras = getattr(self, "constraint_solvers", None)
-        if self.n_cons == 0 and (not run_extras or not extras):
-            return
-        if self.n_cons > 0:
-            if self.use_colored_gs and hasattr(self, 'color_type_ranges'):
-                for type_ranges in self.color_type_ranges:
-                    self._dispatch_constraints(type_ranges)
-            else:
-                self._dispatch_constraints(self.cons_ranges)
-        if run_extras and extras:
-            for fn in extras:
-                fn()
-            if not self.use_jacobi:
-                self.apply_dP()
-
-    def solve_extras(self):
-        """Run only the registered ``constraint_solvers`` (e.g., collision).
-        Intended to be called AFTER ``apply_dP`` so extras see post-ARAP
-        positions. In GS mode (``use_jacobi=False``) the built-in path's
-        apply_dP has already been invoked by the caller, so here we just
-        run extras and (for GS) flush any extras-generated dP again.
-        """
-        extras = getattr(self, "constraint_solvers", None)
-        if not extras:
-            return
-        for fn in extras:
-            fn()
-        if not self.use_jacobi:
-            self.apply_dP()
-
-    # Fiber constraint types to exclude during post-smoothing
-    _FIBER_TYPES = frozenset([TETFIBERNORM, TETFIBERDGF, TETFIBERMILLARD])
-
-    def post_smooth(self):
-        """Jacobi post-smoothing pass: solve only non-fiber constraints
-        (volume, ARAP, attach) to recover mesh quality after fiber contraction.
-        Runs post_smooth_iters iterations, each doing clear→solve→apply.
-
-        On GPU, forces Jacobi mode to avoid race conditions (post_smooth does
-        NOT use colored GS).  On CPU, respects the global use_jacobi setting.
-        """
-        n_iters = int(getattr(self.cfg, 'post_smooth_iters', 0))
-        if n_iters <= 0 or self.n_cons == 0:
-            return
-        # Build filtered type_ranges once and cache
-        if not hasattr(self, '_smooth_ranges'):
-            self._smooth_ranges = {
-                k: v for k, v in self.cons_ranges.items()
-                if k not in self._FIBER_TYPES
-            }
-        # Force Jacobi on GPU to prevent race conditions
-        need_jacobi = self.use_jacobi or self.pos.device.is_cuda
-        saved_jacobi = self.use_jacobi
-        if need_jacobi:
-            self.use_jacobi = True
-        for _ in range(n_iters):
-            self.clear()
-            self._dispatch_constraints(self._smooth_ranges)
-            if self.use_jacobi:
-                self.apply_dP()
-            self.apply_pintotarget()
-        self.use_jacobi = saved_jacobi
-
-    def freeze_near_inverted(self):
-        """Revert vertices of near-inverted tets to their pre-substep positions.
-        Controlled by cfg.freeze_detF_threshold (default 0 = disabled).
-
-        WARNING: Not GPU-safe (race condition on shared vertices). Skipped on
-        CUDA devices with a one-time warning.
-        """
-        threshold = getattr(self.cfg, 'freeze_detF_threshold', 0.0)
-        if threshold <= 0.0:
-            return
-        device = self.pos.device
-        if device.is_cuda:
-            if not getattr(self, '_freeze_gpu_warned', False):
-                import logging
-                logging.getLogger(__name__).warning(
-                    "freeze_near_inverted skipped on GPU (race condition on shared vertices)")
-                self._freeze_gpu_warned = True
-            return
-        n_tet = self.tet_np.shape[0]
-        wp.launch(_freeze_near_inverted_kernel, dim=n_tet,
-                  inputs=[self.tet_indices, self.pos, self.pprev,
-                          self.rest_matrix, self.stopped,
-                          wp.float32(threshold)])
 
     def _capturable_substep(self):
         """One muscle PBD substep — all Warp kernels, no CPU sync.
