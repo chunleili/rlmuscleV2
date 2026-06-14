@@ -1,31 +1,37 @@
-"""humanV2 muscle-vs-moving-skeleton via the Gaia UDCF DCD pipeline.
+"""humanV2 collision: SDF for muscle-vs-bone + UDCF DCD for muscle self.
 
-Same scene as ``muscle.collision.sdf.example.humanV2`` (the pin-driven humanV2
-GMG muscle solver against the 200-frame animated SNU skeleton), but the contact
-is resolved by the UDCF DCD narrow/respond pipeline (:class:`UdcfDcdCollider`)
-instead of the single-push SDF mesh-contact kernel.
+Split by what each method is good at (established empirically — see the commit
+that added this file):
 
-Reuse vs the SDF demo:
-  * ``build_humanV2_sim`` / ``run_humanV2_loop`` / ``add_humanV2_args`` — the
-    sim build, preload, fascia split, USD/geo export, and the per-frame loop are
-    shared verbatim.
-  * ``AnimatedBoneMeshCollider`` is reused unchanged as the penetration
-    MEASUREMENT instrument (its ``wp.Mesh`` + ``inside_depth`` drive the
-    ``is_collide`` / ``pen_depth`` primvars), so the USD output is directly
-    A/B-comparable with the SDF run.
+  * muscle-vs-bone is a VOLUMETRIC overlap of the muscle against a penetrating
+    animated target.  The SDF point-projection collider
+    (``muscle.collision.sdf.example.humanV2.AnimatedBoneMeshCollider``) resolves
+    it cleanly — it hard-projects each submerged vertex to the bone surface.  A
+    surface tri-tri method (DCD) only ever sees the thin crossing rim, so it
+    cannot clear the volume no matter how it is tuned (jacobi/GS, interleaved/
+    last, multiplier, clamp all tried — count drops but depth grows).
 
-Only the contact RESPONSE differs: the muscle surface triangles are the movable
-set and the per-frame skeleton mesh is the DCD static body.  The collider runs
-on ``sim.collision_solvers_iter`` — the per-iteration hook that interleaves
-DCD narrowPhase with ARAP/volume the way the Gaia reference PBD loop does —
-rather than the SDF demo's once-per-substep ``collision_solvers`` post pass.
+  * muscle-vs-muscle self-collision IS a surface-crossing problem with no SDF
+    available (deformable vs deformable), which is exactly the UDCF DCD
+    (:class:`UdcfDcdCollider`, ``allow_self=True``) domain.
+
+Wiring:
+  * SDF bone collider on ``collision_solvers`` (post_phase) — the substep's
+    FINAL word, hard-projecting muscle out of the moving skeleton.
+  * DCD self collider on ``collision_solvers_iter`` (per-iteration) — interleaves
+    self-contact with ARAP/volume; static body is a dummy far-away triangle so
+    ONLY movable-vs-movable (muscle self) pairs are emitted.
+
+The SDF collider also doubles as the penetration METER (its ``inside_depth``
+drives the USD ``is_collide`` / ``pen_depth`` primvars), shared via
+``run_humanV2_loop``.
 
 Run::
 
     PYTHONPATH=src .venv/bin/python -m muscle.collision.udcf.example.humanV2 \\
         --config data/humanV2/config/humanV2_gmg.json \\
         --bone_dir data/humanV2/model/bone --end_frame 20 \\
-        --usd output/humanV2_dcd_coll.usd
+        --usd output/humanV2_sdf_bone_dcd_self.usd
 """
 from __future__ import annotations
 
@@ -42,70 +48,75 @@ from muscle.collision.sdf.example.humanV2 import (
 )
 from muscle.collision.udcf.solver import UdcfDcdCollider, UdcfParams
 
+# Far-away degenerate static mesh: UdcfDcdCollider requires a static body, but
+# in self-only mode we want NO muscle-vs-static pairs — placing it at 1e4 keeps
+# it out of every broadphase cell.
+_DUMMY_STATIC_V = np.array([[1e4, 1e4, 1e4], [1e4 + 1, 1e4, 1e4],
+                            [1e4, 1e4, 1e4 + 1]], np.float32)
+_DUMMY_STATIC_T = np.array([[0, 1, 2]], np.int32)
+
 
 def main(argv=None):
     ap = add_humanV2_args(argparse.ArgumentParser())
-    ap.add_argument("--usd", default="output/humanV2_dcd_coll.usd")
-    ap.add_argument("--self_collision", action="store_true",
-                    help="also resolve muscle self-collision (movable-vs-movable)")
+    ap.add_argument("--usd", default="output/humanV2_sdf_bone_dcd_self.usd")
+    ap.add_argument("--no_bone", action="store_true",
+                    help="disable SDF muscle-vs-bone resolution")
+    ap.add_argument("--no_self", action="store_true",
+                    help="disable DCD muscle self-collision")
     ap.add_argument("--thickness", type=float, default=1e-3,
-                    help="broadphase sphere slack (m)")
-    ap.add_argument("--multiplier", type=float, default=1.01,
-                    help="collisionConstraintMultiplier")
+                    help="DCD broadphase sphere slack (m)")
+    ap.add_argument("--self_multiplier", type=float, default=1.01,
+                    help="DCD collisionConstraintMultiplier for self-contact")
     ap.add_argument("--mu_s", type=float, default=0.5)
     ap.add_argument("--mu_d", type=float, default=0.4)
-    ap.add_argument("--max_pairs", type=int, default=1 << 21,
-                    help="broadphase pair cap (humanV2 skeleton emits ~1.1M)")
-    ap.add_argument("--max_contacts", type=int, default=1 << 18)
+    ap.add_argument("--self_max_pairs", type=int, default=1 << 22,
+                    help="self broadphase pair cap (humanV2 muscle emits ~2.5M)")
+    ap.add_argument("--self_max_contacts", type=int, default=1 << 18)
+    ap.add_argument("--self_gauss_seidel", action="store_true",
+                    help="serial GS self-resolve (stable under fold, single-"
+                         "thread/slow); default jacobi at this vertex count")
     args = ap.parse_args(argv)
+    # --no_collision (shared flag) disables BOTH resolvers.
+    if args.no_collision:
+        args.no_bone = args.no_self = True
 
     wp.init()
     sim, cfg, surf_flat, fascia_flat = build_humanV2_sim(args)
 
-    # Reuse the SDF collider purely as the bone-mesh holder + penetration meter:
-    # it owns the per-frame wp.Mesh (set_frame / refit) and inside_depth, but is
-    # NOT registered as a solver — the DCD collider does the actual response.
-    meter = AnimatedBoneMeshCollider(sim, args.bone_dir, max_dist=args.max_dist)
+    # --- muscle-vs-bone: SDF collider (proven resolver + penetration meter) ---
+    bone = AnimatedBoneMeshCollider(sim, args.bone_dir, max_dist=args.max_dist)
     if not args.static_bone:
-        meter.preload(range(sim.start_frame, sim.end_frame + 1))
+        bone.preload(range(sim.start_frame, sim.end_frame + 1))
+    if not args.no_bone:
+        sim.collision_solvers = [bone]          # post_phase: final word
 
+    # --- muscle self-collision: UDCF DCD (allow_self, dummy static) -----------
     dcd = None
-    if not args.no_collision:
-        # Movable = muscle surface tris; static = the skeleton mesh (already
-        # outward-wound by AnimatedBoneMeshCollider's [0,2,1] swap, exposed as
-        # tris_flat).  DCD offsets the static tri indices by n_mov internally.
-        bone_tris = meter.tris_flat.reshape(-1, 3)
+    if not args.no_self:
         dcd = UdcfDcdCollider(
             sim.pos, sim.inv_mass,
             surface_tris=surf_flat.reshape(-1, 3),
-            static_verts=np.asarray(meter._cur_verts, np.float32),
-            static_tris=bone_tris,
-            params=UdcfParams(allow_self=args.self_collision,
+            static_verts=_DUMMY_STATIC_V, static_tris=_DUMMY_STATIC_T,
+            params=UdcfParams(allow_self=True,
                               thickness=args.thickness,
-                              multiplier=args.multiplier,
+                              multiplier=args.self_multiplier,
                               friction_static=args.mu_s,
                               friction_dynamic=args.mu_d,
-                              max_pairs=args.max_pairs,
-                              max_contacts=args.max_contacts),
+                              max_pairs=args.self_max_pairs,
+                              max_contacts=args.self_max_contacts,
+                              gauss_seidel=args.self_gauss_seidel,
+                              jacobi_avg=not args.self_gauss_seidel),
             device=args.device)
-        sim.collision_solvers_iter = [dcd.solve]
+        sim.collision_solvers_iter = [dcd.solve]  # per-iteration: interleaved
 
-    print(f"bone collider (UDCF DCD): {meter.n_bone_verts} verts, "
-          f"{meter.n_bone_tris} tris  "
-          f"({'STATIC@f1' if args.static_bone else 'ANIMATED'}, "
-          f"push={'OFF' if args.no_collision else 'ON'}, "
-          f"self={'ON' if args.self_collision else 'OFF'})")
+    print(f"humanV2 collision: bone={'SDF' if not args.no_bone else 'OFF'}  "
+          f"self={'DCD' if not args.no_self else 'OFF'}  "
+          f"({'STATIC@f1' if args.static_bone else 'ANIMATED'} skeleton, "
+          f"{bone.n_bone_verts} bone verts)")
 
-    def push_bones(frame):
-        # meter.set_frame already loaded this frame's bone verts into _cur_verts;
-        # mirror them into the DCD static region (old pose -> x_prev for friction).
-        if dcd is not None:
-            dcd.set_static_verts(np.asarray(meter._cur_verts, np.float32))
-
-    run_humanV2_loop(sim, meter, args, cfg, surf_flat, fascia_flat,
-                     pre_step=push_bones)
+    run_humanV2_loop(sim, bone, args, cfg, surf_flat, fascia_flat)
     if dcd is not None:
-        print(f"DCD final: {dcd.stats()}")
+        print(f"DCD self final: {dcd.stats()}")
 
 
 if __name__ == "__main__":
