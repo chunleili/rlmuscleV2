@@ -85,6 +85,27 @@ class GeoFile:
                 payload = payload[0]
             self._attrs[name] = payload
 
+        # Primitive attributes (per-tet).  String attrs (e.g. muscle_id) store a
+        # `strings` table + a per-primitive integer index into it; numeric attrs
+        # use the same values[5] payload as point attrs.
+        self._prim_attrs: dict[str, np.ndarray] = {}
+        self._prim_attr_strings: dict[str, list] = {}
+        for entry in attrs.get("primitiveattributes", []):
+            meta = _pair_list_to_dict(entry[0])
+            data = _pair_list_to_dict(entry[1])
+            name = meta["name"]
+            if "strings" in data and "indices" in data:
+                idxd = _pair_list_to_dict(data["indices"])
+                arr = idxd.get("arrays")
+                if arr is not None:
+                    self._prim_attrs[name] = np.asarray(arr).ravel().astype(np.int32)
+                    self._prim_attr_strings[name] = list(data["strings"])
+            elif "values" in data:
+                payload = np.asarray(data["values"][5])
+                if payload.ndim == 2 and payload.shape[0] == 1:
+                    payload = payload[0]
+                self._prim_attrs[name] = payload
+
         # Topology / tet indices
         topo = _pair_list_to_dict(root["topology"])
         pointref = _pair_list_to_dict(topo["pointref"])
@@ -171,6 +192,20 @@ class GeoFile:
         if name not in self._groups:
             raise KeyError(f"point group '{name}' not in {sorted(self._groups)}")
         return self._groups[name]
+
+    def has_prim_attr(self, name: str) -> bool:
+        return name in self._prim_attrs
+
+    def prim_attr(self, name: str) -> np.ndarray:
+        """Per-primitive attribute. For string attrs this is the integer index
+        into :meth:`prim_attr_strings` (one int per tet)."""
+        if name not in self._prim_attrs:
+            raise KeyError(f"prim attribute '{name}' not in {sorted(self._prim_attrs)}")
+        return self._prim_attrs[name]
+
+    def prim_attr_strings(self, name: str) -> list:
+        """String table for a string-typed prim attr (index -> name)."""
+        return self._prim_attr_strings.get(name, [])
 
 
 def _find_point_attr(pointattrs, name):
