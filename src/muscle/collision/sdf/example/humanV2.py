@@ -192,39 +192,18 @@ class AnimatedBoneMeshCollider:
         return self.mesh.indices.numpy().astype(np.int32)
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="data/humanV2/config/humanV2_gmg.json")
-    ap.add_argument("--bone_dir", default="data/humanV2/model/bone")
-    ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--end_frame", type=int, default=20)
-    ap.add_argument("--max_dist", type=float, default=0.2)
-    ap.add_argument("--no_collision", action="store_true")
-    ap.add_argument("--static_bone", action="store_true",
-                    help="freeze bones at frame 1 (for A/B vs animated)")
-    ap.add_argument("--usd", default="output/humanV2_sdf_coll.usd")
-    ap.add_argument("--no_export", action="store_true",
-                    help="skip all USD/geo output (measure pure sim time)")
-    ap.add_argument("--geo_out", default=None,
-                    help="dir for per-frame .geo (in-place P + is_collide). "
-                         "Template = cfg rest_path. ~37MB/frame.")
-    args = ap.parse_args(argv)
+def build_humanV2_sim(args):
+    """Build the OneWaySim + preload per-frame targets, and compute the
+    muscle/fascia surface triangle lists for rendering.
 
-    wp.init()
+    Shared by the SDF demo (this module) and the UDCF DCD demo
+    (``muscle.collision.udcf.example.humanV2``) — both drive the SAME humanV2
+    GMG solver and only differ in which collider resolves contact, so the
+    config load, preload, and fascia split live here once.
+    """
     cfg = load_config(args.config)
     cfg["end_frame"] = args.end_frame
     sim = OneWaySim(cfg, device=args.device)
-
-    # Always build the collider (we need its mesh to MEASURE penetration even
-    # when --no_collision disables the push) — only registering it as a solver
-    # turns the actual contact resolution on.
-    collider = AnimatedBoneMeshCollider(sim, args.bone_dir, max_dist=args.max_dist)
-    if not args.no_collision:
-        sim.collision_solvers = [collider]
-    print(f"bone collider: {collider.n_bone_verts} verts, "
-          f"{collider.n_bone_tris} tris  "
-          f"({'STATIC@f1' if args.static_bone else 'ANIMATED'}, "
-          f"push={'OFF' if args.no_collision else 'ON'})")
     print(f"NV={sim.NV}  NT={sim.NT}  frames={sim.start_frame}..{sim.end_frame}")
 
     # Parse all per-frame cons/bone .geo up front (RAM-resident, .npy-backed) so
@@ -232,9 +211,7 @@ def main(argv=None):
     t_load = time.perf_counter()
     frames = range(sim.start_frame, sim.end_frame + 1)
     sim.preload_targets(frames)
-    if not args.static_bone:
-        collider.preload(frames)
-    print(f"[preload] {len(frames)} frames of targets+bones "
+    print(f"[preload] {len(frames)} frames of targets "
           f"in {time.perf_counter() - t_load:.1f}s")
 
     # When fascia is active (use_fascia) the tet set is muscle + an outer fascia
@@ -242,8 +219,7 @@ def main(argv=None):
     # the muscle vertex count (fascia verts are appended above it).
     tets = sim.tet_idx.numpy()
     nvm = getattr(sim, "nvm", sim.NV)
-    has_fascia = nvm < sim.NV
-    if has_fascia:
+    if nvm < sim.NV:
         muscle_tets = tets[(tets < nvm).all(axis=1)]
         fascia_tets = tets[(tets >= nvm).all(axis=1)]
         surf_flat = _vectorized_surface_tris(muscle_tets).reshape(-1).astype(np.int32)
@@ -253,7 +229,17 @@ def main(argv=None):
     else:
         surf_flat = _vectorized_surface_tris(tets).reshape(-1).astype(np.int32)
         fascia_flat = None
+    return sim, cfg, surf_flat, fascia_flat
 
+
+def run_humanV2_loop(sim, collider, args, cfg, surf_flat, fascia_flat,
+                     *, pre_step=None):
+    """Per-frame step + USD/geo export, with ``collider`` as the penetration
+    MEASUREMENT instrument (bone mesh + inside_depth) regardless of who resolves
+    contact.  ``pre_step(frame)`` runs after the bones are positioned but before
+    the solve — the UDCF demo uses it to push the new bone pose into its DCD
+    collider's static-mesh region.
+    """
     renderer = None
     if not args.no_export:
         from muscle.engine import WarpRenderer
@@ -274,6 +260,8 @@ def main(argv=None):
     for frame in range(sim.start_frame, sim.end_frame + 1):
         if not args.static_bone:
             collider.set_frame(frame)              # move bones BEFORE solving
+        if pre_step is not None:
+            pre_step(frame)
         sim.step_frame(frame)
         depth = collider.inside_depth()             # >0 = inside bone
         is_collide = (depth > 0.0).astype(np.int32)  # per-vertex 0/1
@@ -307,6 +295,48 @@ def main(argv=None):
     if renderer is not None:
         renderer.save()
         print(f"USD saved -> {args.usd}")
+
+
+def add_humanV2_args(ap):
+    """Args shared by the SDF and UDCF DCD humanV2 demos."""
+    ap.add_argument("--config", default="data/humanV2/config/humanV2_gmg.json")
+    ap.add_argument("--bone_dir", default="data/humanV2/model/bone")
+    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--end_frame", type=int, default=20)
+    ap.add_argument("--max_dist", type=float, default=0.2)
+    ap.add_argument("--no_collision", action="store_true")
+    ap.add_argument("--static_bone", action="store_true",
+                    help="freeze bones at frame 1 (for A/B vs animated)")
+    ap.add_argument("--no_export", action="store_true",
+                    help="skip all USD/geo output (measure pure sim time)")
+    ap.add_argument("--geo_out", default=None,
+                    help="dir for per-frame .geo (in-place P + is_collide). "
+                         "Template = cfg rest_path. ~37MB/frame.")
+    return ap
+
+
+def main(argv=None):
+    ap = add_humanV2_args(argparse.ArgumentParser())
+    ap.add_argument("--usd", default="output/humanV2_sdf_coll.usd")
+    args = ap.parse_args(argv)
+
+    wp.init()
+    sim, cfg, surf_flat, fascia_flat = build_humanV2_sim(args)
+
+    # Always build the collider (we need its mesh to MEASURE penetration even
+    # when --no_collision disables the push) — only registering it as a solver
+    # turns the actual contact resolution on.
+    collider = AnimatedBoneMeshCollider(sim, args.bone_dir, max_dist=args.max_dist)
+    if not args.static_bone:
+        collider.preload(range(sim.start_frame, sim.end_frame + 1))
+    if not args.no_collision:
+        sim.collision_solvers = [collider]
+    print(f"bone collider (SDF): {collider.n_bone_verts} verts, "
+          f"{collider.n_bone_tris} tris  "
+          f"({'STATIC@f1' if args.static_bone else 'ANIMATED'}, "
+          f"push={'OFF' if args.no_collision else 'ON'})")
+
+    run_humanV2_loop(sim, collider, args, cfg, surf_flat, fascia_flat)
 
 
 if __name__ == "__main__":
