@@ -63,6 +63,27 @@ def centroid_radius_kernel(
 
 
 @wp.kernel
+def face_normal_kernel(
+    tris: wp.array2d(dtype=wp.int32),
+    verts: wp.array(dtype=wp.vec3),
+    normals: wp.array(dtype=wp.vec3),
+):
+    """Unit face normal (cross(e1, e2)) per triangle — feeds the broadphase
+    normal-cone cull (skip co-oriented pairs that cannot form a penetration
+    contact)."""
+    i = wp.tid()
+    a = verts[tris[i, 0]]
+    b = verts[tris[i, 1]]
+    c = verts[tris[i, 2]]
+    n = wp.cross(b - a, c - a)
+    ln = wp.length(n)
+    if ln > 0.0:
+        normals[i] = n / ln
+    else:
+        normals[i] = wp.vec3(0.0, 0.0, 0.0)
+
+
+@wp.kernel
 def max_radius_reduce_kernel(
     radii: wp.array(dtype=wp.float32),
     out_max: wp.array(dtype=wp.float32),
@@ -833,6 +854,9 @@ def emit_pairs_groups_kernel(
     radii: wp.array(dtype=wp.float32),
     tris: wp.array2d(dtype=wp.int32),
     tri_group: wp.array(dtype=wp.int32),     # 0 = movable, 1 = static
+    normals: wp.array(dtype=wp.vec3),        # per-tri face normal (normal cull)
+    normal_cull: wp.float32,                 # skip self pairs with n_i·n_j >
+                                             # this; >=1 disables (max dot is 1)
     allow_self: wp.int32,                    # movable-vs-movable pairs
     query_radius: wp.float32,
     thickness: wp.float32,
@@ -875,6 +899,12 @@ def emit_pairs_groups_kernel(
             if (ai0 == bj0 or ai0 == bj1 or ai0 == bj2 or
                     ai1 == bj0 or ai1 == bj1 or ai1 == bj2 or
                     ai2 == bj0 or ai2 == bj1 or ai2 == bj2):
+                continue
+            # Normal-cone cull: two muscle faces can only form a penetration
+            # contact when they face INTO each other (n_i·n_j < 0).  Co-oriented
+            # neighbours (same surface patch) cannot — skip them.  normal_cull>=1
+            # disables (the max possible dot is 1).
+            if wp.dot(normals[i], normals[j]) > normal_cull:
                 continue
         if wp.length(ci - centroids[j]) > ri + radii[j] + thickness:
             continue

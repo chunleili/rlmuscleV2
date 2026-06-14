@@ -14,6 +14,7 @@ import warp as wp
 
 from muscle.collision.udcf.kernel import (
     centroid_radius_kernel,
+    face_normal_kernel,
     max_radius_reduce_kernel,
     emit_pairs_groups_kernel,
     tri_aabb_kernel,
@@ -51,6 +52,9 @@ class UdcfParams:
     max_contacts: int = 1 << 18
     allow_self: bool = False          # movable-vs-movable pairs
     grid_dim: int = 128
+    normal_cull: float = 1.0          # skip self pairs with n_i·n_j > this
+                                      # (co-oriented faces can't penetrate).
+                                      # 1.0 disables; 0.0 culls same-hemisphere.
     use_bvh: bool = False             # broadphase backend.  False (default):
                                       # hashgrid — fastest here (~161ms on the
                                       # humanV2 muscle self set).  True: wp.Bvh
@@ -148,6 +152,7 @@ class UdcfDcdCollider:
 
         self.centroids = wp.zeros(self.n_tris, dtype=wp.vec3, device=self.device)
         self.radii = wp.zeros(self.n_tris, dtype=wp.float32, device=self.device)
+        self.normals = wp.zeros(self.n_tris, dtype=wp.vec3, device=self.device)
         self._max_radius = wp.zeros(1, dtype=wp.float32, device=self.device)
         self.pair_a = wp.zeros(p.max_pairs, dtype=wp.int32, device=self.device)
         self.pair_b = wp.zeros(p.max_pairs, dtype=wp.int32, device=self.device)
@@ -245,6 +250,9 @@ class UdcfDcdCollider:
         wp.launch(centroid_radius_kernel, dim=self.n_tris,
                   inputs=[self.tris, self.x, self.centroids, self.radii],
                   device=self.device)
+        if p.normal_cull < 1.0:
+            wp.launch(face_normal_kernel, dim=self.n_tris,
+                      inputs=[self.tris, self.x, self.normals], device=self.device)
         if p.cell_size is None:
             wp.launch(max_radius_reduce_kernel, dim=1,
                       inputs=[self.radii, self._max_radius], device=self.device)
@@ -263,7 +271,8 @@ class UdcfDcdCollider:
         self.n_pairs.zero_()
         wp.launch(emit_pairs_groups_kernel, dim=self.n_tris,
                   inputs=[self.grid.id, self.centroids, self.radii, self.tris,
-                          self.tri_group, wp.int32(int(p.allow_self)),
+                          self.tri_group, self.normals, wp.float32(p.normal_cull),
+                          wp.int32(int(p.allow_self)),
                           wp.float32(query_radius), wp.float32(p.thickness),
                           wp.int32(p.max_pairs),
                           self.pair_a, self.pair_b, self.n_pairs],
