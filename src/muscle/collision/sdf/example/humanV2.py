@@ -315,6 +315,10 @@ def add_humanV2_args(ap):
     ap.add_argument("--geo_out", default=None,
                     help="dir for per-frame .geo (in-place P + is_collide). "
                          "Template = cfg rest_path. ~37MB/frame.")
+    ap.add_argument("--contact_offset", type=float, default=1e-5,
+                    help="SDF push target = surface + this gap (m); holds muscle "
+                         "verts a hair proud of the bone instead of exactly on it "
+                         "(default 10um). 0 = project onto the surface.")
     ap.add_argument("--collide_eps", type=float, default=1e-6,
                     help="is_collide depth threshold (m); verts shallower than "
                          "this count as resolved (default 1um — filters the "
@@ -333,7 +337,8 @@ def main(argv=None):
     # Always build the collider (we need its mesh to MEASURE penetration even
     # when --no_collision disables the push) — only registering it as a solver
     # turns the actual contact resolution on.
-    collider = AnimatedBoneMeshCollider(sim, args.bone_dir, max_dist=args.max_dist)
+    collider = AnimatedBoneMeshCollider(sim, args.bone_dir, max_dist=args.max_dist,
+                                        contact_offset=args.contact_offset)
     if not args.static_bone:
         collider.preload(range(sim.start_frame, sim.end_frame + 1))
     if not args.no_collision:

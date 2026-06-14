@@ -84,7 +84,8 @@ def main(argv=None):
     sim, cfg, surf_flat, fascia_flat = build_humanV2_sim(args)
 
     # --- muscle-vs-bone: SDF collider (proven resolver + penetration meter) ---
-    bone = AnimatedBoneMeshCollider(sim, args.bone_dir, max_dist=args.max_dist)
+    bone = AnimatedBoneMeshCollider(sim, args.bone_dir, max_dist=args.max_dist,
+                                    contact_offset=args.contact_offset)
     if not args.static_bone:
         bone.preload(range(sim.start_frame, sim.end_frame + 1))
     if not args.no_bone:
