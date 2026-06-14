@@ -61,8 +61,8 @@ def main(argv=None):
     ap.add_argument("--usd", default="output/humanV2_sdf_bone_dcd_self.usd")
     ap.add_argument("--no_bone", action="store_true",
                     help="disable SDF muscle-vs-bone resolution")
-    ap.add_argument("--no_self", action="store_true",
-                    help="disable DCD muscle self-collision")
+    ap.add_argument("--self_collision", action="store_true",
+                    help="enable DCD muscle self-collision (OFF by default)")
     ap.add_argument("--thickness", type=float, default=1e-3,
                     help="DCD broadphase sphere slack (m)")
     ap.add_argument("--self_multiplier", type=float, default=1.01,
@@ -79,6 +79,10 @@ def main(argv=None):
                     help="run DCD self once per SUBSTEP (post_phase) instead of "
                          "per fine-iteration — fewer response launches, looser "
                          "convergence")
+    ap.add_argument("--self_bvh", action="store_true",
+                    help="use the wp.Bvh broadphase backend for self-collision "
+                         "instead of the default hashgrid (generally slower on "
+                         "this mesh — rebuild cost; see UdcfParams.use_bvh)")
     ap.add_argument("--self_rebuild_substeps", action="store_true",
                     help="rebuild the self broadphase EVERY call (~10x slower). "
                          "Default rebuilds once per FRAME and reuses pairs across "
@@ -87,7 +91,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     # --no_collision (shared flag) disables BOTH resolvers.
     if args.no_collision:
-        args.no_bone = args.no_self = True
+        args.no_bone = True
+        args.self_collision = False
 
     wp.init()
     sim, cfg, surf_flat, fascia_flat = build_humanV2_sim(args)
@@ -99,7 +104,7 @@ def main(argv=None):
         bone.preload(range(sim.start_frame, sim.end_frame + 1))
     # --- muscle self-collision: UDCF DCD (allow_self, dummy static) -----------
     dcd = None
-    if not args.no_self:
+    if args.self_collision:
         dcd = UdcfDcdCollider(
             sim.pos, sim.inv_mass,
             surface_tris=surf_flat.reshape(-1, 3),
@@ -112,7 +117,8 @@ def main(argv=None):
                               max_pairs=args.self_max_pairs,
                               max_contacts=args.self_max_contacts,
                               gauss_seidel=args.self_gauss_seidel,
-                              jacobi_avg=not args.self_gauss_seidel),
+                              jacobi_avg=not args.self_gauss_seidel,
+                              use_bvh=args.self_bvh),
             device=args.device)
 
     # Self broadphase rebuild cadence.  dcd.solve(i_iter): i_iter==0 rebuilds the
@@ -146,7 +152,7 @@ def main(argv=None):
         sim.collision_solvers = post
 
     print(f"humanV2 collision: bone={'SDF' if not args.no_bone else 'OFF'}  "
-          f"self={'DCD' if not args.no_self else 'OFF'}  "
+          f"self={'DCD' if args.self_collision else 'OFF'}  "
           f"({'STATIC@f1' if args.static_bone else 'ANIMATED'} skeleton, "
           f"{bone.n_bone_verts} bone verts)")
 
