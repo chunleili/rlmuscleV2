@@ -57,8 +57,14 @@ def main(argv=None):
                     help="enable DCD muscle self-collision (OFF by default)")
     ap.add_argument("--thickness", type=float, default=1e-3,
                     help="DCD broadphase sphere slack (m)")
-    ap.add_argument("--self_multiplier", type=float, default=1.01,
-                    help="DCD collisionConstraintMultiplier for self-contact")
+    ap.add_argument("--self_multiplier", type=float, default=0.3,
+                    help="DCD collisionConstraintMultiplier for self-contact. "
+                         "0.3 (soft) + a few --self_iters converges; the hard "
+                         "1.01 single-push diverges in the pinned muscle context "
+                         "(see the multiplier x iters sweep).")
+    ap.add_argument("--self_iters", type=int, default=2,
+                    help="DCD push iterations per substep (broadphase reused "
+                         "across them). 2 balances depth vs cost; >4 re-diverges.")
     ap.add_argument("--mu_s", type=float, default=0.5)
     ap.add_argument("--mu_d", type=float, default=0.4)
     ap.add_argument("--self_max_pairs", type=int, default=1 << 22,
@@ -67,10 +73,6 @@ def main(argv=None):
     ap.add_argument("--self_gauss_seidel", action="store_true",
                     help="serial GS self-resolve (stable under fold, single-"
                          "thread/slow); default jacobi at this vertex count")
-    ap.add_argument("--self_per_substep", action="store_true",
-                    help="run DCD self once per SUBSTEP (post_phase) instead of "
-                         "per fine-iteration — fewer response launches, looser "
-                         "convergence")
     ap.add_argument("--self_normal_cull", type=float, default=1.0,
                     help="skip self pairs with n_i.n_j > this (1.0 disables, "
                          "0.0 culls co-oriented faces)")
@@ -116,33 +118,36 @@ def main(argv=None):
                               normal_cull=args.self_normal_cull),
             device=args.device)
 
-    # Self broadphase rebuild cadence.  dcd.solve(i_iter): i_iter==0 rebuilds the
-    # broadphase (+ snapshots x_prev), i_iter>0 reuses the existing pairs.  By
-    # default we rebuild ONCE per frame (first self call) and reuse across the
-    # frame's substeps — a ~10x win, since the 2.5M-pair grid is near-constant
-    # within a frame.  --self_rebuild_substeps forces a rebuild every call.
-    self_fn = dcd.solve if dcd is not None else None
+    # Both colliders run in post_phase (the substep's final ops), NOT the
+    # interleaved iter hook — interleaving lets the remaining ARAP iterations push
+    # corrected verts back and spawn secondary self-crossings (max penetration
+    # climbs).  Order is self DCD first, SDF bone LAST: self-before-bone keeps the
+    # self relief (p99 -25%) while letting bone get the final word so muscle is
+    # not pushed back into the skeleton (is_collide stays ~0 vs ~70 if bone ran
+    # before self).  Per substep self does --self_iters soft pushes; dcd.solve(0)
+    # rebuilds the broadphase (+ snapshots x_prev), solve(1) reuses the pairs.
+    # Broadphase rebuilds once per frame (first substep) and is reused across the
+    # rest (the 2.5M-pair grid is near-constant within a frame);
+    # --self_rebuild_substeps rebuilds every substep.
     reset_self = None
-    if dcd is not None and not args.self_rebuild_substeps:
+    post = []
+    if dcd is not None:
         state = {"fresh": True}
+        K = max(1, args.self_iters)
 
-        def self_fn(it=0, _st=state, _d=dcd):
-            _d.solve(0 if _st["fresh"] else 1)
+        def self_fn(_st=state, _d=dcd, _K=K, _every=args.self_rebuild_substeps):
+            rebuild = _st["fresh"] or _every
             _st["fresh"] = False
+            _d.solve(0 if rebuild else 1)        # push 0 (+ broadphase if due)
+            for _ in range(_K - 1):
+                _d.solve(1)                       # extra pushes reuse the pairs
 
         def reset_self(frame, _st=state):
             _st["fresh"] = True
 
-    # post_phase runs once per substep; bone (SDF) must be the FINAL word so it
-    # appends last.  Per-substep self goes ahead of it; per-fine-iter self uses
-    # the interleaved hook instead.
-    post = []
-    if self_fn is not None and args.self_per_substep:
-        post.append(self_fn)
-    elif self_fn is not None:
-        sim.collision_solvers_iter = [self_fn]
+        post.append(self_fn)                     # self DCD first ...
     if not args.no_bone:
-        post.append(bone)
+        post.append(bone)                        # ... SDF bone LAST (final word)
     if post:
         sim.collision_solvers = post
 
