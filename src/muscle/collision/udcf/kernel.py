@@ -883,3 +883,70 @@ def emit_pairs_groups_kernel(
             pair_a[slot] = i
             pair_b[slot] = j
 
+
+@wp.kernel
+def tri_aabb_kernel(
+    tris: wp.array2d(dtype=wp.int32),
+    x: wp.array(dtype=wp.vec3),
+    pad: wp.float32,
+    lower: wp.array(dtype=wp.vec3),
+    upper: wp.array(dtype=wp.vec3),
+):
+    """Per-triangle AABB padded by ``pad`` (= thickness) for the optional
+    wp.Bvh broadphase (UdcfParams.use_bvh).  The pad bakes in the thickness
+    slack so the AABB-overlap query needs no separate sphere reject."""
+    i = wp.tid()
+    a = x[tris[i, 0]]
+    b = x[tris[i, 1]]
+    c = x[tris[i, 2]]
+    p = wp.vec3(pad, pad, pad)
+    lower[i] = wp.min(wp.min(a, b), c) - p
+    upper[i] = wp.max(wp.max(a, b), c) + p
+
+
+@wp.kernel
+def emit_pairs_bvh_kernel(
+    bvh: wp.uint64,
+    lower: wp.array(dtype=wp.vec3),
+    upper: wp.array(dtype=wp.vec3),
+    tris: wp.array2d(dtype=wp.int32),
+    tri_group: wp.array(dtype=wp.int32),     # 0 = movable, 1 = static
+    allow_self: wp.int32,
+    max_pairs: wp.int32,
+    pair_a: wp.array(dtype=wp.int32),
+    pair_b: wp.array(dtype=wp.int32),
+    n_pairs: wp.array(dtype=wp.int32),
+):
+    """BVH broadphase emit: same group/adjacency rules as
+    ``emit_pairs_groups_kernel`` but candidates come from an AABB-overlap query
+    against a ``wp.Bvh``.  AABB-overlap (boxes padded by thickness) is already a
+    conservative superset of within-thickness triangle pairs, so no sphere
+    reject is applied here."""
+    i = wp.tid()
+    gi = tri_group[i]
+    q = wp.bvh_query_aabb(bvh, lower[i], upper[i])
+    j = wp.int32(0)
+    while wp.bvh_query_next(q, j):
+        if j <= i:
+            continue
+        gj = tri_group[j]
+        if gi == 1 and gj == 1:
+            continue
+        if gi == 0 and gj == 0:
+            if allow_self == 0:
+                continue
+            ai0 = tris[i, 0]
+            ai1 = tris[i, 1]
+            ai2 = tris[i, 2]
+            bj0 = tris[j, 0]
+            bj1 = tris[j, 1]
+            bj2 = tris[j, 2]
+            if (ai0 == bj0 or ai0 == bj1 or ai0 == bj2 or
+                    ai1 == bj0 or ai1 == bj1 or ai1 == bj2 or
+                    ai2 == bj0 or ai2 == bj1 or ai2 == bj2):
+                continue
+        slot = wp.atomic_add(n_pairs, 0, 1)
+        if slot < max_pairs:
+            pair_a[slot] = i
+            pair_b[slot] = j
+

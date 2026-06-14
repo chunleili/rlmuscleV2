@@ -16,6 +16,8 @@ from muscle.collision.udcf.kernel import (
     centroid_radius_kernel,
     max_radius_reduce_kernel,
     emit_pairs_groups_kernel,
+    tri_aabb_kernel,
+    emit_pairs_bvh_kernel,
     narrow_kernel,
     narrow_respond_gs_kernel,
     respond_kernel,
@@ -49,6 +51,17 @@ class UdcfParams:
     max_contacts: int = 1 << 18
     allow_self: bool = False          # movable-vs-movable pairs
     grid_dim: int = 128
+    use_bvh: bool = False             # broadphase backend.  False (default):
+                                      # hashgrid — fastest here (~161ms on the
+                                      # humanV2 muscle self set).  True: wp.Bvh
+                                      # over per-triangle AABBs, rebuilt each
+                                      # broadphase.  AABBs are tighter than the
+                                      # hashgrid's single-cell sphere test, but
+                                      # the per-broadphase tree REBUILD (~600ms
+                                      # at 238k tris) costs more than it saves on
+                                      # this mesh; kept as an option for meshes
+                                      # with very non-uniform triangle sizes or
+                                      # small tri counts where rebuild is cheap.
     jacobi_avg: bool = True           # True: dP/count (bounded, can under-
                                       # correct clusters); False: summed dP
                                       # (closer to the reference's serial
@@ -141,6 +154,15 @@ class UdcfDcdCollider:
         self.n_pairs = wp.zeros(1, dtype=wp.int32, device=self.device)
         self.grid = wp.HashGrid(p.grid_dim, p.grid_dim, p.grid_dim,
                                 device=self.device)
+        # Optional BVH broadphase scratch (UdcfParams.use_bvh).
+        self.bvh = None
+        if p.use_bvh:
+            self.aabb_lo = wp.zeros(self.n_tris, dtype=wp.vec3, device=self.device)
+            self.aabb_hi = wp.zeros(self.n_tris, dtype=wp.vec3, device=self.device)
+            wp.launch(tri_aabb_kernel, dim=self.n_tris,
+                      inputs=[self.tris, self.x, wp.float32(p.thickness),
+                              self.aabb_lo, self.aabb_hi], device=self.device)
+            self.bvh = wp.Bvh(self.aabb_lo, self.aabb_hi)
 
         mc = p.max_contacts
         self.n_contacts = wp.zeros(1, dtype=wp.int32, device=self.device)
@@ -217,6 +239,9 @@ class UdcfDcdCollider:
 
     def _broadphase(self) -> None:
         p = self.params
+        if p.use_bvh:
+            self._broadphase_bvh()
+            return
         wp.launch(centroid_radius_kernel, dim=self.n_tris,
                   inputs=[self.tris, self.x, self.centroids, self.radii],
                   device=self.device)
@@ -240,6 +265,24 @@ class UdcfDcdCollider:
                   inputs=[self.grid.id, self.centroids, self.radii, self.tris,
                           self.tri_group, wp.int32(int(p.allow_self)),
                           wp.float32(query_radius), wp.float32(p.thickness),
+                          wp.int32(p.max_pairs),
+                          self.pair_a, self.pair_b, self.n_pairs],
+                  device=self.device)
+
+    def _broadphase_bvh(self) -> None:
+        """wp.Bvh broadphase (UdcfParams.use_bvh).  Refresh per-triangle AABBs,
+        REBUILD the tree on the current boxes (refit alone keeps the stale tree
+        topology and degrades query cost as the mesh deforms), then emit
+        AABB-overlap pairs."""
+        p = self.params
+        wp.launch(tri_aabb_kernel, dim=self.n_tris,
+                  inputs=[self.tris, self.x, wp.float32(p.thickness),
+                          self.aabb_lo, self.aabb_hi], device=self.device)
+        self.bvh = wp.Bvh(self.aabb_lo, self.aabb_hi)
+        self.n_pairs.zero_()
+        wp.launch(emit_pairs_bvh_kernel, dim=self.n_tris,
+                  inputs=[self.bvh.id, self.aabb_lo, self.aabb_hi, self.tris,
+                          self.tri_group, wp.int32(int(p.allow_self)),
                           wp.int32(p.max_pairs),
                           self.pair_a, self.pair_b, self.n_pairs],
                   device=self.device)
