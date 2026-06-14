@@ -45,6 +45,9 @@ TETARAPNORM   =  -885573303
 TETFIBERDGF   =  -403562211
 TETSNH        =  -503462311
 TETFIBERMILLARD = -503662411
+DISTANCE      =  1621136100   # two-vertex edge spring (MassSpring)
+TETVOLUMEHARD =  -215389990   # hard det(F)=1 volume (MassSpring)
+TETINVERSION  =  -215389991   # inverted-tet untangle (MassSpring)
 
 # ARAP flags (from pbd_types.h)
 LINEARENERGY = 1 << 0
@@ -1701,9 +1704,24 @@ def update_velocities_kernel(
     pprev: wp.array(dtype=wp.vec3),
     vel: wp.array(dtype=wp.vec3),
     dt: float,
+    exp_damp: float,
+    const_damp: float,
 ):
     i = wp.tid()
-    vel[i] = (pos[i] - pprev[i]) / dt
+    v = (pos[i] - pprev[i]) / dt
+    # Gaia velocity damping (updateVelocities:3559-3595): vMag scaled by
+    # exp_damp then offset by const_damp.  Defaults (exp=1, const=0) -> no-op.
+    if const_damp != 0.0 or exp_damp != 1.0:
+        vmag = wp.length(v)
+        if vmag > 1.0e-6:
+            vnew = vmag * exp_damp - const_damp
+            if vnew < 1.0e-6:
+                vnew = 0.0
+            vel[i] = v * (vnew / vmag)
+        else:
+            vel[i] = wp.vec3(0.0, 0.0, 0.0)
+    else:
+        vel[i] = v
 
 
 @wp.kernel
@@ -2752,6 +2770,154 @@ def solve_tetsnh_kernel(
 
 
 # ---------------------------------------------------------------------------
+# MassSpring constraint solvers (Gaia S01 U-drop material)
+# ---------------------------------------------------------------------------
+
+@wp.kernel
+def solve_distance_kernel(
+    cons: wp.array(dtype=Constraint),
+    pos: wp.array(dtype=wp.vec3),
+    pprev: wp.array(dtype=wp.vec3),
+    dP: wp.array(dtype=wp.vec3),
+    dPw: wp.array(dtype=wp.float32),
+    mass: wp.array(dtype=wp.float32),
+    stopped: wp.array(dtype=wp.int32),
+    dt: float,
+    use_jacobi: int,
+    has_compress_stiffness: int,
+    offset: int,
+):
+    """Two-vertex XPBD edge spring.  Reuses ``distance_pos_update_xpbd_fn``
+    (the engine distance constraint math) with both endpoints dynamic — the
+    counterpart of MassSpring's spring_kernel."""
+    c = offset + wp.tid()
+    cstiffness = cons[c].stiffness
+    if cstiffness <= 0.0:
+        return
+    kstiffcompress = cons[c].compressionstiffness
+    kstiffcompress = wp.where(kstiffcompress >= 0.0, kstiffcompress, cstiffness)
+    pts = cons[c].pts
+    pt0 = pts[0]
+    pt1 = pts[1]
+    distance_pos_update_xpbd_fn(
+        use_jacobi, c, cons, pt0, pt1,
+        pos[pt0], pos[pt1],
+        pos, pprev, dP, dPw, mass, stopped,
+        cons[c].restlength, cstiffness, cons[c].dampingratio,
+        kstiffcompress, dt, has_compress_stiffness)
+
+
+@wp.kernel
+def solve_tetvolumehard_kernel(
+    cons: wp.array(dtype=Constraint),
+    pos: wp.array(dtype=wp.vec3),
+    dm_inv: wp.array(dtype=wp.mat33),
+    mass: wp.array(dtype=wp.float32),
+    stopped: wp.array(dtype=wp.int32),
+    offset: int,
+):
+    """Hard PBD volume preservation C=det(F)-1, dlambda=-C/w (no compliance).
+    Migrated from MassSpring volume_kernel; Gauss-Seidel direct write.
+    ``dm_inv`` is the rest DmInv with vertex 0 as reference."""
+    c = offset + wp.tid()
+    pts = cons[c].pts
+    i0 = pts[0]
+    i1 = pts[1]
+    i2 = pts[2]
+    i3 = pts[3]
+    w0 = get_inv_mass_fn(i0, mass, stopped)
+    w1 = get_inv_mass_fn(i1, mass, stopped)
+    w2 = get_inv_mass_fn(i2, mass, stopped)
+    w3 = get_inv_mass_fn(i3, mass, stopped)
+    v0 = pos[i0]
+    P = wp.matrix_from_cols(pos[i1] - v0, pos[i2] - v0, pos[i3] - v0)
+    iDS = dm_inv[cons[c].tetid]
+    F = P * iDS
+    f0 = wp.vec3(F[0, 0], F[1, 0], F[2, 0])
+    f1 = wp.vec3(F[0, 1], F[1, 1], F[2, 1])
+    f2 = wp.vec3(F[0, 2], F[1, 2], F[2, 2])
+    dF0 = wp.cross(f1, f2)
+    dF1 = wp.cross(f2, f0)
+    dF2 = wp.cross(f0, f1)
+    g1 = dF0 * iDS[0, 0] + dF1 * iDS[0, 1] + dF2 * iDS[0, 2]
+    g2 = dF0 * iDS[1, 0] + dF1 * iDS[1, 1] + dF2 * iDS[1, 2]
+    g3 = dF0 * iDS[2, 0] + dF1 * iDS[2, 1] + dF2 * iDS[2, 2]
+    g0 = -g1 - g2 - g3
+    C = wp.determinant(F) - 1.0
+    if C == 0.0:
+        return
+    w = (wp.dot(g0, g0) * w0 + wp.dot(g1, g1) * w1
+         + wp.dot(g2, g2) * w2 + wp.dot(g3, g3) * w3)
+    if w == 0.0:
+        return
+    dlam = -C / w
+    pos[i0] = pos[i0] + g0 * (dlam * w0)
+    pos[i1] = pos[i1] + g1 * (dlam * w1)
+    pos[i2] = pos[i2] + g2 * (dlam * w2)
+    pos[i3] = pos[i3] + g3 * (dlam * w3)
+
+
+@wp.kernel
+def solve_tetinversion_kernel(
+    cons: wp.array(dtype=Constraint),
+    pos: wp.array(dtype=wp.vec3),
+    rest_vol: wp.array(dtype=wp.float32),
+    mass: wp.array(dtype=wp.float32),
+    stopped: wp.array(dtype=wp.int32),
+    multiplier: float,
+    offset: int,
+):
+    """Untangle inverted tets (signed vol<=0).  Migrated directly from
+    MassSpring inversion_kernel (no engine counterpart); GS direct write."""
+    c = offset + wp.tid()
+    pts = cons[c].pts
+    i0 = pts[0]
+    i1 = pts[1]
+    i2 = pts[2]
+    i3 = pts[3]
+    e1 = pos[i1] - pos[i0]
+    e2 = pos[i2] - pos[i0]
+    e3 = pos[i3] - pos[i0]
+    vol = wp.dot(e1, wp.cross(e2, e3)) / 6.0
+    if vol > 0.0:
+        return
+    w0 = get_inv_mass_fn(i0, mass, stopped)
+    w1 = get_inv_mass_fn(i1, mass, stopped)
+    w2 = get_inv_mass_fn(i2, mass, stopped)
+    w3 = get_inv_mass_fn(i3, mass, stopped)
+    gr0 = wp.cross(e3 - e1, e2 - e1)
+    gr1 = wp.cross(e2, e3)
+    gr2 = wp.cross(e3, e1)
+    gr3 = wp.cross(e1, e2)
+    C = 6.0 * (vol - rest_vol[cons[c].tetid] * multiplier)
+    if C == 0.0:
+        return
+    a0 = gr0 * w0
+    a1 = gr1 * w1
+    a2 = gr2 * w2
+    a3 = gr3 * w3
+    w = wp.dot(a0, a0) + wp.dot(a1, a1) + wp.dot(a2, a2) + wp.dot(a3, a3)
+    if w == 0.0:
+        return
+    dlam = -C / w
+    pos[i0] = pos[i0] + gr0 * (dlam * w0)
+    pos[i1] = pos[i1] + gr1 * (dlam * w1)
+    pos[i2] = pos[i2] + gr2 * (dlam * w2)
+    pos[i3] = pos[i3] + gr3 * (dlam * w3)
+
+
+def build_unique_edges(tets: np.ndarray) -> np.ndarray:
+    """All unique tet edges (the MassSpring spring set)."""
+    es = set()
+    for t in tets:
+        for a in range(4):
+            for b in range(a + 1, 4):
+                i, j = int(t[a]), int(t[b])
+                es.add((i, j) if i < j else (j, i))
+    return np.asarray(sorted(es), dtype=np.int32)
+
+
+# ---------------------------------------------------------------------------
 # MuscleSim (Warp backend)
 # ---------------------------------------------------------------------------
 
@@ -2782,8 +2948,11 @@ class XpbdEngine(ConstraintBuilderMixin):
         is_collide = getattr(self, "is_collide", None)
         contact_normal = getattr(self, "contact_normal", None)
         if is_collide is None or contact_normal is None:
+            exp_damp = float(getattr(self, "_vel_exp_damp", 1.0))
+            const_damp = float(getattr(self, "_vel_const_damp", 0.0))
             wp.launch(update_velocities_kernel, dim=self.n_verts,
-                      inputs=[self.pos, self.pprev, self.vel, self.dt])
+                      inputs=[self.pos, self.pprev, self.vel, self.dt,
+                              exp_damp, const_damp])
             return
         rn = float(getattr(self, "restitution_n", 0.0))
         rt = float(getattr(self, "restitution_t", 1.0))
@@ -2889,6 +3058,20 @@ class XpbdEngine(ConstraintBuilderMixin):
                     self.cons, self.pos, self.pprev,
                     self.dP, self.dPw, self.mass, self.stopped,
                     self.dt, use_jacobi_int, has_compress, offset])
+            elif ctype == DISTANCE:
+                wp.launch(solve_distance_kernel, dim=count, inputs=[
+                    self.cons, self.pos, self.pprev,
+                    self.dP, self.dPw, self.mass, self.stopped,
+                    self.dt, use_jacobi_int, has_compress, offset])
+            elif ctype == TETVOLUMEHARD:
+                wp.launch(solve_tetvolumehard_kernel, dim=count, inputs=[
+                    self.cons, self.pos, self.ms_dm_inv,
+                    self.mass, self.stopped, offset])
+            elif ctype == TETINVERSION:
+                wp.launch(solve_tetinversion_kernel, dim=count, inputs=[
+                    self.cons, self.pos, self.ms_rest_vol,
+                    self.mass, self.stopped,
+                    wp.float32(self.ms_inversion_mult), offset])
             elif ctype == TETARAP:
                 wp.launch(solve_tetarap_kernel, dim=count, inputs=[
                     self.cons, self.pos, self.pprev,
@@ -3048,6 +3231,61 @@ class XpbdEngine(ConstraintBuilderMixin):
             self._program_sub = _sub
             for phase in self.program:
                 phase()
+
+    def _build_colored_gs(self, all_constraints):
+        """Reorder constraints by (color, type) and build per-color dispatch ranges."""
+        import time
+
+        t0 = time.perf_counter()
+        color_groups = build_constraint_color_groups(all_constraints)
+        n_colors = len(color_groups)
+        print(f"  Graph coloring: {n_colors} colors, "
+              f"sizes: {[len(g) for g in color_groups]} "
+              f"[{(time.perf_counter()-t0)*1000:.0f}ms]")
+
+        # Reorder constraints: (color, type) sorted
+        reordered = []
+        self.color_type_ranges = []
+        global_offset = 0
+        for color_idx, group in enumerate(color_groups):
+            color_cons = [all_constraints[i] for i in group]
+            color_cons.sort(key=lambda c: c['type'])
+
+            type_ranges = {}
+            prev_type = None
+            start = 0
+            for i, c in enumerate(color_cons):
+                ctype = c['type']
+                if ctype != prev_type:
+                    if prev_type is not None:
+                        type_ranges[prev_type] = (global_offset + start, i - start)
+                    start = i
+                    prev_type = ctype
+            if prev_type is not None:
+                type_ranges[prev_type] = (global_offset + start, len(color_cons) - start)
+
+            self.color_type_ranges.append(type_ranges)
+            reordered.extend(color_cons)
+            global_offset += len(color_cons)
+
+        # Rebuild constraint array with new order
+        n_cons = len(reordered)
+        for i, c in enumerate(reordered):
+            c['cidx'] = i
+
+        cons_np = np.zeros(n_cons, dtype=Constraint.numpy_dtype())
+        cons_np['type'] = np.array([c['type'] for c in reordered], dtype=np.int32)
+        cons_np['cidx'] = np.arange(n_cons, dtype=np.int32)
+        cons_np['pts'] = np.array([c['pts'] for c in reordered], dtype=np.int32)
+        cons_np['stiffness'] = np.array([c['stiffness'] for c in reordered], dtype=np.float32)
+        cons_np['dampingratio'] = np.array([c['dampingratio'] for c in reordered], dtype=np.float32)
+        cons_np['tetid'] = np.array([c['tetid'] for c in reordered], dtype=np.int32)
+        cons_np['L'] = np.array([c['L'] for c in reordered], dtype=np.float32)
+        cons_np['restlength'] = np.array([c['restlength'] for c in reordered], dtype=np.float32)
+        cons_np['restvector'] = np.array([c['restvector'] for c in reordered], dtype=np.float32)
+        cons_np['restdir'] = np.array([c['restdir'] for c in reordered], dtype=np.float32)
+        cons_np['compressionstiffness'] = np.array([c['compressionstiffness'] for c in reordered], dtype=np.float32)
+        self.cons = wp.array(cons_np, dtype=Constraint)
 
 
 class MuscleSim(XpbdEngine):
@@ -3534,61 +3772,6 @@ class MuscleSim(XpbdEngine):
         print(f"  Millard curves initialized: f_L ({mc.fl.segments.__len__()} seg), "
               f"f_PE ({mc.fpe.segments.__len__()} seg)")
 
-    def _build_colored_gs(self, all_constraints):
-        """Reorder constraints by (color, type) and build per-color dispatch ranges."""
-        import time
-
-        t0 = time.perf_counter()
-        color_groups = build_constraint_color_groups(all_constraints)
-        n_colors = len(color_groups)
-        print(f"  Graph coloring: {n_colors} colors, "
-              f"sizes: {[len(g) for g in color_groups]} "
-              f"[{(time.perf_counter()-t0)*1000:.0f}ms]")
-
-        # Reorder constraints: (color, type) sorted
-        reordered = []
-        self.color_type_ranges = []
-        global_offset = 0
-        for color_idx, group in enumerate(color_groups):
-            color_cons = [all_constraints[i] for i in group]
-            color_cons.sort(key=lambda c: c['type'])
-
-            type_ranges = {}
-            prev_type = None
-            start = 0
-            for i, c in enumerate(color_cons):
-                ctype = c['type']
-                if ctype != prev_type:
-                    if prev_type is not None:
-                        type_ranges[prev_type] = (global_offset + start, i - start)
-                    start = i
-                    prev_type = ctype
-            if prev_type is not None:
-                type_ranges[prev_type] = (global_offset + start, len(color_cons) - start)
-
-            self.color_type_ranges.append(type_ranges)
-            reordered.extend(color_cons)
-            global_offset += len(color_cons)
-
-        # Rebuild constraint array with new order
-        n_cons = len(reordered)
-        for i, c in enumerate(reordered):
-            c['cidx'] = i
-
-        cons_np = np.zeros(n_cons, dtype=Constraint.numpy_dtype())
-        cons_np['type'] = np.array([c['type'] for c in reordered], dtype=np.int32)
-        cons_np['cidx'] = np.arange(n_cons, dtype=np.int32)
-        cons_np['pts'] = np.array([c['pts'] for c in reordered], dtype=np.int32)
-        cons_np['stiffness'] = np.array([c['stiffness'] for c in reordered], dtype=np.float32)
-        cons_np['dampingratio'] = np.array([c['dampingratio'] for c in reordered], dtype=np.float32)
-        cons_np['tetid'] = np.array([c['tetid'] for c in reordered], dtype=np.int32)
-        cons_np['L'] = np.array([c['L'] for c in reordered], dtype=np.float32)
-        cons_np['restlength'] = np.array([c['restlength'] for c in reordered], dtype=np.float32)
-        cons_np['restvector'] = np.array([c['restvector'] for c in reordered], dtype=np.float32)
-        cons_np['restdir'] = np.array([c['restdir'] for c in reordered], dtype=np.float32)
-        cons_np['compressionstiffness'] = np.array([c['compressionstiffness'] for c in reordered], dtype=np.float32)
-        self.cons = wp.array(cons_np, dtype=Constraint)
-
     def _init_fields(self):
         self.pos0 = wp.from_numpy(self.pos0_np.astype(np.float32), dtype=wp.vec3)
         self.pos = wp.from_numpy(self.pos0_np.astype(np.float32), dtype=wp.vec3)
@@ -3850,6 +4033,215 @@ class MuscleSim(XpbdEngine):
 
         if self.renderer is not None:
             self.renderer.save()
+
+
+class MassSpringSim(XpbdEngine):
+    """Gaia S01 dynamic MassSpring as an XpbdEngine program.
+
+    The Gaia U-drop material — stiff edge springs, a hard det(F)=1 volume
+    constraint and an inverted-tet untangle — expressed entirely with engine
+    primitives: edges are ``DISTANCE`` constraints (reusing the engine distance
+    XPBD math), volume/inversion are the migrated ``TETVOLUMEHARD`` /
+    ``TETINVERSION`` constraint types, and ``integrate`` / ``update_velocities``
+    / graph-colored Gauss-Seidel are the shared ``XpbdEngine`` machinery.
+    Boundary + DCD self-collision run as program phases between the material
+    and finalize passes, reproducing Gaia's substep order::
+
+      integrate -> spring -> volume(hard) -> boundary -> inversion -> DCD -> update_vel
+    """
+
+    def __init__(self, verts, tets, *, dt=1.0 / 60.0, n_substeps=20,
+                 density=3.0, gravity=-9.8, spring_compliance=1e-4,
+                 spring_damping=0.01, inversion_multiplier=0.02,
+                 exp_vel_damping=0.95, const_vel_damping=0.02,
+                 mu_s=0.5, mu_d=0.4, bounds_lo=(-2.0, 0.0, -2.0),
+                 bounds_hi=(2.0, 5.0e4, 2.0), thickness=1e-3,
+                 no_inversion=False, no_dcd=False, init_vel=None,
+                 init_vel_y=0.0, device="cuda:0"):
+        from types import SimpleNamespace
+        from muscle.collision.udcf.kernel import box_boundary_kernel
+        from muscle.collision.udcf.solver import UdcfDcdCollider, UdcfParams
+        from muscle.util.mesh_io import build_surface_tris
+
+        self.device = device
+        dt_sub = dt / n_substeps
+        self.dt = float(dt_sub)
+        self.cfg = SimpleNamespace(veldamping=0.0, gravity=gravity,
+                                   num_substeps=int(n_substeps))
+        self._gravity_vec = wp.vec3(0.0, gravity, 0.0)
+        self.use_jacobi = False
+        self.use_colored_gs = True
+        self.has_compressstiffness = False
+        self.no_inversion = bool(no_inversion)
+        self.ms_inversion_mult = float(inversion_multiplier)
+        # Gaia velocity damping (consumed by update_velocities).
+        self._vel_exp_damp = float(exp_vel_damping ** dt_sub)
+        self._vel_const_damp = float(const_vel_damping * dt_sub)
+
+        verts = np.asarray(verts, np.float32).copy()
+        tets = np.asarray(tets, np.int32).copy()
+        n_v = verts.shape[0]
+        self.n_verts = n_v
+        self.tet_np = tets
+
+        # Gaia winds tets positive (det(Dm) > 0); U.geo winds the other way.
+        # Flip orientation so rest volume is positive and inversion doesn't
+        # fire on every rest tet (see fascia/houdini-lefthand-winding note).
+        v = verts
+        Dm0 = np.stack([v[tets[:, 1]] - v[tets[:, 0]],
+                        v[tets[:, 2]] - v[tets[:, 0]],
+                        v[tets[:, 3]] - v[tets[:, 0]]], axis=2)
+        if np.median(np.linalg.det(Dm0)) < 0:
+            tets[:, [2, 3]] = tets[:, [3, 2]]
+
+        Dm = np.stack([v[tets[:, 1]] - v[tets[:, 0]],
+                       v[tets[:, 2]] - v[tets[:, 0]],
+                       v[tets[:, 3]] - v[tets[:, 0]]], axis=2)
+        DmInv = np.linalg.inv(Dm)
+        rest_vol = np.linalg.det(Dm) / 6.0
+        mass = np.zeros(n_v, np.float64)
+        for k in range(4):
+            np.add.at(mass, tets[:, k], 0.25 * rest_vol * density)
+        inv_mass = np.where(mass > 0, 1.0 / np.where(mass > 0, mass, 1.0), 0.0)
+
+        edges = build_unique_edges(tets)
+        rest_len = np.linalg.norm(v[edges[:, 0]] - v[edges[:, 1]], axis=1)
+
+        dev = device
+        self.pos = wp.array(v, dtype=wp.vec3, device=dev)
+        self.pprev = wp.array(v, dtype=wp.vec3, device=dev)
+        self.vel = wp.zeros(n_v, dtype=wp.vec3, device=dev)
+        self.force = wp.zeros(n_v, dtype=wp.vec3, device=dev)
+        self.mass = wp.array(mass.astype(np.float32), dtype=wp.float32, device=dev)
+        self.inv_mass = wp.array(inv_mass.astype(np.float32), dtype=wp.float32, device=dev)
+        self.stopped = wp.zeros(n_v, dtype=wp.int32, device=dev)
+        self.dP = wp.zeros(n_v, dtype=wp.vec3, device=dev)
+        self.dPw = wp.zeros(n_v, dtype=wp.float32, device=dev)
+        self.ms_dm_inv = wp.array(DmInv.astype(np.float32), dtype=wp.mat33, device=dev)
+        self.ms_rest_vol = wp.array(rest_vol.astype(np.float32), dtype=wp.float32, device=dev)
+
+        if init_vel is not None:
+            self.vel.assign(np.asarray(init_vel, np.float32))
+        elif init_vel_y != 0.0:
+            v0 = np.zeros((n_v, 3), np.float32)
+            v0[:, 1] = init_vel_y
+            self.vel.assign(v0)
+
+        # --- constraints: springs (DISTANCE) + hard volume + inversion -------
+        spring_stiffness = 1.0 / spring_compliance   # engine alpha = 1/(k dt^2)
+        all_constraints = []
+        for e in range(edges.shape[0]):
+            all_constraints.append(dict(
+                type=DISTANCE, pts=[int(edges[e, 0]), int(edges[e, 1]), -1, -1],
+                stiffness=spring_stiffness, dampingratio=float(spring_damping),
+                tetid=-1, L=[0.0, 0.0, 0.0], restlength=float(rest_len[e]),
+                restvector=[0.0, 0.0, 0.0, 0.0], restdir=[0.0, 0.0, 0.0],
+                compressionstiffness=-1.0))
+        for t in range(tets.shape[0]):
+            pts = [int(tets[t, 0]), int(tets[t, 1]), int(tets[t, 2]), int(tets[t, 3])]
+            common = dict(pts=pts, stiffness=1.0, dampingratio=0.0, tetid=t,
+                          L=[0.0, 0.0, 0.0], restlength=0.0,
+                          restvector=[0.0, 0.0, 0.0, 0.0], restdir=[0.0, 0.0, 0.0],
+                          compressionstiffness=-1.0)
+            all_constraints.append(dict(type=TETVOLUMEHARD, **common))
+            all_constraints.append(dict(type=TETINVERSION, **{**common}))
+
+        self.n_cons = len(all_constraints)
+        for i, c in enumerate(all_constraints):
+            c['cidx'] = i
+        self._build_colored_gs(all_constraints)   # builds self.cons + color_type_ranges
+
+        # Per-color ranges split by type.  Gaia sweeps ALL springs, then ALL
+        # volume tets, then (after boundary) ALL inversion tets — so each gets
+        # its own full colored pass rather than interleaving per color.
+        def _ranges_of(ctype):
+            return [{ctype: tr[ctype]} for tr in self.color_type_ranges if ctype in tr]
+        self._spring_ranges = _ranges_of(DISTANCE)
+        self._volume_ranges = _ranges_of(TETVOLUMEHARD)
+        self._inversion_ranges = _ranges_of(TETINVERSION)
+
+        # --- boundary + DCD self-collision -----------------------------------
+        self._box_boundary_kernel = box_boundary_kernel
+        self.bounds_lo = wp.vec3(*bounds_lo)
+        self.bounds_hi = wp.vec3(*bounds_hi)
+        self.mu_s = float(mu_s)
+        self.mu_d = float(mu_d)
+        self.surf = build_surface_tris(tets, v).astype(np.int32)
+        self.dcd = None
+        if not no_dcd:
+            mp = max(65536, self.surf.shape[0] * (self.surf.shape[0] - 1) // 2)
+            dv = np.array([[1e4, 1e4, 1e4], [1e4 + 1, 1e4, 1e4],
+                           [1e4, 1e4, 1e4 + 1]], np.float32)
+            self.dcd = UdcfDcdCollider(
+                self.pos, self.inv_mass, surface_tris=self.surf,
+                static_verts=dv, static_tris=np.array([[0, 1, 2]], np.int32),
+                params=UdcfParams(allow_self=True, max_pairs=mp,
+                                  thickness=thickness, jacobi_avg=False,
+                                  gauss_seidel=True, max_push=0.0),
+                device=device)
+        self.build_program()
+
+    def build_program(self):
+        s = self
+
+        def integrate_phase():
+            s.integrate()
+            s.clear()                       # reset spring XPBD lambda each substep
+
+        def material_phase():
+            for tr in s._spring_ranges:        # all springs (Gaia projectConstraints)
+                s._dispatch_constraints(tr)
+            for tr in s._volume_ranges:        # then all hard-volume tets
+                s._dispatch_constraints(tr)
+
+        def boundary_phase():
+            wp.launch(s._box_boundary_kernel, dim=s.n_verts,
+                      inputs=[s.pos, s.pprev, s.bounds_lo, s.bounds_hi,
+                              wp.float32(s.mu_s), wp.float32(s.mu_d)],
+                      device=s.device)
+
+        def inversion_phase():
+            if s.no_inversion:
+                return
+            for tr in s._inversion_ranges:
+                s._dispatch_constraints(tr)
+
+        def dcd_phase():
+            if s.dcd is not None:
+                s.dcd.solve(0)
+
+        def finalize_phase():
+            s.update_velocities()
+
+        self.program = [integrate_phase, material_phase, boundary_phase,
+                        inversion_phase, dcd_phase, finalize_phase]
+
+    def step(self):
+        self.run_program()
+
+    @classmethod
+    def u_drop(cls, geo_path, *, dt=1.0 / 60.0, n_substeps=20, density=3.0,
+               gravity=-9.8, init_vel_y=-5.0, translate_y=0.2,
+               spring_compliance=1e-4, spring_damping=0.01,
+               mu_s=0.5, mu_d=0.4, thickness=1e-3, no_dcd=False,
+               no_inversion=False, init_verts=None, init_vel=None,
+               device="cuda:0"):
+        """Build the Gaia S01 U-drop.  ``init_verts`` (a recovery pose) becomes
+        the rest state (zero pre-strain), in which case ``translate_y`` is
+        ignored; ``init_vel`` overrides ``init_vel_y``."""
+        from muscle.util.geo_io import GeoFile
+        g = GeoFile(geo_path)
+        tets = np.asarray(g.tet_indices, np.int32)
+        if init_verts is not None:
+            verts = np.asarray(init_verts, np.float32).copy()
+        else:
+            verts = np.asarray(g.positions, np.float32).copy()
+            verts[:, 1] += translate_y
+        return cls(verts, tets, dt=dt, n_substeps=n_substeps, density=density,
+                   gravity=gravity, spring_compliance=spring_compliance,
+                   spring_damping=spring_damping, mu_s=mu_s, mu_d=mu_d,
+                   thickness=thickness, no_inversion=no_inversion, no_dcd=no_dcd,
+                   init_vel=init_vel, init_vel_y=init_vel_y, device=device)
 
 
 def main():

@@ -57,3 +57,6 @@ tools/bicep_fl/opensim_ref.csv
 
 # binary cache of parsed Houdini .geo frames (geo_io.read_geo_attr_cached)
 _npy_cache/
+
+# local backups of merged-away modules
+.backup_massspring/

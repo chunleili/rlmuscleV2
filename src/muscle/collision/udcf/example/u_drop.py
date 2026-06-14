@@ -2,8 +2,9 @@
 
 Unlike example_dcd_u.py (which drove the U with MuscleSim's volume+ARAP
 material -> soft fold -> deep self-crossings -> DCD explosion), this driver
-uses the actual Gaia S01 material (udcf_massspring.MassSpringTet) and the
-exact Gaia substep order, bypassing MuscleSim entirely:
+uses the Gaia S01 MassSpring material (engine.MassSpringSim — stiff DISTANCE
+springs + hard det(F)=1 volume + inverted-tet untangle on the shared
+XpbdEngine) in the exact Gaia substep order:
 
   per substep (Gaia runStepCPU, iterations=1, collisionDetectionSubSteps=1):
     integrate -> spring -> volume -> boundary -> inversion -> narrowPhase -> updateVel
@@ -29,8 +30,7 @@ import os
 import numpy as np
 import warp as wp
 
-from muscle.collision.udcf.massspring_sim import MassSpringSim
-from muscle.engine import WarpRenderer
+from muscle.engine import MassSpringSim, WarpRenderer
 
 
 def write_ply(path, pos_np, tris):
@@ -80,7 +80,7 @@ def main():
     wp.init()
 
     # --init_state: load recovery pose BEFORE construction so it becomes the
-    # MassSpringTet rest state (zero pre-strain), matching pre-refactor semantics.
+    # MassSpringSim rest state (zero pre-strain), matching pre-refactor semantics.
     init_verts = init_vel = None
     if args.init_state:
         from muscle.util.geo_io import GeoFile as _GeoFile
@@ -96,7 +96,6 @@ def main():
         mu_s=args.mu_s, mu_d=args.mu_d, thickness=args.thickness,
         no_dcd=args.no_dcd, no_inversion=args.no_inversion,
         init_verts=init_verts, init_vel=init_vel, device=args.device)
-    ms = sim.ms
     surf = sim.surf
 
     surf_flat = surf.reshape(-1).astype(np.int32)
@@ -112,7 +111,7 @@ def main():
 
     if args.out_ply:
         os.makedirs(args.out_ply, exist_ok=True)
-        write_ply(f"{args.out_ply}/A{0:08d}.ply", ms.pos.numpy(), surf)
+        write_ply(f"{args.out_ply}/A{0:08d}.ply", sim.pos.numpy(), surf)
 
     def render_frame(step, pos_np):
         if renderer is None:
@@ -125,12 +124,12 @@ def main():
                           colors=(0.55, 0.55, 0.55))
         inner.end_frame()
 
-    render_frame(0, ms.pos.numpy())
+    render_frame(0, sim.pos.numpy())
     ref = args.ref_dir
 
     for step in range(1, args.steps + 1):
         sim.step()
-        p = ms.pos.numpy()
+        p = sim.pos.numpy()
         if step % args.out_every == 0 or step == args.steps:
             render_frame(step, p)
             if args.out_ply:

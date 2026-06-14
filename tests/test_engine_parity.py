@@ -105,13 +105,20 @@ def test_musclesim_bicep_parity():
             f"musclesim frame {i} diverged: max|d|={np.abs(p - g['pos'][i]).max():.2e} > {ATOL}"
 
 
-def test_massspring_u_bitwise():
+def test_massspring_u_stability():
+    """MassSpringSim (now an XpbdEngine program) drops the U onto the floor and
+    settles without exploding.  The Gaia MassSpring material was re-expressed on
+    engine primitives (DISTANCE springs + migrated hard-volume/inversion), so
+    this is a stability/behaviour check, not the old bitwise golden compare."""
     if not (ROOT / "data/collisionTest/U.geo").exists():
         pytest.skip("U.geo absent")
-    g = _need("massspring_u")
-    from muscle.collision.udcf.massspring_sim import MassSpringSim  # Stage 3
-    sim = MassSpringSim.u_drop(str(ROOT / "data/collisionTest/U.geo"), device=DEVICE)
-    for i in range(g["pos"].shape[0]):
+    from muscle.engine import MassSpringSim
+    sim = MassSpringSim.u_drop(str(ROOT / "data/collisionTest/U.geo"),
+                               init_vel_y=0.0, device=DEVICE)
+    for i in range(30):
         sim.step()
-        assert np.array_equal(sim.pos.numpy(), g["pos"][i]), f"massspring frame {i} diverged"
-        assert np.array_equal(sim.vel.numpy(), g["vel"][i]), f"massspring vel {i} diverged"
+        p = sim.pos.numpy()
+        assert not np.isnan(p).any(), f"massspring frame {i} produced NaN"
+    # Landed on the y=0 floor and stays in a sane vertical band.
+    assert p[:, 1].min() <= 1e-3, f"U did not reach floor: min_y={p[:, 1].min():.4f}"
+    assert 0.1 < p[:, 1].max() < 1.0, f"U vertical extent unphysical: max_y={p[:, 1].max():.4f}"
