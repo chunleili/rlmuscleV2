@@ -848,7 +848,7 @@ def _peak_update_kernel(
 # ======================================================================
 
 @wp.kernel
-def emit_pairs_groups_kernel(
+def broadphase_find_pairs_kernel(
     grid: wp.uint64,
     centroids: wp.array(dtype=wp.vec3),
     radii: wp.array(dtype=wp.float32),
@@ -935,7 +935,7 @@ def tri_aabb_kernel(
 
 
 @wp.kernel
-def emit_pairs_bvh_kernel(
+def broadphase_find_pairs_bvh_kernel(
     bvh: wp.uint64,
     lower: wp.array(dtype=wp.vec3),
     upper: wp.array(dtype=wp.vec3),
@@ -948,7 +948,7 @@ def emit_pairs_bvh_kernel(
     n_pairs: wp.array(dtype=wp.int32),
 ):
     """BVH broadphase emit: same group/adjacency rules as
-    ``emit_pairs_groups_kernel`` but candidates come from an AABB-overlap query
+    ``broadphase_find_pairs_kernel`` but candidates come from an AABB-overlap query
     against a ``wp.Bvh``.  AABB-overlap (boxes padded by thickness) is already a
     conservative superset of within-thickness triangle pairs, so no sphere
     reject is applied here."""

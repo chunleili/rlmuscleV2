@@ -16,9 +16,9 @@ from muscle.collision.udcf.kernel import (
     centroid_radius_kernel,
     face_normal_kernel,
     max_radius_reduce_kernel,
-    emit_pairs_groups_kernel,
+    broadphase_find_pairs_kernel,
     tri_aabb_kernel,
-    emit_pairs_bvh_kernel,
+    broadphase_find_pairs_bvh_kernel,
     narrow_kernel,
     narrow_respond_gs_kernel,
     respond_kernel,
@@ -269,7 +269,7 @@ class UdcfDcdCollider:
                                2.0 * self._init_max_radius + p.thickness)
         self.grid.build(self.centroids, cell)
         self.n_pairs.zero_()
-        wp.launch(emit_pairs_groups_kernel, dim=self.n_tris,
+        wp.launch(broadphase_find_pairs_kernel, dim=self.n_tris,
                   inputs=[self.grid.id, self.centroids, self.radii, self.tris,
                           self.tri_group, self.normals, wp.float32(p.normal_cull),
                           wp.int32(int(p.allow_self)),
@@ -289,7 +289,7 @@ class UdcfDcdCollider:
                           self.aabb_lo, self.aabb_hi], device=self.device)
         self.bvh = wp.Bvh(self.aabb_lo, self.aabb_hi)
         self.n_pairs.zero_()
-        wp.launch(emit_pairs_bvh_kernel, dim=self.n_tris,
+        wp.launch(broadphase_find_pairs_bvh_kernel, dim=self.n_tris,
                   inputs=[self.bvh.id, self.aabb_lo, self.aabb_hi, self.tris,
                           self.tri_group, wp.int32(int(p.allow_self)),
                           wp.int32(p.max_pairs),
