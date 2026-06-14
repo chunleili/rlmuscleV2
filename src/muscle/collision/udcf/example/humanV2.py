@@ -48,14 +48,6 @@ from muscle.collision.sdf.example.humanV2 import (
 )
 from muscle.collision.udcf.solver import UdcfDcdCollider, UdcfParams
 
-# Far-away degenerate static mesh: UdcfDcdCollider requires a static body, but
-# in self-only mode we want NO muscle-vs-static pairs — placing it at 1e4 keeps
-# it out of every broadphase cell.
-_DUMMY_STATIC_V = np.array([[1e4, 1e4, 1e4], [1e4 + 1, 1e4, 1e4],
-                            [1e4, 1e4, 1e4 + 1]], np.float32)
-_DUMMY_STATIC_T = np.array([[0, 1, 2]], np.int32)
-
-
 def main(argv=None):
     ap = add_humanV2_args(argparse.ArgumentParser())
     ap.add_argument("--usd", default="output/humanV2_sdf_bone_dcd_self.usd")
@@ -105,13 +97,12 @@ def main(argv=None):
                                     contact_offset=args.contact_offset)
     if not args.static_bone:
         bone.preload(range(sim.start_frame, sim.end_frame + 1))
-    # --- muscle self-collision: UDCF DCD (allow_self, dummy static) -----------
+    # --- muscle self-collision: UDCF DCD (allow_self, no static body) ---------
     dcd = None
     if args.self_collision:
         dcd = UdcfDcdCollider(
             sim.pos, sim.inv_mass,
             surface_tris=surf_flat.reshape(-1, 3),
-            static_verts=_DUMMY_STATIC_V, static_tris=_DUMMY_STATIC_T,
             params=UdcfParams(allow_self=True,
                               thickness=args.thickness,
                               multiplier=args.self_multiplier,

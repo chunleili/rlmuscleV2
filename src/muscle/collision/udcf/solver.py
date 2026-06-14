@@ -100,8 +100,13 @@ class CcdInterface(Protocol):
 
 
 class UdcfDcdCollider:
-    """Gaia_UDCF DCD between a movable vert set and a static (per-frame
-    animated) mesh, plus optional movable self-collision.
+    """Gaia_UDCF DCD between a movable vert set and an OPTIONAL static
+    (per-frame animated) mesh, plus optional movable self-collision.
+
+    Pass ``static_verts``/``static_tris`` for movable-vs-static (e.g. muscle
+    vs animated bone).  Omit them (the default ``None``) with
+    ``UdcfParams(allow_self=True)`` for self-collision only — no placeholder
+    mesh, and the broadphase cell is sized off the movable triangles alone.
 
     ``pos`` is the live solver position array (e.g. ``OneWaySim.pos``) —
     the collider reads AND writes it in :meth:`solve`. Register on the
@@ -117,7 +122,8 @@ class UdcfDcdCollider:
 
     def __init__(self, pos: wp.array, inv_mass: wp.array,
                  surface_tris: np.ndarray,
-                 static_verts: np.ndarray, static_tris: np.ndarray,
+                 static_verts: np.ndarray | None = None,
+                 static_tris: np.ndarray | None = None,
                  params: UdcfParams | None = None,
                  device: str | None = None,
                  ccd: CcdInterface | None = None):
@@ -127,26 +133,39 @@ class UdcfDcdCollider:
         self.ccd = ccd
         p = self.params
 
+        # Static body is OPTIONAL: pass None (the default) for self-collision
+        # only (movable-vs-movable, needs allow_self=True).  No placeholder mesh.
+        self.has_static = static_verts is not None and len(static_verts) > 0
+        if not self.has_static and not p.allow_self:
+            raise ValueError("UdcfDcdCollider: no static body and allow_self=False "
+                             "-> nothing to collide; pass a static mesh or set "
+                             "allow_self=True")
+
         self.n_mov = int(pos.shape[0])
-        self.n_static = int(static_verts.shape[0])
+        self.n_static = int(static_verts.shape[0]) if self.has_static else 0
         n_total = self.n_mov + self.n_static
 
         mov_tris = np.asarray(surface_tris, dtype=np.int32).reshape(-1, 3)
-        sta_tris = (np.asarray(static_tris, dtype=np.int32).reshape(-1, 3)
-                    + self.n_mov)
-        all_tris = np.vstack([mov_tris, sta_tris])
+        if self.has_static:
+            sta_tris = (np.asarray(static_tris, dtype=np.int32).reshape(-1, 3)
+                        + self.n_mov)
+            all_tris = np.vstack([mov_tris, sta_tris])
+        else:
+            all_tris = mov_tris
         self.n_tris = int(all_tris.shape[0])
         self.tris = wp.array2d(all_tris, dtype=wp.int32, device=self.device)
         group_np = np.zeros(self.n_tris, dtype=np.int32)
-        group_np[mov_tris.shape[0]:] = 1
+        group_np[mov_tris.shape[0]:] = 1          # no-op when there is no static
         self.tri_group = wp.array(group_np, dtype=wp.int32, device=self.device)
 
-        im_np = np.concatenate([inv_mass.numpy().astype(np.float32),
-                                np.zeros(self.n_static, dtype=np.float32)])
+        im_np = inv_mass.numpy().astype(np.float32)
+        if self.has_static:
+            im_np = np.concatenate([im_np, np.zeros(self.n_static, dtype=np.float32)])
         self.inv_mass = wp.array(im_np, dtype=wp.float32, device=self.device)
 
         x_np = np.zeros((n_total, 3), dtype=np.float32)
-        x_np[self.n_mov:] = static_verts
+        if self.has_static:
+            x_np[self.n_mov:] = static_verts
         self.x = wp.array(x_np, dtype=wp.vec3, device=self.device)
         self.x_prev = wp.clone(self.x)
 
@@ -228,6 +247,9 @@ class UdcfDcdCollider:
     def set_static_verts(self, verts: np.ndarray) -> None:
         """New static pose (per-frame bone animation). The previous pose
         becomes x_prev for friction's contact velocity."""
+        if not self.has_static:
+            raise RuntimeError("UdcfDcdCollider has no static body "
+                               "(self-collision only) — set_static_verts invalid")
         if self._use_slice_views:
             wp.copy(self._xp_sta, self._x_sta)
             self._x_sta.assign(np.asarray(verts, dtype=np.float32))

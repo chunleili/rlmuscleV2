@@ -4170,11 +4170,8 @@ class MassSpringSim(XpbdEngine):
         self.dcd = None
         if not no_dcd:
             mp = max(65536, self.surf.shape[0] * (self.surf.shape[0] - 1) // 2)
-            dv = np.array([[1e4, 1e4, 1e4], [1e4 + 1, 1e4, 1e4],
-                           [1e4, 1e4, 1e4 + 1]], np.float32)
             self.dcd = UdcfDcdCollider(
                 self.pos, self.inv_mass, surface_tris=self.surf,
-                static_verts=dv, static_tris=np.array([[0, 1, 2]], np.int32),
                 params=UdcfParams(allow_self=True, max_pairs=mp,
                                   thickness=thickness, jacobi_avg=False,
                                   gauss_seidel=True, max_push=0.0),
