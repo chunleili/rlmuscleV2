@@ -8,7 +8,7 @@ Reference: ~/Dev/Gaia_UDCF/Simulator/Modules/PBD/PBDPhysics.cpp
 Pipeline (host orchestrated by UdcfDcdCollider, one call per solver
 fine-iteration):
 
-  broadphase (hashgrid, per substep)  ->  narrow_kernel (per candidate pair)
+  broadphase (BVH default / hashgrid)  ->  narrow_kernel (per candidate pair)
   ->  respond_kernel (per contact)     ->  apply_kernel (Jacobi dP/count)
 
 Replicated reference quirks (numerical parity with the golden dump beats

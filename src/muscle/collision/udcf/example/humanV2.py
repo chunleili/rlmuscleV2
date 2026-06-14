@@ -74,10 +74,10 @@ def main(argv=None):
     ap.add_argument("--self_normal_cull", type=float, default=1.0,
                     help="skip self pairs with n_i.n_j > this (1.0 disables, "
                          "0.0 culls co-oriented faces)")
-    ap.add_argument("--self_bvh", action="store_true",
-                    help="use the wp.Bvh broadphase backend for self-collision "
-                         "instead of the default hashgrid (generally slower on "
-                         "this mesh — rebuild cost; see UdcfParams.use_bvh)")
+    ap.add_argument("--self_hashgrid", action="store_true",
+                    help="use the uniform-hashgrid broadphase instead of the "
+                         "default wp.Bvh backend (BVH is ~4.5x faster here; see "
+                         "UdcfParams.use_bvh)")
     ap.add_argument("--self_rebuild_substeps", action="store_true",
                     help="rebuild the self broadphase EVERY call (~10x slower). "
                          "Default rebuilds once per FRAME and reuses pairs across "
@@ -112,7 +112,7 @@ def main(argv=None):
                               max_contacts=args.self_max_contacts,
                               gauss_seidel=args.self_gauss_seidel,
                               jacobi_avg=not args.self_gauss_seidel,
-                              use_bvh=args.self_bvh,
+                              use_bvh=not args.self_hashgrid,
                               normal_cull=args.self_normal_cull),
             device=args.device)
 

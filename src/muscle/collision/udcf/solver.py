@@ -1,8 +1,9 @@
 """UdcfDcdCollider — host orchestration for the Gaia DCD port.
 
 Device kernels live in ``muscle.collision.udcf.kernel``; this module owns
-broadphase hashgrid sizing, the per-iteration kernel launch order, and the
-public ``UdcfParams`` / ``UdcfDcdCollider`` API.
+broadphase backend selection (wp.Bvh default, uniform hashgrid fallback) and
+sizing, the per-iteration kernel launch order, and the public ``UdcfParams`` /
+``UdcfDcdCollider`` API.
 """
 from __future__ import annotations
 
@@ -55,17 +56,17 @@ class UdcfParams:
     normal_cull: float = 1.0          # skip self pairs with n_i·n_j > this
                                       # (co-oriented faces can't penetrate).
                                       # 1.0 disables; 0.0 culls same-hemisphere.
-    use_bvh: bool = False             # broadphase backend.  False (default):
-                                      # hashgrid — fastest here (~161ms on the
-                                      # humanV2 muscle self set).  True: wp.Bvh
-                                      # over per-triangle AABBs, rebuilt each
-                                      # broadphase.  AABBs are tighter than the
-                                      # hashgrid's single-cell sphere test, but
-                                      # the per-broadphase tree REBUILD (~600ms
-                                      # at 238k tris) costs more than it saves on
-                                      # this mesh; kept as an option for meshes
-                                      # with very non-uniform triangle sizes or
-                                      # small tri counts where rebuild is cheap.
+    use_bvh: bool = True              # broadphase backend.  True (default):
+                                      # wp.Bvh over per-triangle AABBs, rebuilt
+                                      # each broadphase.  False: uniform hashgrid.
+                                      # On the humanV2 muscle self set BVH runs
+                                      # the full broadphase in 1.8ms vs the
+                                      # hashgrid's 8.3ms (~4.5x) with identical
+                                      # narrow contacts — AABB-overlap is tighter
+                                      # than the hashgrid's single-cell sphere
+                                      # test (1.5M vs 2.5M candidate pairs) and
+                                      # the per-pass tree rebuild is cheap at this
+                                      # tri count.  Hashgrid kept as a fallback.
     jacobi_avg: bool = True           # True: dP/count (bounded, can under-
                                       # correct clusters); False: summed dP
                                       # (closer to the reference's serial
