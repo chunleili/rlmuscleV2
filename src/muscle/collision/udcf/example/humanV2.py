@@ -75,6 +75,15 @@ def main(argv=None):
     ap.add_argument("--self_gauss_seidel", action="store_true",
                     help="serial GS self-resolve (stable under fold, single-"
                          "thread/slow); default jacobi at this vertex count")
+    ap.add_argument("--self_per_substep", action="store_true",
+                    help="run DCD self once per SUBSTEP (post_phase) instead of "
+                         "per fine-iteration — fewer response launches, looser "
+                         "convergence")
+    ap.add_argument("--self_rebuild_substeps", action="store_true",
+                    help="rebuild the self broadphase EVERY call (~10x slower). "
+                         "Default rebuilds once per FRAME and reuses pairs across "
+                         "substeps — muscle deforms little within a frame, so the "
+                         "10 per-frame rebuilds of the 2.5M-pair grid are wasted.")
     args = ap.parse_args(argv)
     # --no_collision (shared flag) disables BOTH resolvers.
     if args.no_collision:
@@ -88,9 +97,6 @@ def main(argv=None):
                                     contact_offset=args.contact_offset)
     if not args.static_bone:
         bone.preload(range(sim.start_frame, sim.end_frame + 1))
-    if not args.no_bone:
-        sim.collision_solvers = [bone]          # post_phase: final word
-
     # --- muscle self-collision: UDCF DCD (allow_self, dummy static) -----------
     dcd = None
     if not args.no_self:
@@ -108,14 +114,44 @@ def main(argv=None):
                               gauss_seidel=args.self_gauss_seidel,
                               jacobi_avg=not args.self_gauss_seidel),
             device=args.device)
-        sim.collision_solvers_iter = [dcd.solve]  # per-iteration: interleaved
+
+    # Self broadphase rebuild cadence.  dcd.solve(i_iter): i_iter==0 rebuilds the
+    # broadphase (+ snapshots x_prev), i_iter>0 reuses the existing pairs.  By
+    # default we rebuild ONCE per frame (first self call) and reuse across the
+    # frame's substeps — a ~10x win, since the 2.5M-pair grid is near-constant
+    # within a frame.  --self_rebuild_substeps forces a rebuild every call.
+    self_fn = dcd.solve if dcd is not None else None
+    reset_self = None
+    if dcd is not None and not args.self_rebuild_substeps:
+        state = {"fresh": True}
+
+        def self_fn(it=0, _st=state, _d=dcd):
+            _d.solve(0 if _st["fresh"] else 1)
+            _st["fresh"] = False
+
+        def reset_self(frame, _st=state):
+            _st["fresh"] = True
+
+    # post_phase runs once per substep; bone (SDF) must be the FINAL word so it
+    # appends last.  Per-substep self goes ahead of it; per-fine-iter self uses
+    # the interleaved hook instead.
+    post = []
+    if self_fn is not None and args.self_per_substep:
+        post.append(self_fn)
+    elif self_fn is not None:
+        sim.collision_solvers_iter = [self_fn]
+    if not args.no_bone:
+        post.append(bone)
+    if post:
+        sim.collision_solvers = post
 
     print(f"humanV2 collision: bone={'SDF' if not args.no_bone else 'OFF'}  "
           f"self={'DCD' if not args.no_self else 'OFF'}  "
           f"({'STATIC@f1' if args.static_bone else 'ANIMATED'} skeleton, "
           f"{bone.n_bone_verts} bone verts)")
 
-    run_humanV2_loop(sim, bone, args, cfg, surf_flat, fascia_flat)
+    run_humanV2_loop(sim, bone, args, cfg, surf_flat, fascia_flat,
+                     pre_step=reset_self)
     if dcd is not None:
         print(f"DCD self final: {dcd.stats()}")
 
