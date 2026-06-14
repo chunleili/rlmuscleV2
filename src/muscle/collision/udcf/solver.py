@@ -24,6 +24,8 @@ from muscle.collision.udcf.kernel import (
     narrow_respond_gs_kernel,
     respond_kernel,
     apply_kernel,
+    vertex_min_clearance_kernel,
+    clamp_conservative_kernel,
     _clamp_contact_depth_kernel,
     _peak_update_kernel,
 )
@@ -98,6 +100,47 @@ class CcdInterface(Protocol):
     per solve() after the DCD pass with the collider as argument."""
 
     def solve(self, collider: "UdcfDcdCollider") -> None: ...
+
+
+class ConservativeBoundCcd:
+    """Penetration-free conservative-advancement CCD (port of Style3D / VBD's
+    ``particle_conservative_bounds_kernel``).
+
+    Each movable vertex's displacement since the broadphase snapshot is clamped
+    to ``relaxation * (distance to its nearest non-incident surface triangle)``,
+    so a vertex can never cross more than a fraction of its clearance in one
+    step — it cannot tunnel through a thin feature.  No time-of-impact root
+    finding: a per-vertex clearance query (over the collider's BVH) plus a
+    displacement clamp, run after the DCD pass via the collider's ``ccd`` hook.
+
+    Requires ``UdcfParams.use_bvh=True`` (reuses the collider's BVH).  Clearance
+    is recomputed only when the collider rebuilt its broadphase that pass; the
+    cheap clamp runs every pass.
+    """
+
+    def __init__(self, relaxation: float = 0.42, query_radius: float = 0.05,
+                 device: str | None = None):
+        self.relaxation = float(relaxation)
+        self.query_radius = float(query_radius)
+        self.device = device
+        self.min_dist = None
+
+    def solve(self, c: "UdcfDcdCollider") -> None:
+        if c.bvh is None:
+            raise RuntimeError("ConservativeBoundCcd requires UdcfParams.use_bvh=True")
+        dev = self.device or c.device
+        if self.min_dist is None:
+            self.min_dist = wp.zeros(c.n_mov, dtype=wp.float32, device=dev)
+        # Refresh clearance only on a broadphase pass (positions == snapshot;
+        # c.x matches the BVH the query runs against).
+        if getattr(c, "_did_broadphase", True):
+            wp.launch(vertex_min_clearance_kernel, dim=c.n_mov,
+                      inputs=[c.bvh.id, c.x, c.tris, wp.int32(c.n_mov),
+                              wp.float32(self.query_radius), self.min_dist],
+                      device=dev)
+        wp.launch(clamp_conservative_kernel, dim=c.n_mov,
+                  inputs=[c.pos, c.x_prev, self.min_dist,
+                          wp.float32(self.relaxation)], device=dev)
 
 
 class UdcfDcdCollider:
@@ -336,6 +379,7 @@ class UdcfDcdCollider:
                         dest_offset=0, src_offset=0, count=self.n_mov)
             wp.copy(self.x, self.pos,
                     dest_offset=0, src_offset=0, count=self.n_mov)
+        self._did_broadphase = (i_iter == 0)
         if i_iter == 0:
             self._broadphase()
             self._peak_contacts.zero_()

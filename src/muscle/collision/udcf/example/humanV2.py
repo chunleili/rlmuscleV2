@@ -46,7 +46,8 @@ from muscle.collision.sdf.example.humanV2 import (
     build_humanV2_sim,
     run_humanV2_loop,
 )
-from muscle.collision.udcf.solver import UdcfDcdCollider, UdcfParams
+from muscle.collision.udcf.solver import (
+    ConservativeBoundCcd, UdcfDcdCollider, UdcfParams)
 
 def main(argv=None):
     ap = add_humanV2_args(argparse.ArgumentParser())
@@ -73,6 +74,14 @@ def main(argv=None):
     ap.add_argument("--self_gauss_seidel", action="store_true",
                     help="serial GS self-resolve (stable under fold, single-"
                          "thread/slow); default jacobi at this vertex count")
+    ap.add_argument("--self_ccd", action="store_true",
+                    help="add conservative-bound CCD to self-collision: clamp "
+                         "per-vertex displacement to ccd_relaxation x clearance "
+                         "so verts can't tunnel through thin features")
+    ap.add_argument("--ccd_relaxation", type=float, default=0.42,
+                    help="CCD displacement bound = this x nearest-clearance")
+    ap.add_argument("--ccd_query_radius", type=float, default=0.05,
+                    help="CCD clearance search radius (m)")
     ap.add_argument("--self_normal_cull", type=float, default=1.0,
                     help="skip self pairs with n_i.n_j > this (1.0 disables, "
                          "0.0 culls co-oriented faces)")
@@ -102,9 +111,13 @@ def main(argv=None):
     # --- muscle self-collision: UDCF DCD (allow_self, no static body) ---------
     dcd = None
     if args.self_collision:
+        ccd = ConservativeBoundCcd(relaxation=args.ccd_relaxation,
+                                   query_radius=args.ccd_query_radius,
+                                   device=args.device) if args.self_ccd else None
         dcd = UdcfDcdCollider(
             sim.pos, sim.inv_mass,
             surface_tris=surf_flat.reshape(-1, 3),
+            ccd=ccd,
             params=UdcfParams(allow_self=True,
                               thickness=args.thickness,
                               multiplier=args.self_multiplier,

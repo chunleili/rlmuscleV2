@@ -980,3 +980,104 @@ def broadphase_find_pairs_bvh_kernel(
             pair_a[slot] = i
             pair_b[slot] = j
 
+
+
+# ======================================================================
+# Conservative-bound CCD (penetration-free advancement)
+#
+# Port of Style3D / VBD's penetration-free conservative bound
+# (newton _src/solvers/style3d/collision/collision_legacy.py
+#  particle_conservative_bounds_kernel): clamp each movable vertex's
+# displacement to ``relaxation * (min distance to the nearest non-incident
+# surface triangle)`` so a vertex can never advance more than a fraction of
+# its clearance in one step -> it cannot tunnel through a thin feature.
+# Unlike time-of-impact CCD this needs no root finding; it is a per-vertex
+# clearance query + a displacement clamp, composing directly with XPBD.
+# ======================================================================
+
+@wp.func
+def _closest_point_tri_dist(p: wp.vec3, a: wp.vec3, b: wp.vec3,
+                            c: wp.vec3) -> wp.float32:
+    """Distance from point p to triangle (a,b,c) — Ericson closest-point
+    region test (Real-Time Collision Detection)."""
+    ab = b - a
+    ac = c - a
+    ap = p - a
+    d1 = wp.dot(ab, ap)
+    d2 = wp.dot(ac, ap)
+    if d1 <= 0.0 and d2 <= 0.0:
+        return wp.length(p - a)
+    bp = p - b
+    d3 = wp.dot(ab, bp)
+    d4 = wp.dot(ac, bp)
+    if d3 >= 0.0 and d4 <= d3:
+        return wp.length(p - b)
+    cp = p - c
+    d5 = wp.dot(ab, cp)
+    d6 = wp.dot(ac, cp)
+    if d6 >= 0.0 and d5 <= d6:
+        return wp.length(p - c)
+    vc = d1 * d4 - d3 * d2
+    if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+        v = d1 / (d1 - d3)
+        return wp.length(p - (a + v * ab))
+    vb = d5 * d2 - d1 * d6
+    if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+        w = d2 / (d2 - d6)
+        return wp.length(p - (a + w * ac))
+    va = d3 * d6 - d5 * d4
+    if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
+        w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+        return wp.length(p - (b + w * (c - b)))
+    # interior: project onto plane
+    denom = 1.0 / (va + vb + vc)
+    v = vb * denom
+    w = vc * denom
+    return wp.length(p - (a + ab * v + ac * w))
+
+
+@wp.kernel
+def vertex_min_clearance_kernel(
+    bvh: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    tris: wp.array2d(dtype=wp.int32),
+    n_mov: wp.int32,
+    query_radius: wp.float32,
+    min_dist: wp.array(dtype=wp.float32),
+):
+    """Per movable vertex: distance to the nearest NON-incident surface
+    triangle within query_radius (else query_radius).  Incident triangles
+    (the vertex's own faces, distance ~0) are skipped."""
+    v = wp.tid()
+    p = x[v]
+    r = wp.vec3(query_radius, query_radius, query_radius)
+    q = wp.bvh_query_aabb(bvh, p - r, p + r)
+    best = query_radius
+    t = wp.int32(0)
+    while wp.bvh_query_next(q, t):
+        i0 = tris[t, 0]
+        i1 = tris[t, 1]
+        i2 = tris[t, 2]
+        if v == i0 or v == i1 or v == i2:
+            continue
+        d = _closest_point_tri_dist(p, x[i0], x[i1], x[i2])
+        if d < best:
+            best = d
+    min_dist[v] = best
+
+
+@wp.kernel
+def clamp_conservative_kernel(
+    pos: wp.array(dtype=wp.vec3),
+    x_prev: wp.array(dtype=wp.vec3),
+    min_dist: wp.array(dtype=wp.float32),
+    relaxation: wp.float32,
+):
+    """Clamp the displacement (pos - x_prev) of each movable vertex to
+    relaxation * min_dist (its conservative penetration-free bound)."""
+    v = wp.tid()
+    dx = pos[v] - x_prev[v]
+    bound = relaxation * min_dist[v]
+    l = wp.length(dx)
+    if l > bound and l > 0.0:
+        pos[v] = x_prev[v] + dx * (bound / l)
