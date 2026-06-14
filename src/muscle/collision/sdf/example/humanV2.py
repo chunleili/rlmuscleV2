@@ -264,7 +264,10 @@ def run_humanV2_loop(sim, collider, args, cfg, surf_flat, fascia_flat,
             pre_step(frame)
         sim.step_frame(frame)
         depth = collider.inside_depth()             # >0 = inside bone
-        is_collide = (depth > 0.0).astype(np.int32)  # per-vertex 0/1
+        # Threshold at collide_eps, not >0: after SDF projection verts sit ON
+        # the surface (sub-micron inside per the signed test) — that is resolved,
+        # not a collision. eps filters that touch-noise out of the count.
+        is_collide = (depth > args.collide_eps).astype(np.int32)  # per-vertex 0/1
 
         if renderer is not None:
             pos_np = sim.positions_np()
@@ -312,6 +315,10 @@ def add_humanV2_args(ap):
     ap.add_argument("--geo_out", default=None,
                     help="dir for per-frame .geo (in-place P + is_collide). "
                          "Template = cfg rest_path. ~37MB/frame.")
+    ap.add_argument("--collide_eps", type=float, default=1e-6,
+                    help="is_collide depth threshold (m); verts shallower than "
+                         "this count as resolved (default 1um — filters the "
+                         "sub-micron surface-touch noise after SDF projection)")
     return ap
 
 
