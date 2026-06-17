@@ -4,7 +4,9 @@ from rl_mass.env import MassEnv
 
 
 def main():
-    env = make_env("data/rl_mass/config.json")
+    # main moved per-task configs into data/rl_mass/configs/; walk has no
+    # skeleton_format key, so it must route to the DART MassEnv path.
+    env = make_env("data/rl_mass/configs/walk.json")
     assert isinstance(env, MassEnv)
     print("OK")
 
