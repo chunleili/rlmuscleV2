@@ -14,9 +14,15 @@ Based on NVIDIA Warp, which is capable for **all platforms (Windows, Linux, MacO
 
 ## Examples
 
+Run everything from the repo root with **`uv run`** — it auto-syncs the venv,
+so no `activate` and no `PYTHONPATH` are needed (the `example` package is on
+`src/`, registered in `pyproject.toml`). Every command below is `uv run -m
+example.<name>`.
+
+> Not using uv? Prefix instead: `PYTHONPATH=src .venv/bin/python -m example.<name>`.
+
 All examples live in `src/example/` and default to writing a **single USD file
-with animation** under `output/`. Run from the repo root with `PYTHONPATH=src`
-(commands below already include it).
+with animation** under `output/`.
 
 ### ⭐ Core demo — humanV2 muscle
 
@@ -37,7 +43,7 @@ self-collision `dcd` / `intermuscle`) lives in the json's `demo` object; the
 only command-line argument is `--config`.
 
 ```bash
-PYTHONPATH=src python -m example.humanV2 --config data/humanV2/config/humanV2.json
+uv run -m example.humanV2 --config data/humanV2/config/humanV2.json
 # → output/humanV2.usd
 ```
 
@@ -78,9 +84,9 @@ PYTHONPATH=src python -m example.humanV2 --config data/humanV2/config/humanV2.js
     <td align="center" width="33%"><img width="320" src="docs/images/lion_oneway.png" alt="lion one-way"><br><b>lion (one-way)</b></td>
   </tr>
   <tr>
-    <td align="center" width="33%"><code>PYTHONPATH=src python -m example.oneway --config data/humanV2/config/humanV2_gmg.json --out output/humanv2_oneway.usd</code></td>
-    <td align="center" width="33%"><code>PYTHONPATH=src python -m example.bicep --auto</code></td>
-    <td align="center" width="33%"><code>PYTHONPATH=src python -m example.oneway --config data/lion/config/lion_nomg.json --out output/lion_oneway.usd</code></td>
+    <td align="center" width="33%"><code>uv run -m example.oneway --config data/humanV2/config/humanV2_gmg.json --out output/humanv2_oneway.usd</code></td>
+    <td align="center" width="33%"><code>uv run -m example.bicep --auto</code></td>
+    <td align="center" width="33%"><code>uv run -m example.oneway --config data/lion/config/lion_nomg.json --out output/lion_oneway.usd</code></td>
   </tr>
   <tr>
     <td align="center" width="33%"><sub>→ <code>output/humanv2_oneway.usd</code></sub></td>
@@ -93,8 +99,8 @@ PYTHONPATH=src python -m example.humanV2 --config data/humanV2/config/humanV2.js
     <td align="center" width="33%"></td>
   </tr>
   <tr>
-    <td align="center" width="33%"><code>PYTHONPATH=src python -m example.oneway --config data/minotaur/config/minotaur.json --out output/minotaur_oneway.usd</code></td>
-    <td align="center" width="33%"><code>PYTHONPATH=src python -m example.oneway --config data/minotaur_leg/config/minotaur_leg.json --out output/minotaur_leg_oneway.usd</code></td>
+    <td align="center" width="33%"><code>uv run -m example.oneway --config data/minotaur/config/minotaur.json --out output/minotaur_oneway.usd</code></td>
+    <td align="center" width="33%"><code>uv run -m example.oneway --config data/minotaur_leg/config/minotaur_leg.json --out output/minotaur_leg_oneway.usd</code></td>
     <td align="center" width="33%"></td>
   </tr>
   <tr>
@@ -133,13 +139,13 @@ PYTHONPATH=src python -m example.humanV2 --config data/humanV2/config/humanV2.js
   </tr>
   <tr>
     <td align="center" width="33%">
-      <code>PYTHONPATH=src python -m example.sdf_drop --config data/collisionTest/sdf_drop.json --shape plane</code>
+      <code>uv run -m example.sdf_drop --config data/collisionTest/sdf_drop.json --shape plane</code>
     </td>
     <td align="center" width="33%">
-      <code>PYTHONPATH=src python -m example.rigid_soft --config data/collisionTest/rigid_soft.json</code>
+      <code>uv run -m example.rigid_soft --config data/collisionTest/rigid_soft.json</code>
     </td>
     <td align="center" width="33%">
-      <code>PYTHONPATH=src python -m example.humanV2 --config data/humanV2/config/humanV2.json</code>
+      <code>uv run -m example.humanV2 --config data/humanV2/config/humanV2.json</code>
     </td>
   </tr>
   <tr>
@@ -171,7 +177,7 @@ PYTHONPATH=src python -m example.humanV2 --config data/humanV2/config/humanV2.js
   </tr>
   <tr>
     <td align="center" width="33%">
-      <code>PYTHONPATH=src python -m example.dcd_drop --steps 60 --init_vel_y 0</code>
+      <code>uv run -m example.dcd_drop --steps 60 --init_vel_y 0</code>
     </td>
     <td align="center" width="33%"></td>
     <td align="center" width="33%"></td>
