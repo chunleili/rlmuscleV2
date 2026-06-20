@@ -273,7 +273,8 @@ class InterMuscleCollider:
     def __init__(self, sim, rest_path: str, *, max_dist: float = 0.02,
                  contact_offset: float = 1e-4, device=None,
                  flip_winding: bool = True, iters: int = 1, substep_stride: int = 2,
-                 push_cap: float = 0.0, surf_dist: float = None):
+                 push_cap: float = 0.0, surf_dist: float = None,
+                 refit_stride: int = 1):
         self.sim = sim
         self.device = device or sim._device
         self.max_dist = float(max_dist)
@@ -289,6 +290,11 @@ class InterMuscleCollider:
         # Run the refit+push only every Nth substep (1 = every substep).  The
         # LAST substep always runs so the frame ends resolved.
         self.substep_stride = max(1, int(substep_stride))
+        # Refit the per-muscle surface meshes only every Nth substep (1 = every
+        # push). ~199 host-side refit() launches per substep dominate the cost;
+        # the surface deforms little between substeps, so a slightly stale closest
+        # point is fine for the iterative capped push.
+        self.refit_stride = max(1, int(refit_stride))
         self._sub = 0
         self._nsub = int(getattr(sim, "nsubsteps", 1))
 
@@ -378,7 +384,12 @@ class InterMuscleCollider:
         self._adj.zero_()
         self._active.zero_()
         self._n_pairs.zero_()
-        margin = self.surf_dist + self.contact_offset
+        # Tight margin: the active mask only gates the surface refit, and a muscle
+        # can only be a push target if some vertex is INSIDE it (containment ->
+        # tight AABB overlap). Using the large surf_dist here marked nearly every
+        # muscle active (refit ~all 199 / substep, ~50% of cost). max_dist is a
+        # small safety band around true overlap.
+        margin = self.max_dist + self.contact_offset
         wp.launch(_adjacency_kernel, dim=nm * nm,
                   inputs=[self._lo, self._hi, wp.float32(margin), wp.int32(nm),
                           self._adj, self._active, self._n_pairs],
@@ -392,14 +403,24 @@ class InterMuscleCollider:
     def __call__(self):
         # Run on every Nth substep AND always on the last one, so the frame ends
         # fully resolved.
-        run = (self._sub % self.substep_stride == 0) or (self._sub == self._nsub - 1)
+        cur = self._sub
+        last = self._nsub - 1
+        run = (cur % self.substep_stride == 0) or (cur == last)
         self._sub += 1
         if not run:
             return
-        for mesh in self._active_meshes:    # per-substep refit, active only
-            mesh.refit()
+        # Refit gated separately from push: every refit_stride-th run, and always
+        # on the last substep so the frame ends pushing against current geometry.
+        # ~199 host-side refit() launches/substep dominate; the surface deforms
+        # little between substeps so a stale closest point is fine.
+        if cur % self.refit_stride == 0 or cur == last:
+            for mesh in self._active_meshes:    # active only
+                mesh.refit()
+        # Build the tet BVH ONCE per call and reuse across iters. The capped push
+        # moves verts at most push_cap/pass, so the AABBs go only mildly stale
+        # within a call — far cheaper than rebuilding a 468k-tet tree every iter.
+        self._build_tet_bvh()
         for _ in range(self.iters):
-            self._build_tet_bvh()           # positions moved -> rebuild
             wp.launch(_push_kernel, dim=self.nvm,
                       inputs=[self.sim.pos, self._vert_muscle, self.inv_mass,
                               self._tet_bvh.id, self._tet_idx, self._tet_muscle,

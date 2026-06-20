@@ -95,15 +95,36 @@ that the per-substep hard pin re-creates faster than one resolve pass clears.
 | `iters` | push passes per resolve (more = lower count, slower) | 4 |
 | `stride` | run every Nth substep (last always runs) | 1 |
 | `push_cap` | per-pass displacement clamp (0 = unlimited) | 0.0 |
+| `refit_stride` | refit the surface meshes every Nth substep (1 = every push) | 1 |
 | `surf_dist` | explicit surface search radius (overrides the default) | — |
 | `meter_max_dist` | surface radius for the depth meter only | = `surf_dist` |
 
-Baseline config: `data/humanV2/config/humanV2_intermuscle.json`.
+Baseline config: `data/humanV2/config/humanV2_intermuscle.json`
+(`iters=4`, `stride=1`, `push_cap=0.003`, `refit_stride=5`).
 
-## Known cost / next (speed)
+## Speed
 
-The tet BVH is rebuilt every push pass (`iters` × every substep). At `iters=4`
-that is ~40 rebuilds of a 468k-tet BVH per frame — the dominant cost. Borrowing
-the udcf optimizations (build once per substep and reuse across `iters`, gate the
-per-frame meter to export-only, trim the active-mesh refit) is the open speed
-work.
+Profiled cost distribution (humanV2 50f, `iters=4`/`stride=1`, before tuning):
+`refit 50% · tet-BVH 22% · push 21% · meter 6%`.
+
+Two cheap wins, neither hurts the count:
+
+- **`refit_stride`** — the per-muscle surface refit is ~199 host-side `refit()`
+  launches **per substep** (in a packed body every muscle is within ~2 cm of
+  some neighbour, so `last_active` is the full 199 even with a tight broadphase
+  margin). The surface deforms little between substeps, so refitting every 5th
+  substep instead of every one cuts that cost ~5× with no quality change
+  (count flat across `refit_stride` 1–10).
+- **tet-BVH reuse** — build the tet BVH **once per resolve call** and reuse it
+  across the `iters` capped passes (the push moves verts ≤ `push_cap`/pass, so
+  the AABBs go only mildly stale). 4 rebuilds → 1, ~4× off the BVH cost; the
+  count is unchanged (slightly better).
+
+Note the broadphase **margin** for the active mask is `max_dist`, not
+`surf_dist`: a muscle can only be a push target if some vertex is INSIDE it
+(containment ⊂ tight AABB overlap), so the large surface-search radius must not
+widen the refit gate.
+
+Result (humanV2 50f, no export, RTX 4090): self-collision overhead **~130 → ~50
+ms/frame** at the same count (~380, depth 1 mm). The push kernel (real BVH
+traversal + barycentric + closest-point per vertex) is now the dominant term.
