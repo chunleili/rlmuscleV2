@@ -16,7 +16,7 @@ import warp as wp
 from muscle.coupleOneWayGmg.solver import OneWaySim, load_config
 from muscle.util.geo_io import GeoFile
 
-CONFIG = "data/humanV2/config/humanV2_fascia.json"
+CONFIG = "data/humanV2/config/humanV2.json"   # baseline carries the fascia config
 N_FRAMES = 30
 DEVICE = "cuda:0"
 

@@ -26,7 +26,7 @@ def dbg(pos: wp.array(dtype=wp.vec3), mesh: wp.uint64, md: wp.float32,
 
 def runto(fiber, upto, vid):
     a = argparse.Namespace(
-        config='data/humanV2/config/humanV2_fascia.json', device='cuda:0',
+        config='data/humanV2/config/humanV2.json', device='cuda:0',
         end_frame=upto, fiber=fiber, fiber_stiffness=1e9, contraction_ratio=0.8,
         activate=None, bone_dir='data/humanV2/model/bone', max_dist=0.2,
         contact_offset=1e-5, static_bone=False, no_collision=False)
