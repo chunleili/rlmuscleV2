@@ -3,16 +3,16 @@
 Uses Warp MuscleSim for PBD computation and WarpRenderer for visualization.
 
 Usage (OpenGL interactive):
-    uv run python -m muscle.example_muscle_warp
+    PYTHONPATH=src python -m example.bicep
 
 Usage (headless auto-test, no rendering):
-    uv run python examples/example_muscle_warp.py --auto --render none
+    PYTHONPATH=src python -m example.bicep --auto --render none
 
 Usage (auto-test with USD output):
-    uv run python examples/example_muscle_warp.py --auto --render usd
+    PYTHONPATH=src python -m example.bicep --auto --render usd
 
 Usage (USD output):
-    uv run python examples/example_muscle_warp.py --render usd
+    PYTHONPATH=src python -m example.bicep --render usd
 """
 
 import argparse

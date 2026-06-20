@@ -18,7 +18,7 @@ Compare output PLYs against ~/Dev/Gaia_UDCF/Simulator/testresults_U/A*.ply.
 
 Run::
 
-    PYTHONPATH=src .venv/bin/python -m muscle.collision.udcf.example.u_drop \
+    PYTHONPATH=src .venv/bin/python -m example.dcd_drop \
         --geo data/collisionTest/U.geo --steps 60
 """
 from __future__ import annotations

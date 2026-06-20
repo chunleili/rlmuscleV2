@@ -4,9 +4,9 @@ Default config (bicep_coupled.json) uses TETFIBERNORM constraint.
 Switch to bicep_fibermillard_coupled.json via --config to use TETFIBERMILLARD.
 
 Usage:
-    uv run python -m muscle.coupleTwoWay.example --auto --steps 300
-    uv run python -m muscle.coupleTwoWay.example --auto --render
-    uv run python -m muscle.coupleTwoWay.example --eval
+    uv run python -m example.twoway --auto --steps 300
+    uv run python -m example.twoway --auto --render
+    uv run python -m example.twoway --eval
 """
 
 from __future__ import annotations

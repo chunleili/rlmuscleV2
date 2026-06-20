@@ -1,25 +1,42 @@
-"""Animated bone collider for humanV2: muscle vs the MOVING skeleton.
+"""humanV2 muscle demo — single json-driven entry point.
 
-The static-bone version (``example_humanV2_bone``) holds the skeleton at its
-rest pose while the muscle is pulled away by the per-frame pin targets, so the
-muscle plunges ever deeper into the frozen bones (verts_inside grows ~250 ->
-~4000 over 20 frames) and the single-push contact cannot keep up once a vertex
-sinks past ``max_dist``.
+Baseline (``data/humanV2/config/humanV2.json``):
+    fascia shell + animated-bone SDF collision, multigrid OFF (No MG).
 
-Here the bones are driven by the same 200-frame animation that generated the
-muscle's ``cons`` targets — a per-frame mesh sequence
-``data/humanV2/model/bone/bone_<N>.geo`` (36811 verts, 73218 tris, constant
-topology, same world frame as the muscle). Each frame we load the bone vertex
-positions into the collider's ``wp.Mesh`` and ``refit()`` it before stepping
-the solver, so the bones track the muscle and penetration stays shallow / local
-— well within ``max_dist`` of the surface.
+This file MERGES the four old humanV2 examples (sdf bone, sdf+fascia, sdf+DCD
+self, sdf+inter-muscle self). Every knob is read from the json config — the
+ONLY command-line argument is ``--config``::
 
-Run::
+    PYTHONPATH=src python -m example.humanV2 --config data/humanV2/config/humanV2.json
+    # -> output/humanV2.usd
 
-    PYTHONPATH=src .venv/bin/python -m muscle.collision.sdf.example.humanV2 \\
-        --config data/humanV2/config/humanV2_gmg.json \\
-        --bone_dir data/humanV2/model/bone --end_frame 20 \\
-        --usd output/humanV2_sdf_coll.usd
+The skeleton is driven by the same 200-frame animation that generated the
+muscle's ``cons`` targets (``data/humanV2/model/bone/bone_<N>.geo``, constant
+topology). Each frame the bone verts are loaded into a ``wp.Mesh`` and
+``refit()``-ed before the solve, so penetration stays shallow / local.
+
+Config schema (``demo`` object; solver keys stay at the json top level and are
+consumed by ``OneWaySim``):
+
+    "demo": {
+      "out": "output/humanV2.usd",
+      "bone_dir": "data/humanV2/model/bone",
+      "device": "cuda:0",
+      "no_export": false,
+      "geo_out": null,
+      "no_collide_primvars": false,
+      "activate": null,                      # muscle-name substring; needs use_fiber
+      "collision": {
+        "enabled": true,
+        "static_bone": false,
+        "max_dist": 0.2,
+        "contact_offset": 1e-5,
+        "collide_eps": 1e-6
+      },
+      "self_collision": {                     # method: none | dcd | intermuscle
+        "method": "none"
+      }
+    }
 """
 from __future__ import annotations
 
@@ -31,7 +48,7 @@ import numpy as np
 import warp as wp
 
 from muscle.coupleOneWayGmg.solver import OneWaySim, load_config
-from muscle.coupleOneWayGmg.example import _vectorized_surface_tris
+from muscle.util.mesh_io import vectorized_surface_tris
 from muscle.collision.sdf.kernel import solve_mesh_contact_pos_kernel
 from muscle.util.geo_io import GeoFile, GeoWriter, read_geo_attr_cached
 
@@ -158,8 +175,6 @@ def _bake_static_primvars(stage, prim_path, sim):
         print(f"[usd] baked static primvars: {', '.join(baked)}")
 
 
-
-
 def _load_bone_verts(bone_dir: Path, frame: int) -> np.ndarray:
     pos = read_geo_attr_cached(str(bone_dir / f"bone_{frame}.geo"), "P")
     return np.ascontiguousarray(np.asarray(pos, dtype=np.float32))
@@ -262,30 +277,14 @@ class AnimatedBoneMeshCollider:
         return self.mesh.indices.numpy().astype(np.int32)
 
 
-def build_humanV2_sim(args):
+def build_humanV2_sim(cfg, demo):
     """Build the OneWaySim + preload per-frame targets, and compute the
     muscle/fascia surface triangle lists for rendering.
 
-    Shared by the SDF demo (this module) and the UDCF DCD demo
-    (``muscle.collision.udcf.example.humanV2``) — both drive the SAME humanV2
-    GMG solver and only differ in which collider resolves contact, so the
-    config load, preload, and fascia split live here once.
-    """
-    cfg = load_config(args.config)
-    cfg["end_frame"] = args.end_frame
-    # Optional overrides for the partial-pin experiment (no-op if args absent).
-    if getattr(args, "no_gmg", False):
-        cfg["use_multigrid"] = False
-    if getattr(args, "tendon_pin_threshold", None) is not None:
-        cfg["tendon_pin_threshold"] = args.tendon_pin_threshold
-    if getattr(args, "pin_soft_stiffness", None) is not None:
-        cfg["pin_soft_stiffness"] = args.pin_soft_stiffness
-    if getattr(args, "fiber", "none") != "none":
-        cfg["use_fiber"] = True
-        cfg["fiber_model"] = args.fiber
-        cfg["fiber_stiffness"] = args.fiber_stiffness
-        cfg["contraction_ratio"] = args.contraction_ratio
-    sim = OneWaySim(cfg, device=args.device)
+    All knobs (fascia, multigrid, fiber, tendon pin) come from the json ``cfg``
+    — ``OneWaySim`` reads them directly. ``demo`` only carries the run-level
+    settings (device, activate)."""
+    sim = OneWaySim(cfg, device=demo.get("device", "cuda:0"))
     if getattr(sim, "use_fiber", False):
         print(f"[fiber] model={sim.fiber_model} k_fib={sim.fiber_stiffness:g} "
               f"contraction_ratio={sim.contraction_ratio:g}")
@@ -293,7 +292,7 @@ def build_humanV2_sim(args):
     # run loop ramps this muscle's activation 0->1 across frames so the fiber
     # contraction is visible against the passive baseline.
     sim._activate_mask = None
-    act_name = getattr(args, "activate", None)
+    act_name = demo.get("activate")
     if act_name and getattr(sim, "use_fiber", False):
         mask = sim.tet_mask_for_muscles(act_name).astype(np.float32)
         sim._activate_mask = mask
@@ -317,43 +316,76 @@ def build_humanV2_sim(args):
     if nvm < sim.NV:
         muscle_tets = tets[(tets < nvm).all(axis=1)]
         fascia_tets = tets[(tets >= nvm).all(axis=1)]
-        surf_flat = _vectorized_surface_tris(muscle_tets).reshape(-1).astype(np.int32)
-        fascia_flat = _vectorized_surface_tris(fascia_tets).reshape(-1).astype(np.int32)
+        surf_flat = vectorized_surface_tris(muscle_tets).reshape(-1).astype(np.int32)
+        fascia_flat = vectorized_surface_tris(fascia_tets).reshape(-1).astype(np.int32)
         print(f"fascia: {muscle_tets.shape[0]} muscle tets, "
               f"{fascia_tets.shape[0]} fascia tets ({sim.NV - nvm} fascia verts)")
     else:
-        surf_flat = _vectorized_surface_tris(tets).reshape(-1).astype(np.int32)
+        surf_flat = vectorized_surface_tris(tets).reshape(-1).astype(np.int32)
         fascia_flat = None
+    return sim, surf_flat, fascia_flat
+
+
+def build_humanV2_sim_from_args(args):
+    """Back-compat shim for the diagnostic ``tools/`` scripts that drive the
+    builder with an argparse Namespace instead of a json ``demo`` block.
+
+    Returns the legacy 4-tuple ``(sim, cfg, surf_flat, fascia_flat)``. New code
+    should use ``build_humanV2_sim(cfg, demo)`` directly."""
+    cfg = load_config(args.config)
+    if getattr(args, "end_frame", None) is not None:
+        cfg["end_frame"] = args.end_frame
+    if getattr(args, "no_gmg", False):
+        cfg["use_multigrid"] = False
+    if getattr(args, "tendon_pin_threshold", None) is not None:
+        cfg["tendon_pin_threshold"] = args.tendon_pin_threshold
+    if getattr(args, "pin_soft_stiffness", None) is not None:
+        cfg["pin_soft_stiffness"] = args.pin_soft_stiffness
+    if getattr(args, "fiber", "none") not in ("none", None):
+        cfg["use_fiber"] = True
+        cfg["fiber_model"] = args.fiber
+        cfg["fiber_stiffness"] = getattr(args, "fiber_stiffness", 1.0e8)
+        cfg["contraction_ratio"] = getattr(args, "contraction_ratio", 0.4)
+    demo = {"device": getattr(args, "device", "cuda:0"),
+            "activate": getattr(args, "activate", None)}
+    sim, surf_flat, fascia_flat = build_humanV2_sim(cfg, demo)
     return sim, cfg, surf_flat, fascia_flat
 
 
-def run_humanV2_loop(sim, collider, args, cfg, surf_flat, fascia_flat,
+def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
                      *, pre_step=None):
     """Per-frame step + USD/geo export, with ``collider`` as the penetration
     MEASUREMENT instrument (bone mesh + inside_depth) regardless of who resolves
     contact.  ``pre_step(frame)`` runs after the bones are positioned but before
-    the solve — the UDCF demo uses it to push the new bone pose into its DCD
-    collider's static-mesh region.
+    the solve — the self-collision modes use it to refresh their colliders.
     """
+    coll = demo.get("collision", {})
+    static_bone = bool(coll.get("static_bone", False))
+    collide_eps = float(coll.get("collide_eps", 1e-6))
+    no_export = bool(demo.get("no_export", False))
+    no_collide_primvars = bool(demo.get("no_collide_primvars", False))
+    out = demo.get("out", "output/humanV2.usd")
+    geo_out = demo.get("geo_out")
+
     renderer = None
-    if not args.no_export:
+    if not no_export:
         from muscle.engine import WarpRenderer
-        Path(args.usd).parent.mkdir(parents=True, exist_ok=True)
-        renderer = WarpRenderer(mode="usd", stage_path=args.usd)
-        print(f"[render] writing USD to {args.usd}")
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        renderer = WarpRenderer(mode="usd", stage_path=out)
+        print(f"[render] writing USD to {out}")
     else:
         print("[no_export] pure-sim timing, no USD/geo output")
 
     geo_writer = None
-    if args.geo_out and not args.no_export:
+    if geo_out and not no_export:
         tpl = cfg["rest_path"]
         geo_writer = GeoWriter(tpl)
-        Path(args.geo_out).mkdir(parents=True, exist_ok=True)
-        print(f"[geo] in-place .geo (template {tpl}) -> {args.geo_out}/")
+        Path(geo_out).mkdir(parents=True, exist_ok=True)
+        print(f"[geo] in-place .geo (template {tpl}) -> {geo_out}/")
 
     t0 = time.perf_counter()
     for frame in range(sim.start_frame, sim.end_frame + 1):
-        if not args.static_bone:
+        if not static_bone:
             collider.set_frame(frame)              # move bones BEFORE solving
         if pre_step is not None:
             pre_step(frame)
@@ -366,7 +398,7 @@ def run_humanV2_loop(sim, collider, args, cfg, surf_flat, fascia_flat,
         # Threshold at collide_eps, not >0: after SDF projection verts sit ON
         # the surface (sub-micron inside per the signed test) — that is resolved,
         # not a collision. eps filters that touch-noise out of the count.
-        is_collide = (depth > args.collide_eps).astype(np.int32)  # per-vertex 0/1
+        is_collide = (depth > collide_eps).astype(np.int32)  # per-vertex 0/1
 
         if renderer is not None:
             pos_np = sim.positions_np()
@@ -376,7 +408,7 @@ def run_humanV2_loop(sim, collider, args, cfg, surf_flat, fascia_flat,
             inner.begin_frame(frame / inner.fps)
             muscle_path = inner.render_mesh(name="muscle", points=pos_np,
                                             indices=surf_flat, colors=(0.8, 0.3, 0.25))
-            if not getattr(args, "no_collide_primvars", False):
+            if not no_collide_primvars:
                 _set_is_collide_primvar(inner.stage, muscle_path, is_collide, inner.time)
                 _set_pen_depth_primvar(inner.stage, muscle_path, depth, inner.time)
             _set_sum_is_collide(inner.stage, muscle_path, int(is_collide.sum()), inner.time)
@@ -390,7 +422,7 @@ def run_humanV2_loop(sim, collider, args, cfg, surf_flat, fascia_flat,
             inner.end_frame()
 
             if geo_writer is not None:
-                geo_writer.write(str(Path(args.geo_out) / f"muscle_{frame}.geo"),
+                geo_writer.write(str(Path(geo_out) / f"muscle_{frame}.geo"),
                                  pos_np, is_collide, depth)
         if frame % 5 == 0 or frame == sim.end_frame:
             elapsed = time.perf_counter() - t0
@@ -399,79 +431,143 @@ def run_humanV2_loop(sim, collider, args, cfg, surf_flat, fascia_flat,
                   f"max_depth={depth.max()*1000:.1f}mm")
     if renderer is not None:
         renderer.save()
-        print(f"USD saved -> {args.usd}")
+        print(f"USD saved -> {out}")
 
 
-def add_humanV2_args(ap):
-    """Args shared by the SDF and UDCF DCD humanV2 demos."""
-    ap.add_argument("--config", default="data/humanV2/config/humanV2_gmg.json")
-    ap.add_argument("--bone_dir", default="data/humanV2/model/bone")
-    ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--end_frame", type=int, default=20)
-    ap.add_argument("--max_dist", type=float, default=0.2)
-    ap.add_argument("--no_collision", action="store_true")
-    ap.add_argument("--static_bone", action="store_true",
-                    help="freeze bones at frame 1 (for A/B vs animated)")
-    ap.add_argument("--no_export", action="store_true",
-                    help="skip all USD/geo output (measure pure sim time)")
-    ap.add_argument("--geo_out", default=None,
-                    help="dir for per-frame .geo (in-place P + is_collide). "
-                         "Template = cfg rest_path. ~37MB/frame.")
-    ap.add_argument("--contact_offset", type=float, default=1e-5,
-                    help="SDF push target = surface + this gap (m); holds muscle "
-                         "verts a hair proud of the bone instead of exactly on it "
-                         "(default 10um). 0 = project onto the surface.")
-    ap.add_argument("--collide_eps", type=float, default=1e-6,
-                    help="is_collide depth threshold (m); verts shallower than "
-                         "this count as resolved (default 1um — filters the "
-                         "sub-micron surface-touch noise after SDF projection)")
-    ap.add_argument("--fiber", choices=("none", "fibernorm", "aniso_arap"),
-                    default="none",
-                    help="add an along-fiber constraint using the materialW "
-                         "fiber field: 'fibernorm' (linear Houdini TETFIBERNORM) "
-                         "or 'aniso_arap' (quadratic HOBAK fiber). Passive unless "
-                         "--activate is set. Default none.")
-    ap.add_argument("--fiber_stiffness", type=float, default=1.0e8,
-                    help="fiber constraint stiffness k_fib (XPBD compliance "
-                         "1/(k_fib·V0)); default 1e8.")
-    ap.add_argument("--activate", default=None,
-                    help="muscle-name substring (e.g. 'bicepsBrachialis') whose "
-                         "fiber activation ramps 0->1 across frames so the active "
-                         "contraction is visible. Needs --fiber. Matches muscle_id "
-                         "strings (both L_/R_).")
-    ap.add_argument("--contraction_ratio", type=float, default=0.4,
-                    help="max along-fiber shortening at activation=1: target "
-                         "stretch s* = 1 - belly·a·ratio (default 0.4 = 40%%).")
-    ap.add_argument("--no_collide_primvars", action="store_true",
-                    help="skip the per-vertex per-frame is_collide / pen_depth "
-                         "USD primvars (~+30%% file size at 200f). The cheap "
-                         "per-frame scalar sum_is_collide is still written.")
-    return ap
+def _make_self_collider(sim, cfg, demo, surf_flat):
+    """Build the optional self-collision resolver from ``demo.self_collision``.
+
+    Returns ``(post_fn_or_collider, pre_step, finalize)`` where ``post_fn`` is
+    appended to ``collision_solvers`` BEFORE the SDF bone (so the bone gets the
+    final word), ``pre_step(frame)`` refreshes the collider each frame, and
+    ``finalize()`` prints end-of-run stats. Any may be None."""
+    sc = demo.get("self_collision", {}) or {}
+    method = sc.get("method", "none")
+    if method in (None, "none"):
+        return None, None, None
+
+    if method == "dcd":
+        from muscle.collision.udcf.solver import (
+            ConservativeBoundCcd, UdcfDcdCollider, UdcfParams)
+        device = demo.get("device", "cuda:0")
+        ccd = None
+        if sc.get("ccd", False):
+            ccd = ConservativeBoundCcd(
+                relaxation=float(sc.get("ccd_relaxation", 0.42)),
+                query_radius=float(sc.get("ccd_query_radius", 0.05)),
+                device=device)
+        dcd = UdcfDcdCollider(
+            sim.pos, sim.inv_mass,
+            surface_tris=surf_flat.reshape(-1, 3),
+            ccd=ccd,
+            params=UdcfParams(allow_self=True,
+                              thickness=float(sc.get("thickness", 1e-3)),
+                              multiplier=float(sc.get("multiplier", 0.3)),
+                              friction_static=float(sc.get("mu_s", 0.5)),
+                              friction_dynamic=float(sc.get("mu_d", 0.4)),
+                              max_pairs=int(sc.get("max_pairs", 1 << 22)),
+                              max_contacts=int(sc.get("max_contacts", 1 << 18)),
+                              gauss_seidel=bool(sc.get("gauss_seidel", False)),
+                              jacobi_avg=not bool(sc.get("gauss_seidel", False)),
+                              use_bvh=not bool(sc.get("hashgrid", False)),
+                              normal_cull=float(sc.get("normal_cull", 1.0))),
+            device=device)
+        # Both colliders run in post_phase (substep's final ops). Order: self DCD
+        # first, SDF bone LAST — self-before-bone keeps the self relief while
+        # letting bone get the final word (is_collide stays ~0). Per substep self
+        # does K soft pushes; solve(0) rebuilds the broadphase, solve(1) reuses.
+        # Broadphase rebuilds once per frame and is reused across substeps unless
+        # rebuild_substeps is set (the 2.5M-pair grid is near-constant in a frame).
+        state = {"fresh": True}
+        K = max(1, int(sc.get("iters", 2)))
+        every = bool(sc.get("rebuild_substeps", False))
+
+        def self_fn(_st=state, _d=dcd, _K=K, _every=every):
+            rebuild = _st["fresh"] or _every
+            _st["fresh"] = False
+            _d.solve(0 if rebuild else 1)
+            for _ in range(_K - 1):
+                _d.solve(1)
+
+        def pre_step(frame, _st=state):
+            _st["fresh"] = True
+
+        def finalize():
+            print(f"DCD self final: {dcd.stats()}")
+
+        print(f"[self] DCD muscle self-collision (mult={sc.get('multiplier', 0.3)} "
+              f"x {K} iters)")
+        return self_fn, pre_step, finalize
+
+    if method == "intermuscle":
+        from muscle.collision.closest_point.intermuscle import InterMuscleCollider
+        inter = InterMuscleCollider(sim, cfg["rest_path"],
+                                    max_dist=float(sc.get("max_dist", 0.02)),
+                                    contact_offset=float(sc.get("offset", 1e-4)),
+                                    iters=int(sc.get("iters", 1)),
+                                    substep_stride=int(sc.get("stride", 2)),
+                                    device=demo.get("device", "cuda:0"))
+        print(f"[self] inter-muscle collider: {inter.n_muscle} muscles, "
+              f"max_dist={sc.get('max_dist', 0.02)} offset={sc.get('offset', 1e-4)}")
+
+        def finalize():
+            print(f"inter-muscle final inside_count={inter.inside_count()}  "
+                  f"pairs={inter.last_pairs}")
+
+        return inter, (lambda frame: inter.refresh()), finalize
+
+    raise ValueError(f"unknown self_collision.method '{method}' "
+                     f"(expected none | dcd | intermuscle)")
 
 
 def main(argv=None):
-    ap = add_humanV2_args(argparse.ArgumentParser())
-    ap.add_argument("--usd", default="output/humanV2_sdf_coll.usd")
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--config", default="data/humanV2/config/humanV2.json",
+                    help="json scene+demo config (the ONLY argument; every other "
+                         "knob lives in the json's solver keys + 'demo' object)")
     args = ap.parse_args(argv)
 
     wp.init()
-    sim, cfg, surf_flat, fascia_flat = build_humanV2_sim(args)
+    cfg = load_config(args.config)
+    demo = cfg.get("demo", {}) or {}
 
-    # Always build the collider (we need its mesh to MEASURE penetration even
-    # when --no_collision disables the push) — only registering it as a solver
-    # turns the actual contact resolution on.
-    collider = AnimatedBoneMeshCollider(sim, args.bone_dir, max_dist=args.max_dist,
-                                        contact_offset=args.contact_offset)
-    if not args.static_bone:
+    sim, surf_flat, fascia_flat = build_humanV2_sim(cfg, demo)
+
+    coll = demo.get("collision", {}) or {}
+    collision_on = bool(coll.get("enabled", True))
+    static_bone = bool(coll.get("static_bone", False))
+    bone_dir = demo.get("bone_dir", "data/humanV2/model/bone")
+
+    # Always build the bone collider — it is the penetration METER (inside_depth
+    # drives the USD primvars) even when collision resolution is disabled.
+    collider = AnimatedBoneMeshCollider(
+        sim, bone_dir,
+        max_dist=float(coll.get("max_dist", 0.2)),
+        contact_offset=float(coll.get("contact_offset", 1e-5)))
+    if not static_bone:
         collider.preload(range(sim.start_frame, sim.end_frame + 1))
-    if not args.no_collision:
-        sim.collision_solvers = [collider]
-    print(f"bone collider (SDF): {collider.n_bone_verts} verts, "
-          f"{collider.n_bone_tris} tris  "
-          f"({'STATIC@f1' if args.static_bone else 'ANIMATED'}, "
-          f"push={'OFF' if args.no_collision else 'ON'})")
 
-    run_humanV2_loop(sim, collider, args, cfg, surf_flat, fascia_flat)
+    # Optional self-collision resolver (post_phase, BEFORE the SDF bone).
+    self_collider, self_pre, self_finalize = _make_self_collider(
+        sim, cfg, demo, surf_flat)
+
+    post = []
+    if self_collider is not None:
+        post.append(self_collider)             # self push first ...
+    if collision_on:
+        post.append(collider)                  # ... SDF bone LAST (final word)
+    if post:
+        sim.collision_solvers = post
+
+    print(f"humanV2: bone={'SDF' if collision_on else 'OFF(meter only)'}  "
+          f"self={demo.get('self_collision', {}).get('method', 'none')}  "
+          f"({'STATIC@f1' if static_bone else 'ANIMATED'} skeleton, "
+          f"{collider.n_bone_verts} bone verts)")
+
+    run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
+                     pre_step=self_pre)
+    if self_finalize is not None:
+        self_finalize()
 
 
 if __name__ == "__main__":

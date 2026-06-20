@@ -11,7 +11,7 @@ self-collision): here there is no broadphase, no pair list, no winding — one
 
 Run::
 
-    PYTHONPATH=src .venv/bin/python -m muscle.collision.sdf.example.u_drop \\
+    PYTHONPATH=src .venv/bin/python -m example.sdf_drop \\
         --config data/collisionTest/sdf_drop.json --shape plane
 """
 from __future__ import annotations

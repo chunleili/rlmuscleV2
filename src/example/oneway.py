@@ -1,15 +1,15 @@
 """End-to-end driver for the ARAP-HPBD one-way pin-to-target sim.
 
 Usage:
-    python -m muscle.coupleOneWayGmg.example \
+    python -m example.oneway \
         --config data/lion/config/lion_nomg.json \
         --out output/lion_oneway.usd
 
-    python -m muscle.coupleOneWayGmg.example \
+    python -m example.oneway \
         --config data/minotaur/config/minotaur.json \
         --out output/minotaur_oneway.usd
 
-    python -m muscle.coupleOneWayGmg.example \
+    python -m example.oneway \
         --config data/minotaur_leg/config/minotaur_leg.json \
         --out output/minotaur_leg_oneway.usd
 """
@@ -22,26 +22,7 @@ import numpy as np
 import warp as wp
 
 from muscle.coupleOneWayGmg.solver import OneWaySim, load_config
-from muscle.util.mesh_io import MeshExporter
-
-
-def _vectorized_surface_tris(tets: np.ndarray) -> np.ndarray:
-    """Extract boundary tris from a tet mesh — fast vectorized version.
-
-    A face is on the surface iff it appears in exactly one tet. Faces are
-    canonicalized by sorting their 3 vertex ids; the original (oriented)
-    triangle is recovered by looking up which tet+face slot produced it.
-    """
-    NT = tets.shape[0]
-    # Each tet has 4 faces; use the standard outward winding convention.
-    face_slots = np.array([[1, 2, 3], [0, 3, 2], [0, 1, 3], [0, 2, 1]], dtype=np.int32)
-    tris = tets[:, face_slots].reshape(-1, 3)        # (4*NT, 3) oriented
-    keys = np.sort(tris, axis=1)                      # canonical key
-
-    # Find unique canonical faces and how many tets share each.
-    _, inv, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
-    boundary_mask = counts[inv] == 1
-    return tris[boundary_mask].astype(np.int32)
+from muscle.util.mesh_io import MeshExporter, vectorized_surface_tris
 
 
 def main():
@@ -83,7 +64,7 @@ def main():
             exporter = MeshExporter(path=stem, format="usd",
                                     tet_indices=muscle_tets, fps=fps,
                                     prim_path="/muscle")
-            exporter.add_mesh("fascia", _vectorized_surface_tris(fascia_tets))
+            exporter.add_mesh("fascia", vectorized_surface_tris(fascia_tets))
             print(f"  split: {muscle_tets.shape[0]} muscle tets, "
                   f"{fascia_tets.shape[0]} fascia tets")
         else:

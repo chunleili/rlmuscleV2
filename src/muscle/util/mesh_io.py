@@ -55,6 +55,25 @@ def build_surface_tris(tets: np.ndarray, positions: np.ndarray = None) -> np.nda
     return np.asarray(surface, dtype=np.int32)
 
 
+def vectorized_surface_tris(tets: np.ndarray) -> np.ndarray:
+    """Extract boundary tris from a tet mesh — fast vectorized version.
+
+    A face is on the surface iff it appears in exactly one tet. Faces are
+    canonicalized by sorting their 3 vertex ids; the original (oriented)
+    triangle is recovered by looking up which tet+face slot produced it.
+    """
+    NT = tets.shape[0]
+    # Each tet has 4 faces; use the standard outward winding convention.
+    face_slots = np.array([[1, 2, 3], [0, 3, 2], [0, 1, 3], [0, 2, 1]], dtype=np.int32)
+    tris = tets[:, face_slots].reshape(-1, 3)        # (4*NT, 3) oriented
+    keys = np.sort(tris, axis=1)                      # canonical key
+
+    # Find unique canonical faces and how many tets share each.
+    _, inv, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
+    boundary_mask = counts[inv] == 1
+    return tris[boundary_mask].astype(np.int32)
+
+
 # ---------------------------------------------------------------------------
 # Internal: format detection
 # ---------------------------------------------------------------------------

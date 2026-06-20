@@ -1,7 +1,7 @@
 import warp as wp; wp.init()
 import numpy as np
 import argparse
-from muscle.collision.sdf.example.humanV2 import build_humanV2_sim, AnimatedBoneMeshCollider
+from example.humanV2 import build_humanV2_sim_from_args, AnimatedBoneMeshCollider
 
 
 @wp.kernel
@@ -30,7 +30,7 @@ def runto(fiber, upto, vid):
         end_frame=upto, fiber=fiber, fiber_stiffness=1e9, contraction_ratio=0.8,
         activate=None, bone_dir='data/humanV2/model/bone', max_dist=0.2,
         contact_offset=1e-5, static_bone=False, no_collision=False)
-    sim, cfg, sf, ff = build_humanV2_sim(a)
+    sim, cfg, sf, ff = build_humanV2_sim_from_args(a)
     col = AnimatedBoneMeshCollider(sim, a.bone_dir, max_dist=a.max_dist,
                                    contact_offset=a.contact_offset)
     col.preload(range(1, upto + 1))

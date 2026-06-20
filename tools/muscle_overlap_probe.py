@@ -15,8 +15,8 @@ import numpy as np
 import warp as wp
 
 wp.init()
-from muscle.collision.sdf.example.humanV2 import build_humanV2_sim, AnimatedBoneMeshCollider
-from muscle.coupleOneWayGmg.example import _vectorized_surface_tris
+from example.humanV2 import build_humanV2_sim_from_args, AnimatedBoneMeshCollider
+from muscle.util.mesh_io import vectorized_surface_tris as _vectorized_surface_tris
 from muscle.util.geo_io import GeoFile
 
 DEV = "cuda:0"
@@ -38,7 +38,7 @@ def main():
     M = len(names)
     print(f"muscles: {M}   tets: {mid.size}")
 
-    sim, cfg, surf, fas = build_humanV2_sim(a)
+    sim, cfg, surf, fas = build_humanV2_sim_from_args(a)
     tets = sim.tet_idx.numpy()
     assert tets.shape[0] == mid.size, f"tet mismatch {tets.shape[0]} vs {mid.size}"
 

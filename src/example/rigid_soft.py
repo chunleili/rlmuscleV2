@@ -17,7 +17,7 @@ irrelevant for a sphere on near-vertical contact).
 
 Run::
 
-    PYTHONPATH=src .venv/bin/python -m muscle.collision.sdf.example.rigid_soft \\
+    PYTHONPATH=src .venv/bin/python -m example.rigid_soft \\
         --config data/collisionTest/rigid_soft.json
 """
 from __future__ import annotations
@@ -34,7 +34,7 @@ from muscle.collision.sdf.kernel import (
     solve_sdf_contact_kernel,           # soft vs static ground plane
     solve_sphere_soft_contact_kernel,   # soft vs dynamic sphere (two-way)
 )
-from muscle.collision.sdf.example.u_drop import (
+from example.sdf_drop import (
     _build_plane_mesh_xz, _build_uv_sphere,
 )
 from muscle.util.util import load_config, setup_logging

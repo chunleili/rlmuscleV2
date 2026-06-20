@@ -15,7 +15,7 @@ import numpy as np
 import warp as wp
 
 wp.init()
-from muscle.collision.sdf.example.humanV2 import build_humanV2_sim, AnimatedBoneMeshCollider
+from example.humanV2 import build_humanV2_sim_from_args, AnimatedBoneMeshCollider
 from muscle.collision.udcf.solver import UdcfDcdCollider, UdcfParams
 from muscle.collision.udcf.kernel import (centroid_radius_kernel, max_radius_reduce_kernel,
                                           broadphase_find_pairs_kernel)
@@ -72,7 +72,7 @@ def main():
     a.device = DEV; a.max_dist = 0.2
     a.no_collision = False; a.static_bone = False; a.no_export = True; a.geo_out = None
 
-    sim, cfg, surf, fas = build_humanV2_sim(a)
+    sim, cfg, surf, fas = build_humanV2_sim_from_args(a)
     bone = AnimatedBoneMeshCollider(sim, a.bone_dir, max_dist=0.2, contact_offset=1e-5)
     bone.preload(range(sim.start_frame, sim.end_frame + 1))
 

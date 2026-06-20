@@ -36,7 +36,7 @@ from __future__ import annotations
 import numpy as np
 import warp as wp
 
-from muscle.coupleOneWayGmg.example import _vectorized_surface_tris
+from muscle.util.mesh_io import vectorized_surface_tris as _vectorized_surface_tris
 from muscle.util.geo_io import GeoFile
 
 _INF = wp.constant(1.0e30)
