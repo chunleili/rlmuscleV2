@@ -171,6 +171,22 @@ def _bake_static_primvars(stage, prim_path, sim):
             pv.Set(Vt.Vec3fArray.FromNumpy(
                 np.ascontiguousarray(_pad(cd[:, :3]), np.float32)), default)
             baked.append("Cd")
+    # muscle_id is a PER-TET attribute (index into muscle_id_strings); scatter it
+    # to the verts of each muscle tet. Muscles are vertex-disjoint here, so every
+    # muscle vert gets a single unambiguous id; fascia / unreferenced verts stay
+    # -1. Written once as a static int vertex primvar so usdview can select /
+    # colour individual muscles.
+    if getattr(sim, "muscle_id_np", None) is not None:
+        mid = np.asarray(sim.muscle_id_np).astype(np.int32)
+        tets = sim.tet_idx.numpy()
+        nt_m = mid.shape[0]                       # muscle tets are the first nt_m
+        vid = np.full(nv, -1, dtype=np.int32)
+        for k in range(4):
+            vid[tets[:nt_m, k]] = mid
+        pv = api.GetPrimvar("muscle_id") or api.CreatePrimvar(
+            "muscle_id", Sdf.ValueTypeNames.IntArray, UsdGeom.Tokens.vertex)
+        pv.Set(Vt.IntArray.FromNumpy(np.ascontiguousarray(vid, np.int32)), default)
+        baked.append("muscle_id")
     if baked:
         print(f"[usd] baked static primvars: {', '.join(baked)}")
 
