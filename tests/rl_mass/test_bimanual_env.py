@@ -1,6 +1,6 @@
 """BimanualEnv: interface attrs, reset, step, reward, muscle tuple shapes."""
 import numpy as np
-from rl_mass.bimanual_env import BimanualEnv
+from rl_mass.finger.bimanual_env import BimanualEnv
 
 CFG = "data/rl_mass_bimanual/config.json"
 

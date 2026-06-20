@@ -1,7 +1,7 @@
 """TendonMuscleSystem: dims, sign cross-check vs MuJoCo, tuple terms."""
 import numpy as np
 from rl_mass.engine import MuJoCoEngine
-from rl_mass.tendon_muscle import TendonMuscleSystem
+from rl_mass.finger.tendon_muscle import TendonMuscleSystem
 
 XML = "/home/chunleli/Dev/musclemimic_models/musclemimic_models/model/arm/myoarm_bimanual.xml"
 

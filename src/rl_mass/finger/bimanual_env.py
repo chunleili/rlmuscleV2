@@ -16,9 +16,9 @@ import numpy as np
 
 from rl_mass.engine import MuJoCoEngine
 from rl_mass.env import MuscleTuple
-from rl_mass.native_spd import native_spd_forces
-from rl_mass.tendon_muscle import TendonMuscleSystem
-from rl_mass.trajectory_ref import TrajectoryRef
+from rl_mass.finger.native_spd import native_spd_forces
+from rl_mass.finger.tendon_muscle import TendonMuscleSystem
+from rl_mass.finger.trajectory_ref import TrajectoryRef
 
 _QVEL_STATE_SCALE = 0.1
 

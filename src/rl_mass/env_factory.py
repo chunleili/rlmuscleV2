@@ -12,7 +12,7 @@ def make_env(config_path: str):
     with open(config_path) as f:
         fmt = json.load(f).get("skeleton_format", "dart")
     if fmt == "mujoco_native":
-        from rl_mass.bimanual_env import BimanualEnv
+        from rl_mass.finger.bimanual_env import BimanualEnv
         return BimanualEnv(config_path)
     if fmt == "dart":
         from rl_mass.env import MassEnv

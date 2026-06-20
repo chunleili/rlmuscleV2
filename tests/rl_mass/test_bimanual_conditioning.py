@@ -6,7 +6,7 @@ moment matrix is full rank, so the least-squares torque-matching residual
 should be ~0.
 """
 import numpy as np
-from rl_mass.bimanual_env import BimanualEnv
+from rl_mass.finger.bimanual_env import BimanualEnv
 
 CFG = "data/rl_mass_bimanual/config.json"
 

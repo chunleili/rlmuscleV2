@@ -1,6 +1,6 @@
 """TrajectoryRef serves interpolated qpos/qvel from a musclemimic .npz."""
 import numpy as np
-from rl_mass.trajectory_ref import TrajectoryRef
+from rl_mass.finger.trajectory_ref import TrajectoryRef
 
 NPZ = "/home/chunleli/Dev/musclemimic/trajectory_data_bimanual/bimanual_episodes_mjx_20260601_220203.npz"
 

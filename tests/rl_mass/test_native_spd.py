@@ -1,7 +1,7 @@
 """native_spd_forces: shape, and zero torque when at the target with zero vel."""
 import numpy as np
 from rl_mass.engine import MuJoCoEngine
-from rl_mass.native_spd import native_spd_forces
+from rl_mass.finger.native_spd import native_spd_forces
 
 XML = "/home/chunleli/Dev/musclemimic_models/musclemimic_models/model/arm/myoarm_bimanual.xml"
 

@@ -1,6 +1,6 @@
 """make_env returns BimanualEnv for the native config; serial vec env runs."""
 from rl_mass.env_factory import make_env
-from rl_mass.bimanual_env import BimanualEnv
+from rl_mass.finger.bimanual_env import BimanualEnv
 from rl_mass.vec_env import make_vec_env
 import numpy as np
 

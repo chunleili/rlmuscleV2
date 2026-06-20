@@ -24,7 +24,7 @@ import re
 
 import numpy as np
 
-from rl_mass.bimanual_env import BimanualEnv
+from rl_mass.finger.bimanual_env import BimanualEnv
 from rl_mass.model import MuscleNN, SimulationNN
 
 try:
