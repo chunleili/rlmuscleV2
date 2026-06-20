@@ -12,6 +12,19 @@ Based on NVIDIA Warp, which is capable for **all platforms (Windows, Linux, MacO
 - 🫀 **Tissue + fascia** — one tetrahedral mesh; the fascia shell prevents splaying and reduces penetration.
 - 📦 **Flexible export** — USD (default & recommended), PLY, and Houdini `.geo` (round-trips with all attributes intact).
 
+## Install
+
+Dependencies are managed with [uv](https://docs.astral.sh/uv/). From the repo
+root:
+
+```bash
+uv sync          # creates .venv and installs everything (Python 3.11)
+```
+
+That is the whole setup — `uv run …` (below) then works with no `activate` and
+no `PYTHONPATH`. Large `model/` geometry is fetched separately; see
+[Art assets](#art-assets).
+
 ## Examples
 
 Run everything from the repo root with **`uv run`** — it auto-syncs the venv,
