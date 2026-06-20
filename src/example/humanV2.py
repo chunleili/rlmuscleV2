@@ -422,19 +422,26 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
             # One USD timecode per sim frame. (begin_frame does round(time*fps);
             # passing frame*sim.dt collapses frames since sim.dt is the SUBSTEP dt.)
             inner.begin_frame(frame / inner.fps)
-            muscle_path = inner.render_mesh(name="muscle", points=pos_np,
-                                            indices=surf_flat, colors=(0.8, 0.3, 0.25))
+            # Constant displayColor only needs writing once — warp's render_mesh
+            # re-sets it (time-sampled) on every call, so pass colors ONLY on the
+            # first frame and None after to keep the USD small. (Topology / face
+            # indices are already written once by warp; points must be per-frame.)
+            first = frame == sim.start_frame
+            muscle_path = inner.render_mesh(
+                name="muscle", points=pos_np, indices=surf_flat,
+                colors=(0.8, 0.3, 0.25) if first else None)
             if not no_collide_primvars:
                 _set_is_collide_primvar(inner.stage, muscle_path, is_collide, inner.time)
                 _set_pen_depth_primvar(inner.stage, muscle_path, depth, inner.time)
             _set_sum_is_collide(inner.stage, muscle_path, int(is_collide.sum()), inner.time)
-            if frame == sim.start_frame:
+            if first:
                 _bake_static_primvars(inner.stage, muscle_path, sim)
             if fascia_flat is not None:
-                inner.render_mesh(name="fascia", points=pos_np,
-                                  indices=fascia_flat, colors=(0.55, 0.75, 0.9))
+                inner.render_mesh(name="fascia", points=pos_np, indices=fascia_flat,
+                                  colors=(0.55, 0.75, 0.9) if first else None)
             inner.render_mesh(name="bones", points=collider._cur_verts,
-                              indices=collider.tris_flat, colors=(0.9, 0.88, 0.8))
+                              indices=collider.tris_flat,
+                              colors=(0.9, 0.88, 0.8) if first else None)
             inner.end_frame()
 
             if geo_writer is not None:
