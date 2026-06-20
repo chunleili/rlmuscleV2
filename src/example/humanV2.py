@@ -617,9 +617,11 @@ def _make_self_collider(sim, cfg, demo, surf_flat):
                                     contact_offset=float(sc.get("offset", 1e-4)),
                                     iters=int(sc.get("iters", 1)),
                                     substep_stride=int(sc.get("stride", 2)),
+                                    push_cap=float(sc.get("push_cap", 0.0)),
                                     device=demo.get("device", "cuda:0"))
         print(f"[self] inter-muscle collider: {inter.n_muscle} muscles, "
-              f"max_dist={sc.get('max_dist', 0.02)} offset={sc.get('offset', 1e-4)}")
+              f"max_dist={sc.get('max_dist', 0.02)} offset={sc.get('offset', 1e-4)} "
+              f"push_cap={sc.get('push_cap', 0.0)} iters={inter.iters}")
 
         def finalize():
             print(f"inter-muscle final inside_count={inter.inside_count()}  "

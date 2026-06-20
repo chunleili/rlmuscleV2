@@ -1,35 +1,38 @@
-"""Inter-muscle collision via per-muscle closest-point projection.
+"""Inter-muscle collision via tet-barycentric inside test + closest-point push.
 
-The simplification over UDCF DCD self-collision: only resolve muscle_A-vs-muscle_B
-penetration, NEVER muscle-vs-itself.  That removes the hard part — intra-body
-self-collision needs k-ring/connectivity filtering so a vertex is not pushed
-against its own neighbouring triangles.  Across two DISTINCT muscles every
-triangle of the other body is a valid target, so the resolution is a plain
-closest-point projection: treat each muscle as a closed watertight body, query
-each candidate vertex against the OTHER muscle's surface with
-``mesh_query_point_sign_normal``, and push the inside ones out to the closest
-surface point.  (No precomputed signed distance field — the sign comes from the
-mesh query — so this lives outside ``collision/sdf``; it is the same per-vertex
-push as the SDF-bone collider but with a deformable closest-point target.)
+Resolve only muscle_A-vs-muscle_B penetration, NEVER muscle-vs-itself.  Across
+two DISTINCT muscles every element of the other body is a valid target, so there
+is no k-ring / self-adjacency filtering to do.
 
-This is also the physically meaningful case: a muscle folding into itself is
-internal and invisible, whereas two packed muscles overlapping is the visible
-penetration (199 muscles in humanV2).
+Inside / outside is decided by **tetrahedral barycentric containment**, not by a
+surface pseudonormal sign.  ``mesh_query_point_sign_normal``'s angle-weighted
+pseudonormal flips sign on thin / concave / near-non-manifold muscle surfaces
+(exactly the densely-packed folded poses we care about), reporting verts that are
+OUTSIDE as inside — pushing on those false positives manufactures real churn and
+the penetration count never drops.  The muscles are tet meshes, so the robust
+test is exact volumetric containment: a vertex ``x`` is inside muscle B iff it
+falls inside one of B's tets (barycentric coords all >= 0, sum <= 1).  This holds
+for thin / concave / even slightly-inverted tets, with no sign to flip.
 
-Everything but the per-muscle BVH refit is on the GPU, with no host sync:
+Pipeline (everything on the GPU, one host sync per frame for the active mask):
 
-  * broadphase (``refresh``, once per frame): a per-muscle AABB kernel
-    (atomic min/max into ``lo``/``hi``) then an N_muscle x N_muscle adjacency
-    kernel that marks overlapping muscle pairs.
-  * resolve (``__call__``, per substep): one push kernel, one thread per muscle
-    vertex, that loops its muscle's overlapping neighbours, queries each
-    neighbour's surface and applies the AVERAGE outward push (jacobi — the
-    average is computed locally in the single owning thread, so no atomics and
-    no race even when a vertex sits inside several muscles).
+  * a GLOBAL ``wp.Bvh`` over every muscle TET's AABB (tagged by muscle id) is the
+    broadphase AND the inside test — ``bvh_query_aabb(x, x)`` returns the
+    candidate tets containing ``x``; a barycentric test on the non-self ones
+    decides containment.  Rebuilt each resolve pass (positions move).
+  * the push TARGET is the nearest point on the containing muscle's boundary
+    surface (its own per-muscle ``wp.Mesh``), found with a plain closest-point
+    query.  Only the *geometric* closest point is used (face + bary), never the
+    query's sign — so the surface search radius can be large enough to reach a
+    deep vertex without re-introducing any sign-flip false positive.
+
+  Decoupling the two — exact unbounded inside decision (tet) from geometric
+  closest-surface push (mesh) — is what lets the count actually fall: the inside
+  test no longer lies, and the push can see deep penetration.
 
 muscle_id comes from the rest geo's per-tet ``muscle_id`` prim attr (199 strings
 for humanV2); each muscle's surface is extracted from its own tet subset so the
-shared interface between two touching muscles is a surface for both.
+shared interface between two touching muscles is a boundary for both.
 """
 from __future__ import annotations
 
@@ -41,6 +44,8 @@ from muscle.util.geo_io import GeoFile
 
 _INF = wp.constant(1.0e30)
 
+
+# ─── broadphase helpers for the per-muscle active mask (surface refit gating) ──
 
 @wp.kernel
 def _reset_aabb_kernel(lo: wp.array(dtype=wp.float32),
@@ -75,10 +80,10 @@ def _adjacency_kernel(lo: wp.array(dtype=wp.float32),
                       adj: wp.array(dtype=wp.int32),
                       active: wp.array(dtype=wp.int32),
                       n_pairs: wp.array(dtype=wp.int32)):
-    """Mark overlapping muscle pairs (i < j) in the dense ``nm x nm`` matrix and
-    flag both muscles ``active`` (only active muscles need a refit / push).
-
-    Empty muscles keep ``lo = +inf`` so their overlap test always fails."""
+    """Mark overlapping muscle pairs (i < j) and flag both ``active``.  Used only
+    to gate the per-muscle surface refit (refit a muscle only if it overlaps
+    another this frame) and to report a pair count; the inside test itself uses
+    the global tet BVH, not this matrix."""
     idx = wp.tid()
     i = idx / nm
     j = idx % nm
@@ -98,140 +103,191 @@ def _adjacency_kernel(lo: wp.array(dtype=wp.float32),
         wp.atomic_add(n_pairs, 0, 1)
 
 
+# ─── tet BVH (inside test) ─────────────────────────────────────────────────
+
+@wp.kernel
+def _tet_aabb_kernel(pos: wp.array(dtype=wp.vec3),
+                     tet: wp.array(dtype=wp.vec4i),
+                     pad: wp.float32,
+                     lo: wp.array(dtype=wp.vec3),
+                     hi: wp.array(dtype=wp.vec3)):
+    """Per-tet AABB (current positions) for the global inside-test BVH."""
+    t = wp.tid()
+    idx = tet[t]
+    a = pos[idx[0]]
+    b = pos[idx[1]]
+    c = pos[idx[2]]
+    d = pos[idx[3]]
+    p = wp.vec3(pad, pad, pad)
+    lo[t] = wp.min(wp.min(a, b), wp.min(c, d)) - p
+    hi[t] = wp.max(wp.max(a, b), wp.max(c, d)) + p
+
+
 @wp.func
-def _push_against(mesh: wp.uint64, x: wp.vec3, max_dist: wp.float32,
-                  offset: wp.float32):
-    """Outward correction that moves ``x`` to ``mesh``'s surface if inside it
-    (zero vec + 0 otherwise).  Returns (correction, hit)."""
-    q = wp.mesh_query_point_sign_normal(mesh, x, max_dist)
-    if q.result:
-        cp = wp.mesh_eval_position(mesh, q.face, q.u, q.v)
-        delta = x - cp
-        dist = wp.length(delta) * q.sign          # < 0 inside the mesh
-        err = dist - offset
-        if err < 0.0:
-            n = wp.normalize(delta) * q.sign
-            return -n * err, 1                     # outward push (err < 0)
-    return wp.vec3(0.0, 0.0, 0.0), 0
+def _tet_inside_score(x: wp.vec3, p0: wp.vec3, p1: wp.vec3, p2: wp.vec3,
+                      p3: wp.vec3) -> wp.float32:
+    """Barycentric containment score: ``min(lambda)`` (> 0, larger = deeper) if
+    ``x`` is inside the tet, else -1.  Orientation-independent (works for
+    slightly-inverted tets); only degenerate tets are rejected."""
+    e1 = p1 - p0
+    e2 = p2 - p0
+    e3 = p3 - p0
+    Dm = wp.mat33(e1[0], e2[0], e3[0],
+                  e1[1], e2[1], e3[1],
+                  e1[2], e2[2], e3[2])
+    det = wp.determinant(Dm)
+    if wp.abs(det) < 1.0e-20:
+        return -1.0
+    lam = wp.inverse(Dm) * (x - p0)
+    l1 = lam[0]
+    l2 = lam[1]
+    l3 = lam[2]
+    l0 = 1.0 - l1 - l2 - l3
+    if l0 >= 0.0 and l1 >= 0.0 and l2 >= 0.0 and l3 >= 0.0:
+        return wp.min(wp.min(l0, l1), wp.min(l2, l3))
+    return -1.0
+
+
+@wp.func
+def _inside_target(x: wp.vec3, m: wp.int32, bvh: wp.uint64,
+                   tet: wp.array(dtype=wp.vec4i),
+                   tet_muscle: wp.array(dtype=wp.int32),
+                   pos: wp.array(dtype=wp.vec3)) -> wp.int32:
+    """The non-self muscle ``x`` is most deeply inside (barycentric), or -1.
+
+    Multiple tets of the same muscle containing ``x`` is normal (deep vertex);
+    the deepest-score wins, so the result is a single target muscle.  When ``x``
+    sits inside several DISTINCT muscles the deepest is taken this pass and the
+    rest are cleared by later iterations."""
+    best = float(0.0)
+    best_mb = wp.int32(-1)
+    q = wp.bvh_query_aabb(bvh, x, x)
+    t = wp.int32(0)
+    while wp.bvh_query_next(q, t):
+        mb = tet_muscle[t]
+        if mb != m:
+            idx = tet[t]
+            s = _tet_inside_score(x, pos[idx[0]], pos[idx[1]],
+                                  pos[idx[2]], pos[idx[3]])
+            if s > best:
+                best = s
+                best_mb = mb
+    return best_mb
 
 
 @wp.kernel
-def _push_adj_kernel(pos: wp.array(dtype=wp.vec3),
-                     vert_muscle: wp.array(dtype=wp.int32),
-                     inv_mass: wp.array(dtype=wp.float32),
-                     mesh_ids: wp.array(dtype=wp.uint64),
-                     adj: wp.array(dtype=wp.int32), nm: wp.int32,
-                     max_dist: wp.float32, offset: wp.float32,
-                     push_cap: wp.float32):
-    """One thread per muscle vertex: average the push out of every overlapping
-    neighbour muscle it is inside, and apply it (clamped to ``push_cap``).
+def _push_kernel(pos: wp.array(dtype=wp.vec3),
+                 vert_muscle: wp.array(dtype=wp.int32),
+                 inv_mass: wp.array(dtype=wp.float32),
+                 bvh: wp.uint64,
+                 tet: wp.array(dtype=wp.vec4i),
+                 tet_muscle: wp.array(dtype=wp.int32),
+                 mesh_ids: wp.array(dtype=wp.uint64),
+                 surf_dist: wp.float32, offset: wp.float32,
+                 push_cap: wp.float32):
+    """One thread per muscle vertex: if it is inside another muscle (tet
+    barycentric), move it to that muscle's nearest BOUNDARY surface point plus a
+    small outward ``offset``.
 
-    The owning thread accumulates locally over its neighbour loop, so the jacobi
-    average needs no atomics and cannot race even when the vertex sits inside
-    several muscles.  ``x`` is read once, so within a launch the push is jacobi.
-
-    ``push_cap`` limits the per-pass displacement (0 = unlimited).  A deep vertex
-    is eased out a little each pass and re-queried, following the real exit path
-    instead of teleporting straight to the nearest surface — which, in densely
-    packed muscle, overshoots THROUGH the neighbour behind it and deepens the
-    penetration.  Use several ``iters`` (and a small cap) to clear deep overlap."""
+    The surface point is the plain geometric closest point (face + bary only —
+    the query's sign is never read), so ``surf_dist`` can be large enough to
+    reach a deep vertex without any pseudonormal sign-flip.  ``push_cap`` clamps
+    the per-pass step (0 = unlimited)."""
     i = wp.tid()
     m = vert_muscle[i]
     if m < 0 or inv_mass[i] == 0.0:
         return
     x = pos[i]
-    acc = wp.vec3(0.0, 0.0, 0.0)
-    c = int(0)
-    row = m * nm
-    for j in range(nm):
-        if adj[row + j] != 0:
-            d, hit = _push_against(mesh_ids[j], x, max_dist, offset)
-            acc += d
-            c += hit
-    if c > 0:
-        step = acc / wp.float32(c)
-        if push_cap > 0.0:
-            mag = wp.length(step)
-            if mag > push_cap:
-                step = step * (push_cap / mag)
-        pos[i] = x + step
+    mb = _inside_target(x, m, bvh, tet, tet_muscle, pos)
+    if mb < 0:
+        return
+    q = wp.mesh_query_point_sign_normal(mesh_ids[mb], x, surf_dist)
+    if not q.result:
+        return
+    cp = wp.mesh_eval_position(mesh_ids[mb], q.face, q.u, q.v)
+    d = cp - x                                   # x is inside -> points outward
+    dl = wp.length(d)
+    if dl < 1.0e-9:
+        return
+    step = d + (d / dl) * offset                 # to surface, then offset beyond
+    if push_cap > 0.0:
+        mag = wp.length(step)
+        if mag > push_cap:
+            step = step * (push_cap / mag)
+    pos[i] = x + step
 
 
 @wp.kernel
-def _count_inside_adj_kernel(pos: wp.array(dtype=wp.vec3),
+def _count_inside_tet_kernel(pos: wp.array(dtype=wp.vec3),
                              vert_muscle: wp.array(dtype=wp.int32),
-                             mesh_ids: wp.array(dtype=wp.uint64),
-                             adj: wp.array(dtype=wp.int32), nm: wp.int32,
-                             max_dist: wp.float32,
+                             bvh: wp.uint64,
+                             tet: wp.array(dtype=wp.vec4i),
+                             tet_muscle: wp.array(dtype=wp.int32),
                              count: wp.array(dtype=wp.int32)):
-    """Penetration METER: count this vertex once per neighbour muscle it is
-    inside (matches the directional inside-vertex tally)."""
+    """Penetration METER: count each muscle vertex once if it is inside any other
+    muscle (exact barycentric, no sign-flip false positives)."""
     i = wp.tid()
     m = vert_muscle[i]
     if m < 0:
         return
-    x = pos[i]
-    row = m * nm
-    for j in range(nm):
-        if adj[row + j] != 0:
-            q = wp.mesh_query_point_sign_normal(mesh_ids[j], x, max_dist)
-            if q.result:
-                cp = wp.mesh_eval_position(mesh_ids[j], q.face, q.u, q.v)
-                if wp.length(x - cp) * q.sign < 0.0:
-                    wp.atomic_add(count, 0, 1)
+    if _inside_target(pos[i], m, bvh, tet, tet_muscle, pos) >= 0:
+        wp.atomic_add(count, 0, 1)
 
 
 @wp.kernel
-def _depth_inside_adj_kernel(pos: wp.array(dtype=wp.vec3),
+def _depth_inside_tet_kernel(pos: wp.array(dtype=wp.vec3),
                              vert_muscle: wp.array(dtype=wp.int32),
+                             bvh: wp.uint64,
+                             tet: wp.array(dtype=wp.vec4i),
+                             tet_muscle: wp.array(dtype=wp.int32),
                              mesh_ids: wp.array(dtype=wp.uint64),
-                             adj: wp.array(dtype=wp.int32), nm: wp.int32,
-                             max_dist: wp.float32,
+                             surf_dist: wp.float32,
                              depth: wp.array(dtype=wp.float32)):
-    """Penetration-DEPTH meter: per vertex, the deepest it sits inside any
-    overlapping neighbour muscle (0 if outside all of them), metres."""
+    """Penetration-DEPTH meter: for each muscle vertex inside another muscle, the
+    distance to that muscle's boundary surface (metres, 0 if outside all)."""
     i = wp.tid()
     depth[i] = 0.0
     m = vert_muscle[i]
     if m < 0:
         return
     x = pos[i]
-    row = m * nm
-    d = float(0.0)
-    for j in range(nm):
-        if adj[row + j] != 0:
-            q = wp.mesh_query_point_sign_normal(mesh_ids[j], x, max_dist)
-            if q.result:
-                cp = wp.mesh_eval_position(mesh_ids[j], q.face, q.u, q.v)
-                sd = wp.length(x - cp) * q.sign      # < 0 inside
-                if -sd > d:
-                    d = -sd
-    depth[i] = d
+    mb = _inside_target(x, m, bvh, tet, tet_muscle, pos)
+    if mb < 0:
+        return
+    q = wp.mesh_query_point_sign_normal(mesh_ids[mb], x, surf_dist)
+    if q.result:
+        cp = wp.mesh_eval_position(mesh_ids[mb], q.face, q.u, q.v)
+        depth[i] = wp.length(x - cp)
 
 
 class InterMuscleCollider:
-    """Per-muscle closed-surface colliders that resolve only A-vs-B penetration.
+    """Resolve muscle-A-vs-muscle-B penetration with an exact tet-barycentric
+    inside test and a geometric closest-surface push.
 
-    Each muscle's ``wp.Mesh`` shares ``sim.pos`` as its points array (no copy),
-    so a single ``refit()`` per muscle per call tracks the deforming muscle; only
-    the per-muscle BVHs are extra memory.  The broadphase and resolve are GPU
-    kernels driven by a per-vertex ``vert_muscle`` map and a dense muscle
-    adjacency matrix — no host sync per frame.
+    A global ``wp.Bvh`` over all muscle tets (tagged by muscle id) is both the
+    broadphase and the inside test; each muscle's ``wp.Mesh`` (points SHARED with
+    ``sim.pos``) supplies the nearest boundary point for the push.  No host sync
+    per resolve pass; one per frame to cache the active-muscle mask for refit.
     """
 
     def __init__(self, sim, rest_path: str, *, max_dist: float = 0.02,
                  contact_offset: float = 1e-4, device=None,
                  flip_winding: bool = True, iters: int = 1, substep_stride: int = 2,
-                 push_cap: float = 0.0):
+                 push_cap: float = 0.0, surf_dist: float = None):
         self.sim = sim
         self.device = device or sim._device
         self.max_dist = float(max_dist)
         self.contact_offset = float(contact_offset)
         self.iters = max(1, int(iters))
         self.push_cap = float(push_cap)
+        # Surface-search radius for the push / depth-meter closest-point query.
+        # Independent of the inside test (which is the unbounded tet barycentric),
+        # so it can be large to reach deep verts — only the geometric closest
+        # point is used, never the query sign, so a large radius is safe.
+        self.surf_dist = float(surf_dist) if surf_dist is not None \
+            else max(0.2, 10.0 * self.max_dist)
         # Run the refit+push only every Nth substep (1 = every substep).  The
-        # ~10 per-frame refits are the cost; raising this trades resolution depth
-        # for speed.  The LAST substep always runs so the frame ends resolved.
+        # LAST substep always runs so the frame ends resolved.
         self.substep_stride = max(1, int(substep_stride))
         self._sub = 0
         self._nsub = int(getattr(sim, "nsubsteps", 1))
@@ -247,16 +303,28 @@ class InterMuscleCollider:
         nv = sim.pos.shape[0]
 
         # Per-vertex muscle id (-1 for non-muscle verts, e.g. fascia).  A vertex
-        # shared by several muscles' tets gets the last one — those interface
-        # verts are rare and sit on the boundary either way.
+        # shared by several muscles' tets gets the last one — interface verts are
+        # rare and sit on the boundary either way.
         vert_muscle = np.full(nv, -1, dtype=np.int32)
         for k in range(4):
             vert_muscle[tets[:, k]] = mid
         self._vert_muscle = wp.array(vert_muscle, dtype=wp.int32, device=self.device)
 
-        # Per-muscle surface meshes.  Each muscle's surface is extracted from its
-        # OWN tet subset, so two touching muscles each own the shared interface
-        # (both treat it as a closed boundary).
+        # Global tet BVH inputs: every muscle tet, tagged by muscle id.  Tet
+        # indices reference global muscle verts (< nvm), so pos[idx] is valid.
+        self._tet_idx = wp.array(tets, dtype=wp.vec4i, device=self.device)
+        self._tet_muscle = wp.array(mid.astype(np.int32), dtype=wp.int32,
+                                    device=self.device)
+        self._n_tet = int(tets.shape[0])
+        self._tet_lo = wp.zeros(self._n_tet, dtype=wp.vec3, device=self.device)
+        self._tet_hi = wp.zeros(self._n_tet, dtype=wp.vec3, device=self.device)
+        self._tet_bvh = None
+        self._target = wp.zeros(self.nvm, dtype=wp.int32, device=self.device)
+
+        # Per-muscle surface meshes (push target).  Each muscle's surface is
+        # extracted from its OWN tet subset, so two touching muscles each own the
+        # shared interface.  Points SHARED with sim.pos (refit tracks deformation;
+        # winding does not matter — only the geometric closest point is used).
         self._meshes = []
         for m in range(self.n_muscle):
             mtets = tets[mid == m]
@@ -269,9 +337,6 @@ class InterMuscleCollider:
                 points=sim.pos,                          # SHARED with the sim
                 indices=wp.array(surf.reshape(-1), dtype=wp.int32,
                                  device=self.device)))
-
-        # mesh.id per muscle, on the GPU (ids are stable across refit; 0 for an
-        # empty muscle, which the adjacency matrix never references).
         ids = np.array([m.id if m is not None else 0 for m in self._meshes],
                        dtype=np.uint64)
         self._mesh_ids = wp.array(ids, dtype=wp.uint64, device=self.device)
@@ -289,13 +354,21 @@ class InterMuscleCollider:
         self.last_active = 0
         self.refresh()
 
+    def _build_tet_bvh(self):
+        """Rebuild the global tet AABB BVH on the current positions (the inside
+        test reads it; positions move every pass, so rebuild — a refit keeps the
+        stale tree topology and degrades the query)."""
+        wp.launch(_tet_aabb_kernel, dim=self._n_tet,
+                  inputs=[self.sim.pos, self._tet_idx, wp.float32(0.0),
+                          self._tet_lo, self._tet_hi], device=self.device)
+        self._tet_bvh = wp.Bvh(self._tet_lo, self._tet_hi)
+
     def refresh(self):
-        """Recompute the muscle adjacency from the current positions — call once
-        per frame.  The overlapping-pair set is reused across the substep pushes;
-        the surface itself is still refit every substep (intra-frame muscle
-        deformation is large, so a frame-start surface is too stale to push
-        against).  Reads back the 199-int ``active`` mask once so the per-substep
-        refit can skip idle muscles (never queried this frame)."""
+        """Recompute the per-muscle active mask from the current positions — call
+        once per frame.  Only used to gate the per-substep surface refit (refit a
+        muscle only if it overlaps another this frame); the inside test uses the
+        tet BVH, rebuilt per pass.  One host sync per frame for the 199-int
+        active mask."""
         nm = self.n_muscle
         wp.launch(_reset_aabb_kernel, dim=nm * 3, inputs=[self._lo, self._hi],
                   device=self.device)
@@ -305,13 +378,11 @@ class InterMuscleCollider:
         self._adj.zero_()
         self._active.zero_()
         self._n_pairs.zero_()
-        margin = self.max_dist + self.contact_offset
+        margin = self.surf_dist + self.contact_offset
         wp.launch(_adjacency_kernel, dim=nm * nm,
                   inputs=[self._lo, self._hi, wp.float32(margin), wp.int32(nm),
                           self._adj, self._active, self._n_pairs],
                   device=self.device)
-        # Cache the active meshes (one host sync/frame) so the per-substep refit
-        # touches only muscles that overlap something this frame.
         act = self._active.numpy()
         self.last_active = int(act.sum())
         self._active_meshes = [self._meshes[m] for m in range(nm)
@@ -320,8 +391,7 @@ class InterMuscleCollider:
 
     def __call__(self):
         # Run on every Nth substep AND always on the last one, so the frame ends
-        # fully resolved (skipping the final substep leaves the muscle wherever
-        # the solver moved it — measured as no relief).
+        # fully resolved.
         run = (self._sub % self.substep_stride == 0) or (self._sub == self._nsub - 1)
         self._sub += 1
         if not run:
@@ -329,10 +399,11 @@ class InterMuscleCollider:
         for mesh in self._active_meshes:    # per-substep refit, active only
             mesh.refit()
         for _ in range(self.iters):
-            wp.launch(_push_adj_kernel, dim=self.nvm,
+            self._build_tet_bvh()           # positions moved -> rebuild
+            wp.launch(_push_kernel, dim=self.nvm,
                       inputs=[self.sim.pos, self._vert_muscle, self.inv_mass,
-                              self._mesh_ids, self._adj, wp.int32(self.n_muscle),
-                              wp.float32(self.max_dist),
+                              self._tet_bvh.id, self._tet_idx, self._tet_muscle,
+                              self._mesh_ids, wp.float32(self.surf_dist),
                               wp.float32(self.contact_offset),
                               wp.float32(self.push_cap)],
                       device=self.device)
@@ -343,33 +414,32 @@ class InterMuscleCollider:
         return self.last_pairs
 
     def inside_count(self) -> int:
-        """Total inter-muscle inside-vertices (a penetration METER; counts each
-        direction independently).  Refreshes the adjacency + refits the active
-        muscles first; the meter only queries active muscles' surfaces."""
+        """Muscle vertices inside another muscle (exact barycentric meter).  Each
+        vertex counted once.  Refreshes + rebuilds the tet BVH first."""
         self.refresh()
-        for mesh in self._active_meshes:
-            mesh.refit()
+        self._build_tet_bvh()
         self._count.zero_()
-        wp.launch(_count_inside_adj_kernel, dim=self.nvm,
-                  inputs=[self.sim.pos, self._vert_muscle, self._mesh_ids,
-                          self._adj, wp.int32(self.n_muscle),
-                          wp.float32(self.max_dist), self._count],
+        wp.launch(_count_inside_tet_kernel, dim=self.nvm,
+                  inputs=[self.sim.pos, self._vert_muscle, self._tet_bvh.id,
+                          self._tet_idx, self._tet_muscle, self._count],
                   device=self.device)
         self.pair_count()
         return int(self._count.numpy()[0])
 
     def inside_depth(self, meter_max_dist: float = None) -> np.ndarray:
-        """Per-muscle-vertex deepest inter-muscle penetration depth (metres, 0 if
-        outside all neighbours).  ``meter_max_dist`` overrides the search radius
-        for MEASUREMENT only (use a large value so deep penetration is not capped
-        at the resolver's ``max_dist``).  Refreshes + refits active muscles."""
-        md = self.max_dist if meter_max_dist is None else float(meter_max_dist)
+        """Per-muscle-vertex inter-muscle penetration depth (metres, 0 if outside
+        all neighbours): the distance from an inside vertex to the containing
+        muscle's boundary surface.  ``meter_max_dist`` overrides the surface
+        search radius (the inside test is the unbounded tet barycentric, so this
+        only bounds how deep a surface point can be located)."""
+        md = self.surf_dist if meter_max_dist is None else float(meter_max_dist)
         self.refresh()
         for mesh in self._active_meshes:
             mesh.refit()
-        wp.launch(_depth_inside_adj_kernel, dim=self.nvm,
-                  inputs=[self.sim.pos, self._vert_muscle, self._mesh_ids,
-                          self._adj, wp.int32(self.n_muscle),
+        self._build_tet_bvh()
+        wp.launch(_depth_inside_tet_kernel, dim=self.nvm,
+                  inputs=[self.sim.pos, self._vert_muscle, self._tet_bvh.id,
+                          self._tet_idx, self._tet_muscle, self._mesh_ids,
                           wp.float32(md), self._depth],
                   device=self.device)
         self.pair_count()
