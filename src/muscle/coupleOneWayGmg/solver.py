@@ -375,6 +375,213 @@ def solve_fibermillard_kernel(
 
 
 @wp.kernel
+def solve_fibernorm_kernel(
+    pos_mid: wp.array(dtype=wp.vec3),
+    tet_indices: wp.array(dtype=wp.vec4i),
+    B: wp.array(dtype=wp.mat33),
+    fiber_dir: wp.array(dtype=wp.vec3),     # per-vertex rest fiber direction (materialW)
+    inv_mass: wp.array(dtype=wp.float32),
+    alpha: wp.array(dtype=wp.float32),      # per-tet 1/(fiber_stiffness*V0)
+    L: wp.array(dtype=wp.float32),
+    activation: wp.array(dtype=wp.float32),  # per-tet a in [0,1] (0 = passive)
+    tendonmask: wp.array(dtype=wp.float32),  # per-tet tendon fraction in [0,1]
+    contraction_ratio: float,
+    dt: float,
+    omega: float,
+    pos: wp.array(dtype=wp.vec3),
+):
+    """Plain fiber constraint (Houdini TETFIBERNORM, NORMSTIFFNESS).
+
+    Linear anisotropic-stretch response: with ``F = Ds·B`` and rest fiber
+    ``f0`` (normalised), the deformed fiber is ``d = F·f0`` and its stretch
+    ``s = |d|``. Drives ``C = s - 1`` (rest length) — adds along-fiber
+    stiffness on top of the isotropic ARAP shape match. Same parallel-Jacobi
+    (atomic, ``omega``) XPBD projection as :func:`arap_svd_kernel`. Faithful
+    to ``muscle/engine.py:tet_fiber_update_xpbd_fn`` (the proven coupleTwoWay
+    port) with ``target_stretch = 1`` (zero activation = passive).
+    """
+    t = wp.tid()
+    idx = tet_indices[t]
+    p0i = idx[0]
+    p1i = idx[1]
+    p2i = idx[2]
+    p3i = idx[3]
+
+    f0 = (fiber_dir[p0i] + fiber_dir[p1i] + fiber_dir[p2i] + fiber_dir[p3i]) / 4.0
+    fn = wp.length(f0)
+    if fn < 1.0e-9:
+        return
+    f0 = f0 / fn
+
+    x0 = pos_mid[p0i]
+    x1 = pos_mid[p1i]
+    x2 = pos_mid[p2i]
+    x3 = pos_mid[p3i]
+    e1 = x1 - x0
+    e2 = x2 - x0
+    e3 = x3 - x0
+    Ds = wp.mat33(
+        e1[0], e2[0], e3[0],
+        e1[1], e2[1], e3[1],
+        e1[2], e2[2], e3[2],
+    )
+    Bt = B[t]
+    F = Ds * Bt
+
+    d = F * f0
+    s = wp.length(d)
+    if s < 1.0e-9:
+        return
+    # Skip degenerate / inverted / over-stretched tets. Typical muscle stretch is
+    # s≈1.0 (p99≈1.04); regions where the tracked RL pose folds a muscle (e.g.
+    # pectoralisMajor) reach s>10 with inverted tets, and passive fiber yanks the
+    # shared verts cm-scale (spikes). det(F)<=0 = inverted, s>1.5 = abnormal
+    # stretch — leave these to ARAP/volume. (Active contraction drives s DOWN
+    # toward s* so the low-s side is intentionally left open.)
+    if wp.determinant(F) <= 0.0 or s > 1.5:
+        return
+    # Active contraction: belly fibers shorten toward s* = 1 - belly·a·ratio
+    # (tendon ends, tendonmask≈1, stay at s*=1). a=0 ⇒ s*=1 ⇒ passive C=s-1.
+    belly = 1.0 - tendonmask[t]
+    s_target = 1.0 - belly * activation[t] * contraction_ratio
+    C = s - s_target
+    # dC/dF = (1/s)·d·f0^T  →  map to verts via dCdF·B[row].
+    dCdF = wp.outer(d / s, f0)
+    row0 = wp.vec3(Bt[0, 0], Bt[0, 1], Bt[0, 2])
+    row1 = wp.vec3(Bt[1, 0], Bt[1, 1], Bt[1, 2])
+    row2 = wp.vec3(Bt[2, 0], Bt[2, 1], Bt[2, 2])
+    g1 = dCdF * row0
+    g2 = dCdF * row1
+    g3 = dCdF * row2
+    g0 = -(g1 + g2 + g3)
+
+    w0 = inv_mass[p0i]
+    w1 = inv_mass[p1i]
+    w2 = inv_mass[p2i]
+    w3 = inv_mass[p3i]
+    denom = (
+        w0 * wp.dot(g0, g0)
+        + w1 * wp.dot(g1, g1)
+        + w2 * wp.dot(g2, g2)
+        + w3 * wp.dot(g3, g3)
+    )
+    if denom < 1.0e-20:
+        return
+    alpha_tilde = alpha[t] / (dt * dt)
+    dlambda = -(C + alpha_tilde * L[t]) / (denom + alpha_tilde)
+    L[t] = L[t] + dlambda
+
+    f = omega * dlambda
+    wp.atomic_add(pos, p0i, (f * w0) * g0)
+    wp.atomic_add(pos, p1i, (f * w1) * g1)
+    wp.atomic_add(pos, p2i, (f * w2) * g2)
+    wp.atomic_add(pos, p3i, (f * w3) * g3)
+
+
+@wp.kernel
+def solve_aniso_arap_kernel(
+    pos_mid: wp.array(dtype=wp.vec3),
+    tet_indices: wp.array(dtype=wp.vec4i),
+    B: wp.array(dtype=wp.mat33),
+    fiber_dir: wp.array(dtype=wp.vec3),
+    inv_mass: wp.array(dtype=wp.float32),
+    alpha: wp.array(dtype=wp.float32),
+    L: wp.array(dtype=wp.float32),
+    activation: wp.array(dtype=wp.float32),  # per-tet a in [0,1] (0 = passive)
+    tendonmask: wp.array(dtype=wp.float32),  # per-tet tendon fraction in [0,1]
+    contraction_ratio: float,
+    dt: float,
+    omega: float,
+    pos: wp.array(dtype=wp.vec3),
+):
+    """Anisotropic ARAP fiber constraint (Houdini, HOBAK / 8.4.2 in
+    *Dynamic Deformables*).
+
+    Quadratic fiber energy ``psi = 0.5·(sqrt(I5) - SI4·fiberscale)^2`` with the
+    along-fiber invariant ``I5 = |F·f0|^2`` (so ``sqrt(I5) = s``), ``fiberscale
+    = 1`` (passive, no contraction), and ``SI4 = sign(det F)`` flagging
+    along-fiber inversion (cheap branch of Houdini ``calcI4``). Differs from
+    :func:`solve_fibernorm_kernel` in the energy shape (quadratic vs linear
+    NORMSTIFFNESS response). Same parallel-Jacobi XPBD projection.
+    """
+    t = wp.tid()
+    idx = tet_indices[t]
+    p0i = idx[0]
+    p1i = idx[1]
+    p2i = idx[2]
+    p3i = idx[3]
+
+    f0 = (fiber_dir[p0i] + fiber_dir[p1i] + fiber_dir[p2i] + fiber_dir[p3i]) / 4.0
+    fn = wp.length(f0)
+    if fn < 1.0e-9:
+        return
+    f0 = f0 / fn
+
+    x0 = pos_mid[p0i]
+    x1 = pos_mid[p1i]
+    x2 = pos_mid[p2i]
+    x3 = pos_mid[p3i]
+    e1 = x1 - x0
+    e2 = x2 - x0
+    e3 = x3 - x0
+    Ds = wp.mat33(
+        e1[0], e2[0], e3[0],
+        e1[1], e2[1], e3[1],
+        e1[2], e2[2], e3[2],
+    )
+    Bt = B[t]
+    F = Ds * Bt
+
+    d = F * f0
+    s = wp.length(d)
+    if s < 1.0e-9:
+        return
+    # Skip degenerate / inverted / over-stretched tets (see solve_fibernorm_kernel):
+    # folded-pose regions reach s>10 and yank shared verts cm-scale. s>1.5 = abnormal.
+    if wp.determinant(F) <= 0.0 or s > 1.5:
+        return
+    SI4 = wp.where(wp.determinant(F) < 0.0, -1.0, 1.0)
+    # Active contraction: fiberscale = s* = 1 - belly·a·ratio (a=0 ⇒ passive,
+    # fiberscale=1). Target along-fiber stretch is SI4·fiberscale.
+    belly = 1.0 - tendonmask[t]
+    fiberscale = 1.0 - belly * activation[t] * contraction_ratio
+    diff = s - SI4 * fiberscale
+    C = 0.5 * diff * diff
+    # dpsi/dF = (diff/s)·d·f0^T  (gradscale = diff/s = 1 - SI4/s).
+    gradscale = diff / s
+    dCdF = gradscale * wp.outer(d, f0)
+    row0 = wp.vec3(Bt[0, 0], Bt[0, 1], Bt[0, 2])
+    row1 = wp.vec3(Bt[1, 0], Bt[1, 1], Bt[1, 2])
+    row2 = wp.vec3(Bt[2, 0], Bt[2, 1], Bt[2, 2])
+    g1 = dCdF * row0
+    g2 = dCdF * row1
+    g3 = dCdF * row2
+    g0 = -(g1 + g2 + g3)
+
+    w0 = inv_mass[p0i]
+    w1 = inv_mass[p1i]
+    w2 = inv_mass[p2i]
+    w3 = inv_mass[p3i]
+    denom = (
+        w0 * wp.dot(g0, g0)
+        + w1 * wp.dot(g1, g1)
+        + w2 * wp.dot(g2, g2)
+        + w3 * wp.dot(g3, g3)
+    )
+    if denom < 1.0e-20:
+        return
+    alpha_tilde = alpha[t] / (dt * dt)
+    dlambda = -(C + alpha_tilde * L[t]) / (denom + alpha_tilde)
+    L[t] = L[t] + dlambda
+
+    f = omega * dlambda
+    wp.atomic_add(pos, p0i, (f * w0) * g0)
+    wp.atomic_add(pos, p1i, (f * w1) * g1)
+    wp.atomic_add(pos, p2i, (f * w2) * g2)
+    wp.atomic_add(pos, p3i, (f * w3) * g3)
+
+
+@wp.kernel
 def pintotarget_overwrite_kernel(
     pts: wp.array(dtype=wp.int32),
     target_pos: wp.array(dtype=wp.vec3),
@@ -817,23 +1024,24 @@ class OneWaySim(XpbdEngine):
         self.use_volume = bool(cfg.get("use_volume", False))
         self.volume_stiffness = float(cfg.get("volume_stiffness", 1.0e10))
 
-        # Optional FiberMillard active-contraction constraint. SCAFFOLD ONLY:
-        # the humanV2 GMG asset lacks per-vertex fiber direction and per-tet
-        # activation, so enabling this raises until that data is baked in (see
-        # solve_fibermillard_kernel). Flags parsed here so configs/docs are ready.
+        # Optional PASSIVE fiber constraint. The humanV2 asset (restpos.geo)
+        # carries the per-vertex rest fiber direction in the ``materialW`` point
+        # attribute, so the two passive Houdini fiber models are supported:
+        #   "fibernorm"  -> solve_fibernorm_kernel  (linear TETFIBERNORM)
+        #   "aniso_arap" -> solve_aniso_arap_kernel (quadratic HOBAK fiber)
+        # The active "fibermillard" model still needs per-tet activation (from an
+        # RL trajectory) that the asset lacks, so it remains gated off.
         self.use_fiber = bool(cfg.get("use_fiber", False))
-        self.fiber_model = str(cfg.get("fiber_model", "fibermillard"))
-        self.fiber_stiffness = float(cfg.get("fiber_stiffness", 1.0e4))
+        self.fiber_model = str(cfg.get("fiber_model", "fibernorm"))
+        self.fiber_stiffness = float(cfg.get("fiber_stiffness", 1.0e8))
         self.contraction_ratio = float(cfg.get("contraction_ratio", 0.4))
-        if self.use_fiber:
+        if self.use_fiber and self.fiber_model not in ("fibernorm", "aniso_arap"):
             raise NotImplementedError(
-                "use_fiber=true is not yet supported by the OneWayGmg solver: "
-                "the FiberMillard constraint needs per-vertex fiber direction "
-                "and per-tet activation, which the humanV2 asset (restpos.geo) "
-                "does not carry (only tendonmask is present). Bake fiber "
-                "direction (from the muscle fiber field) and activation (from "
-                "the RL trajectory) into the geo, extend the loader to read "
-                "them, then enable solve_fibermillard_kernel in substep()."
+                f"fiber_model={self.fiber_model!r} not supported. The OneWayGmg "
+                "solver implements the PASSIVE Houdini fiber models 'fibernorm' "
+                "and 'aniso_arap' (both read the materialW fiber field). The "
+                "active 'fibermillard' model needs per-tet activation, which the "
+                "humanV2 asset does not carry — bake it in to enable that."
             )
 
         _check_unzipped(self.rest_path)
@@ -880,6 +1088,63 @@ class OneWaySim(XpbdEngine):
                                       dtype=wp.float32, device=device)
             self.vol_L = wp.zeros(self.NT, dtype=wp.float32, device=device)
 
+        # Time-invariant per-vertex muscle attributes, cached for USD baking
+        # (materialW = fiber direction, tendonmask, optional Cd). Stored as numpy
+        # so the render loop can write them once as static USD primvars.
+        self.materialW_np = (rest.point_attr("materialW").astype(np.float32)
+                             if rest.has_point_attr("materialW") else None)
+        self.tendonmask_np = (rest.point_attr("tendonmask").astype(np.float32)
+                              if rest.has_point_attr("tendonmask") else None)
+        self.cd_np = (rest.point_attr("Cd").astype(np.float32)
+                      if rest.has_point_attr("Cd") else None)
+
+        # Per-tet muscle id (index into muscle_id_strings), cached so the driver
+        # can target named muscles (e.g. "L_bicepsBrachialis") for activation.
+        self.muscle_id_np = (rest.prim_attr("muscle_id")
+                             if rest.has_prim_attr("muscle_id") else None)
+        self.muscle_id_strings = (rest.prim_attr_strings("muscle_id")
+                                  if rest.has_prim_attr("muscle_id") else [])
+
+        # Passive fiber constraint setup. Reads the rest fiber direction from
+        # materialW and builds the per-tet XPBD compliance alpha = 1/(k_fib·V0).
+        self.v_fiber_dir = None
+        if self.use_fiber:
+            if self.materialW_np is None:
+                raise ValueError(
+                    "use_fiber=true but restpos.geo has no 'materialW' point "
+                    "attribute (the fiber direction field).")
+            if self.materialW_np.shape[0] != self.NV:
+                raise ValueError(
+                    f"materialW has {self.materialW_np.shape[0]} verts, "
+                    f"expected NV={self.NV}.")
+            self.v_fiber_dir = wp.array(self.materialW_np.copy(),
+                                        dtype=wp.vec3, device=device)
+            with np.errstate(divide="ignore"):
+                fib_alpha_np = 1.0 / (self.fiber_stiffness * V0)
+            fib_alpha_np[~np.isfinite(fib_alpha_np)] = 1.0e30
+            fib_alpha_np[V0 <= 0.0] = 1.0e30
+            self.fiber_alpha = wp.array(fib_alpha_np.astype(np.float32),
+                                        dtype=wp.float32, device=device)
+            self.fiber_L = wp.zeros(self.NT, dtype=wp.float32, device=device)
+            # Per-tet tendon fraction (belly = 1 - tendonmask drives contraction)
+            # and activation (default 0 = passive). Both length = muscle NT here.
+            if self.tendonmask_np is not None:
+                tmask_tet = (self.tendonmask_np[rest.tet_indices]
+                             .mean(axis=1).astype(np.float32))
+            else:
+                tmask_tet = np.zeros(self.NT, dtype=np.float32)
+            self.fiber_tendonmask = wp.array(tmask_tet, dtype=wp.float32,
+                                             device=device)
+            self.fiber_activation = wp.zeros(self.NT, dtype=wp.float32,
+                                             device=device)
+            # Fiber lives on MUSCLE tets only. Under fascia merge the muscle tets
+            # stay the first NT entries (build_merged_state vstacks muscle first),
+            # with their B / rest_volume / vert indices unchanged, so the kernel
+            # runs over the first _fiber_nt tets of whatever (merged or not) state
+            # self.tet_idx points to. materialW (v_fiber_dir, NV_muscle) is indexed
+            # only by muscle verts (< nvm), valid in both layouts.
+            self._fiber_nt = self.NT  # = muscle NT here (set before any merge)
+
         # Pin-to-target: topology (pts) is constant across all cons_<frame>.geo
         # files; only target_pos varies.
         cons0_path = str(Path(self.cons_dir) / f"cons_{self.start_frame}.geo")
@@ -892,6 +1157,27 @@ class OneWaySim(XpbdEngine):
         rest_offset_np = (rest.positions[cons0.pts] - cons0.target_pos).astype(np.float32)
         self.rest_offset = wp.array(rest_offset_np, dtype=wp.vec3, device=device)
         self.target_pos = wp.array(cons0.target_pos.copy(), dtype=wp.vec3, device=device)
+
+        # Optional PARTIAL pinning. humanV2 is fully pinned (pts == all NV): every
+        # vert is hard-overwritten to a per-frame target each substep, and those
+        # targets self-overlap, so the belly is forced through neighbouring
+        # muscles and no collision push can hold. With tendon_pin_threshold set,
+        # only verts whose tendonmask exceeds it (the tendon attachment regions)
+        # stay HARD-pinned; the belly is freed to a soft pull toward target
+        # (pin_soft_stiffness) so it tracks gross body motion while yielding to
+        # collision. Reuses the fascia free/soft-pin path (mutually exclusive with
+        # fascia, which rebuilds pin_active from its own glue ring below).
+        self.tendon_pin_threshold = cfg.get("tendon_pin_threshold", None)
+        if self.tendon_pin_threshold is not None:
+            tmask = rest.point_attr("tendonmask").astype(np.float32)
+            active = (tmask[self._pin_pts_np]
+                      > float(self.tendon_pin_threshold)).astype(np.int32)
+            self.pin_active = wp.array(active, dtype=wp.int32, device=device)
+            self.fascia_soft_pin = float(
+                cfg.get("pin_soft_stiffness", self.fascia_soft_pin))
+            print(f"[partial-pin] tendonmask>{self.tendon_pin_threshold}: "
+                  f"{int(active.sum())}/{len(active)} hard pins, "
+                  f"rest soft (stiffness={self.fascia_soft_pin})")
 
         if self.use_multigrid:
             if self.coarse_rest_path is None:
@@ -1131,6 +1417,27 @@ class OneWaySim(XpbdEngine):
 
     # ------------------------------------------------------------------
 
+    def tet_mask_for_muscles(self, names) -> np.ndarray:
+        """Boolean per-(muscle)-tet mask selecting tets in the named muscles.
+
+        ``names`` is a string or list of substrings matched against
+        ``muscle_id_strings`` (e.g. ``"bicepsBrachialis"`` matches both L_/R_).
+        Length = muscle NT (= ``_fiber_nt``), aligned with ``fiber_activation``.
+        """
+        if isinstance(names, str):
+            names = [names]
+        if self.muscle_id_np is None:
+            raise ValueError("restpos.geo has no 'muscle_id' prim attribute.")
+        sel_ids = [i for i, s in enumerate(self.muscle_id_strings)
+                   if any(n in s for n in names)]
+        return np.isin(self.muscle_id_np, sel_ids)
+
+    def set_fiber_activation(self, acti_np) -> None:
+        """Upload a per-(muscle)-tet activation array (length = ``_fiber_nt``)."""
+        if not self.use_fiber:
+            raise RuntimeError("set_fiber_activation requires use_fiber=True.")
+        self.fiber_activation.assign(np.ascontiguousarray(acti_np, np.float32))
+
     def preload_targets(self, frames=None) -> None:
         """Parse every frame's cons target_pos once and hold it in RAM.
 
@@ -1215,11 +1522,18 @@ class OneWaySim(XpbdEngine):
                     device=s._device,
                 )
                 s.apply_pintotarget()
+            elif s.pin_active is not None:
+                # Partial pin without multigrid: still re-apply pin every substep
+                # so the hard tendon anchors hold and freed belly verts get their
+                # soft pull (the multigrid branch above does this via prolong).
+                s.apply_pintotarget()
             if getattr(s, "merged", None) is not None:
                 apply_anchor(s.merged, s._device)
             s.L.zero_()
             if s.use_volume:
                 s.vol_L.zero_()
+            if s.use_fiber:
+                s.fiber_L.zero_()
 
         def iter_phase():
             for it in range(s.fine_iters):
@@ -1241,6 +1555,24 @@ class OneWaySim(XpbdEngine):
                         inputs=[s.pos_mid, s.tet_idx, s.B,
                                 s.inv_mass, s.vol_alpha, s.vol_L,
                                 s.dt, s.omega, s.pos],
+                        device=s._device,
+                    )
+                # Optional PASSIVE fiber constraint: along-fiber anisotropic
+                # stiffness, projected from the same pos_mid snapshot as ARAP /
+                # volume (parallel-Jacobi). Runs over the MUSCLE tets only (the
+                # first _fiber_nt entries — fascia tets have no fiber field);
+                # works on both the muscle-only and fascia-merged states.
+                if s.use_fiber:
+                    fiber_kernel = (solve_aniso_arap_kernel
+                                    if s.fiber_model == "aniso_arap"
+                                    else solve_fibernorm_kernel)
+                    wp.launch(
+                        fiber_kernel,
+                        dim=s._fiber_nt,
+                        inputs=[s.pos_mid, s.tet_idx, s.B, s.v_fiber_dir,
+                                s.inv_mass, s.fiber_alpha, s.fiber_L,
+                                s.fiber_activation, s.fiber_tendonmask,
+                                s.contraction_ratio, s.dt, s.omega, s.pos],
                         device=s._device,
                     )
                 # Per-iteration collision hook (UDCF DCD): interleaves contact

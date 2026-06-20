@@ -100,6 +100,64 @@ def _set_sum_is_collide(stage, prim_path, total, time):
     attr.Set(int(total), time)
 
 
+def _bake_static_primvars(stage, prim_path, sim):
+    """Write the time-INVARIANT per-vertex muscle attributes (materialW fiber
+    direction, tendonmask, optional Cd) as default-timecode USD primvars.
+
+    These never change across the sequence, so they are written once at the
+    default timecode (not time-sampled) — a few MB total. ``materialW`` lands as
+    a Float3Array, ``tendonmask`` as a FloatArray, ``Cd`` as a Color3fArray
+    named ``displayColor`` so usdview shades by it. All vertex-interpolated to
+    match the muscle mesh points (the full NV vertex set)."""
+    from pxr import UsdGeom, Sdf, Vt, Usd
+    prim = stage.GetPrimAtPath(prim_path)
+    api = UsdGeom.PrimvarsAPI(prim)
+    default = Usd.TimeCode.Default()
+    # The muscle prim renders ALL particles (sim.NV) — under a fascia merge that
+    # is muscle + fascia verts, while these attrs cover only the muscle verts.
+    # Vertex primvars must match the point count, so pad the tail (fascia verts,
+    # unreferenced by the muscle surface tris) with zeros.
+    nv = int(sim.NV)
+
+    def _pad(arr):
+        if arr.shape[0] == nv:
+            return arr
+        out = np.zeros((nv,) + arr.shape[1:], dtype=np.float32)
+        out[:arr.shape[0]] = arr
+        return out
+
+    def _vec3(name, arr):
+        pv = api.GetPrimvar(name) or api.CreatePrimvar(
+            name, Sdf.ValueTypeNames.Float3Array, UsdGeom.Tokens.vertex)
+        pv.Set(Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(_pad(arr), np.float32)),
+               default)
+
+    def _scalar(name, arr):
+        pv = api.GetPrimvar(name) or api.CreatePrimvar(
+            name, Sdf.ValueTypeNames.FloatArray, UsdGeom.Tokens.vertex)
+        pv.Set(Vt.FloatArray.FromNumpy(np.ascontiguousarray(_pad(arr), np.float32)),
+               default)
+
+    baked = []
+    if getattr(sim, "materialW_np", None) is not None:
+        _vec3("materialW", sim.materialW_np)
+        baked.append("materialW")
+    if getattr(sim, "tendonmask_np", None) is not None:
+        _scalar("tendonmask", sim.tendonmask_np)
+        baked.append("tendonmask")
+    if getattr(sim, "cd_np", None) is not None:
+        cd = sim.cd_np
+        if cd.ndim == 2 and cd.shape[1] >= 3:
+            pv = api.GetPrimvar("displayColor") or api.CreatePrimvar(
+                "displayColor", Sdf.ValueTypeNames.Color3fArray,
+                UsdGeom.Tokens.vertex)
+            pv.Set(Vt.Vec3fArray.FromNumpy(
+                np.ascontiguousarray(_pad(cd[:, :3]), np.float32)), default)
+            baked.append("Cd")
+    if baked:
+        print(f"[usd] baked static primvars: {', '.join(baked)}")
+
+
 
 
 def _load_bone_verts(bone_dir: Path, frame: int) -> np.ndarray:
@@ -115,12 +173,14 @@ class AnimatedBoneMeshCollider:
     """
 
     def __init__(self, sim: OneWaySim, bone_dir: str,
-                 max_dist: float = 0.2, contact_offset: float = 0.0):
+                 max_dist: float = 0.2, contact_offset: float = 0.0,
+                 max_push: float = 0.005):
         self.sim = sim
         self.device = sim._device
         self.bone_dir = Path(bone_dir)
         self.max_dist = float(max_dist)
         self.contact_offset = float(contact_offset)
+        self.max_push = float(max_push)
 
         g0 = GeoFile(str(self.bone_dir / "bone_1.geo"))
         tri = np.asarray(g0.tet_indices, dtype=np.int32)
@@ -138,7 +198,16 @@ class AnimatedBoneMeshCollider:
         )
         # humanV2 is fully pin-driven (pts == all NV); use full inv_mass so the
         # push can act, running as the substep's last op to win over the pin.
-        self.coll_inv_mass = wp.clone(sim.inv_mass)
+        # Fascia (verts >= nvm) is the OUTER shell wrapping the muscles, which in
+        # turn wrap the bone — fascia never touches bone, so any "contact" it
+        # reports is a spurious mesh_query_point_sign_normal sign-flip that
+        # catapults the vert. Exclude fascia from collision entirely (inv_mass=0).
+        coll_inv_mass_np = sim.inv_mass.numpy()
+        nvm = int(getattr(sim, "nvm", sim.NV))
+        if nvm < sim.NV:
+            coll_inv_mass_np[nvm:] = 0.0
+        self.coll_inv_mass = wp.array(coll_inv_mass_np, dtype=wp.float32,
+                                      device=self.device)
         self._count = wp.zeros(1, dtype=wp.int32, device=self.device)
         self._depth = wp.zeros(sim.NV, dtype=wp.float32, device=self.device)
         self._cur_verts = verts0  # for viz / dump
@@ -168,7 +237,8 @@ class AnimatedBoneMeshCollider:
         wp.launch(
             solve_mesh_contact_pos_kernel, dim=self.sim.NV,
             inputs=[self.sim.pos, self.coll_inv_mass, self.mesh.id,
-                    wp.float32(self.max_dist), wp.float32(self.contact_offset)],
+                    wp.float32(self.max_dist), wp.float32(self.contact_offset),
+                    wp.float32(self.max_push)],
             device=self.device)
 
     def inside_count(self) -> int:
@@ -203,7 +273,32 @@ def build_humanV2_sim(args):
     """
     cfg = load_config(args.config)
     cfg["end_frame"] = args.end_frame
+    # Optional overrides for the partial-pin experiment (no-op if args absent).
+    if getattr(args, "no_gmg", False):
+        cfg["use_multigrid"] = False
+    if getattr(args, "tendon_pin_threshold", None) is not None:
+        cfg["tendon_pin_threshold"] = args.tendon_pin_threshold
+    if getattr(args, "pin_soft_stiffness", None) is not None:
+        cfg["pin_soft_stiffness"] = args.pin_soft_stiffness
+    if getattr(args, "fiber", "none") != "none":
+        cfg["use_fiber"] = True
+        cfg["fiber_model"] = args.fiber
+        cfg["fiber_stiffness"] = args.fiber_stiffness
+        cfg["contraction_ratio"] = args.contraction_ratio
     sim = OneWaySim(cfg, device=args.device)
+    if getattr(sim, "use_fiber", False):
+        print(f"[fiber] model={sim.fiber_model} k_fib={sim.fiber_stiffness:g} "
+              f"contraction_ratio={sim.contraction_ratio:g}")
+    # Optional: build the activation mask for a named muscle (e.g. bicep). The
+    # run loop ramps this muscle's activation 0->1 across frames so the fiber
+    # contraction is visible against the passive baseline.
+    sim._activate_mask = None
+    act_name = getattr(args, "activate", None)
+    if act_name and getattr(sim, "use_fiber", False):
+        mask = sim.tet_mask_for_muscles(act_name).astype(np.float32)
+        sim._activate_mask = mask
+        print(f"[activate] '{act_name}' -> {int(mask.sum())}/{mask.shape[0]} "
+              f"muscle tets ramp 0->1")
     print(f"NV={sim.NV}  NT={sim.NT}  frames={sim.start_frame}..{sim.end_frame}")
 
     # Parse all per-frame cons/bone .geo up front (RAM-resident, .npy-backed) so
@@ -262,6 +357,10 @@ def run_humanV2_loop(sim, collider, args, cfg, surf_flat, fascia_flat,
             collider.set_frame(frame)              # move bones BEFORE solving
         if pre_step is not None:
             pre_step(frame)
+        if getattr(sim, "_activate_mask", None) is not None:
+            span = max(1, sim.end_frame - sim.start_frame)
+            a = (frame - sim.start_frame) / span      # linear ramp 0 -> 1
+            sim.set_fiber_activation(a * sim._activate_mask)
         sim.step_frame(frame)
         depth = collider.inside_depth()             # >0 = inside bone
         # Threshold at collide_eps, not >0: after SDF projection verts sit ON
@@ -277,9 +376,12 @@ def run_humanV2_loop(sim, collider, args, cfg, surf_flat, fascia_flat,
             inner.begin_frame(frame / inner.fps)
             muscle_path = inner.render_mesh(name="muscle", points=pos_np,
                                             indices=surf_flat, colors=(0.8, 0.3, 0.25))
-            _set_is_collide_primvar(inner.stage, muscle_path, is_collide, inner.time)
-            _set_pen_depth_primvar(inner.stage, muscle_path, depth, inner.time)
+            if not getattr(args, "no_collide_primvars", False):
+                _set_is_collide_primvar(inner.stage, muscle_path, is_collide, inner.time)
+                _set_pen_depth_primvar(inner.stage, muscle_path, depth, inner.time)
             _set_sum_is_collide(inner.stage, muscle_path, int(is_collide.sum()), inner.time)
+            if frame == sim.start_frame:
+                _bake_static_primvars(inner.stage, muscle_path, sim)
             if fascia_flat is not None:
                 inner.render_mesh(name="fascia", points=pos_np,
                                   indices=fascia_flat, colors=(0.55, 0.75, 0.9))
@@ -323,6 +425,27 @@ def add_humanV2_args(ap):
                     help="is_collide depth threshold (m); verts shallower than "
                          "this count as resolved (default 1um — filters the "
                          "sub-micron surface-touch noise after SDF projection)")
+    ap.add_argument("--fiber", choices=("none", "fibernorm", "aniso_arap"),
+                    default="none",
+                    help="add an along-fiber constraint using the materialW "
+                         "fiber field: 'fibernorm' (linear Houdini TETFIBERNORM) "
+                         "or 'aniso_arap' (quadratic HOBAK fiber). Passive unless "
+                         "--activate is set. Default none.")
+    ap.add_argument("--fiber_stiffness", type=float, default=1.0e8,
+                    help="fiber constraint stiffness k_fib (XPBD compliance "
+                         "1/(k_fib·V0)); default 1e8.")
+    ap.add_argument("--activate", default=None,
+                    help="muscle-name substring (e.g. 'bicepsBrachialis') whose "
+                         "fiber activation ramps 0->1 across frames so the active "
+                         "contraction is visible. Needs --fiber. Matches muscle_id "
+                         "strings (both L_/R_).")
+    ap.add_argument("--contraction_ratio", type=float, default=0.4,
+                    help="max along-fiber shortening at activation=1: target "
+                         "stretch s* = 1 - belly·a·ratio (default 0.4 = 40%%).")
+    ap.add_argument("--no_collide_primvars", action="store_true",
+                    help="skip the per-vertex per-frame is_collide / pen_depth "
+                         "USD primvars (~+30%% file size at 200f). The cheap "
+                         "per-frame scalar sum_is_collide is still written.")
     return ap
 
 

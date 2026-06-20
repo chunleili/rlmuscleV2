@@ -126,6 +126,7 @@ def solve_mesh_contact_pos_kernel(
     mesh: wp.uint64,                 # wp.Mesh.id of the rigid collider (e.g. bone)
     max_dist: wp.float32,            # closest-point search radius
     contact_offset: wp.float32,      # keep verts this far outside the surface
+    max_push: wp.float32,            # reject contacts deeper than this (spurious)
 ):
     """Position-only push of verts out of a rigid TRIANGLE-MESH collider.
 
@@ -136,6 +137,15 @@ def solve_mesh_contact_pos_kernel(
     quasi-static solvers — no velocity, position only. ``inv_mass == 0`` verts
     are skipped. The host owns the mesh and ``refit()``s it when the collider
     moves (e.g. per animation frame).
+
+    ROBUSTNESS: ``mesh_query_point_sign_normal``'s sign is unreliable near thin
+    bone features / sharp edges (the reason the bone winding is pre-flipped). A
+    spurious sign flip reports a vert that is actually just OUTSIDE as deeply
+    INSIDE relative to a far face, and the raw push ``x - n*err`` then catapults
+    it cm-scale onto that face (single-vert spikes). Real per-substep penetration
+    is sub-cm, so a contact reporting depth > ``max_push`` is rejected as a bad
+    query. The degenerate ``|delta|≈0`` case (vert on the surface → unstable
+    ``normalize``) is also skipped.
     """
     i = wp.tid()
     if inv_mass[i] == 0.0:
@@ -145,10 +155,13 @@ def solve_mesh_contact_pos_kernel(
     if query.result:
         cp = wp.mesh_eval_position(mesh, query.face, query.u, query.v)
         delta = x - cp
-        dist = wp.length(delta) * query.sign      # signed: < 0 inside the mesh
+        dlen = wp.length(delta)
+        if dlen < 1.0e-9:                          # on the surface: normal undefined
+            return
+        dist = dlen * query.sign                   # signed: < 0 inside the mesh
         err = dist - contact_offset
-        if err < 0.0:
-            n = wp.normalize(delta) * query.sign   # outward surface normal
+        if err < 0.0 and -err <= max_push:         # reject spurious deep (sign-flip)
+            n = (delta / dlen) * query.sign        # outward surface normal
             pos[i] = x - n * err                    # push out to offset surface
 
 

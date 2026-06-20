@@ -40,6 +40,20 @@ def main(argv=None):
     ap.add_argument("--usd", default="output/humanV2_sdf_bone_intermuscle.usd")
     ap.add_argument("--no_bone", action="store_true",
                     help="disable SDF muscle-vs-bone resolution")
+    ap.add_argument("--no_gmg", action="store_true",
+                    help="disable the multigrid V-cycle (use_multigrid=false). "
+                         "Pairs with --tendon_pin_threshold: GMG off + partial "
+                         "pin frees the belly to yield to collision.")
+    ap.add_argument("--tendon_pin_threshold", type=float, default=None,
+                    help="PARTIAL pin: hard-pin only verts with tendonmask above "
+                         "this (tendon attach regions, ~14%% at 0.9); soft-attach "
+                         "the rest so the belly can deform. None = full pin (all "
+                         "verts hard-overwritten to target — the deep-penetration "
+                         "source).")
+    ap.add_argument("--pin_soft_stiffness", type=float, default=None,
+                    help="soft-pin fraction toward target per substep for the "
+                         "freed belly verts (default solver fascia_soft_pin=0.5). "
+                         "Lower = belly yields more to collision.")
     ap.add_argument("--self_collision", action="store_true",
                     help="enable inter-muscle self-collision (OFF by default)")
     ap.add_argument("--self_max_dist", type=float, default=0.02,
@@ -47,6 +61,10 @@ def main(argv=None):
                          "deeper than this past another muscle's surface is missed")
     ap.add_argument("--self_offset", type=float, default=1e-4,
                     help="keep pushed verts this far outside the other muscle (m)")
+    ap.add_argument("--self_stride", type=int, default=2,
+                    help="run the inter-muscle refit+push only every Nth substep "
+                         "(plus always the last). 2 halves the refit cost for a "
+                         "few %% more residual; 1 = every substep (deepest).")
     ap.add_argument("--self_iters", type=int, default=1,
                     help="jacobi push passes per substep. 1 is best: the ~10 "
                          "per-substep refits already iterate; K>1 reuses the work "
@@ -70,7 +88,9 @@ def main(argv=None):
         inter = InterMuscleCollider(sim, cfg["rest_path"],
                                     max_dist=args.self_max_dist,
                                     contact_offset=args.self_offset,
-                                    iters=args.self_iters, device=args.device)
+                                    iters=args.self_iters,
+                                    substep_stride=args.self_stride,
+                                    device=args.device)
         print(f"inter-muscle collider: {inter.n_muscle} muscles, "
               f"max_dist={args.self_max_dist} offset={args.self_offset}")
 

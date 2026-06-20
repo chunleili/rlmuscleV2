@@ -54,6 +54,15 @@ def main(argv=None):
     ap.add_argument("--usd", default="output/humanV2_sdf_bone_dcd_self.usd")
     ap.add_argument("--no_bone", action="store_true",
                     help="disable SDF muscle-vs-bone resolution")
+    ap.add_argument("--no_gmg", action="store_true",
+                    help="disable multigrid V-cycle (use_multigrid=false); pairs "
+                         "with --tendon_pin_threshold for partial pinning")
+    ap.add_argument("--tendon_pin_threshold", type=float, default=None,
+                    help="PARTIAL pin: hard-pin only verts with tendonmask above "
+                         "this; soft-attach the belly. None = full pin")
+    ap.add_argument("--pin_soft_stiffness", type=float, default=None,
+                    help="soft-pin fraction/substep for freed belly verts "
+                         "(solver default 0.5)")
     ap.add_argument("--self_collision", action="store_true",
                     help="enable DCD muscle self-collision (OFF by default)")
     ap.add_argument("--thickness", type=float, default=1e-3,

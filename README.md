@@ -36,13 +36,15 @@ PYTHONPATH=src python -m muscle.collision.sdf.example.humanV2_fascia --end_frame
 
 <table>
   <tr><th colspan="2">Performance — 50 frames, RTX 4090</th></tr>
+  <tr><td>
+  </td></tr>substeps</td><td>10,</td></tr>
+  </td></tr>dt</td></tr> 1/24 s</td></tr>
   <tr><td>verts</td><td>172,717 (muscle 157,369 + fascia 15,348)</td></tr>
   <tr><td>tets</td><td>534,947 (muscle 468,162 + fascia 66,785)</td></tr>
-  <tr><td>pure sim (<code>--no_export</code>, warm cache)</td><td>0.9 s — 18 ms/frame</td></tr>
-  <tr><td>with USD export (warm cache)</td><td>1.6 s — 32 ms/frame</td></tr>
+  <tr><td>sim (<code>no export</code>)</td><td>0.9 s — 18 ms/frame</td></tr>
+  <tr><td>sim with USD export</td><td>1.6 s — 32 ms/frame</td></tr>
   <tr><td>first run (cold, builds <code>.npy</code> cache)</td><td>37.5 s — per-frame cost is JSON <code>.geo</code> parsing, cached after</td></tr>
-  <tr><td>peak GPU memory</td><td>484 MiB process (~98 MiB sim arrays + CUDA/Warp context)</td></tr>
-  <tr><td>contacts/frame</td><td>~1,300–1,600 verts</td></tr>
+  <tr><td>peak GPU memory</td><td>~98 MiB (w/o CUDA/Warp context, which is ~386 MiB)</td></tr>
   <tr><td>max penetration</td><td>0.0 mm (resolved each frame)</td></tr>
 </table>
 

@@ -16,11 +16,16 @@ This is also the physically meaningful case: a muscle folding into itself is
 internal and invisible, whereas two packed muscles overlapping is the visible
 penetration (199 muscles in humanV2).
 
-Pipeline per call:
-  1. refit each muscle's ``wp.Mesh`` (points shared with ``sim.pos``, BVH rebuilt)
-  2. broadphase: per-muscle AABB, emit overlapping muscle pairs (sparse)
-  3. for each pair (i, j): push verts of i inside j out to j's surface, and
-     verts of j inside i out to i's surface
+Everything but the per-muscle BVH refit is on the GPU, with no host sync:
+
+  * broadphase (``refresh``, once per frame): a per-muscle AABB kernel
+    (atomic min/max into ``lo``/``hi``) then an N_muscle x N_muscle adjacency
+    kernel that marks overlapping muscle pairs.
+  * resolve (``__call__``, per substep): one push kernel, one thread per muscle
+    vertex, that loops its muscle's overlapping neighbours, queries each
+    neighbour's surface and applies the AVERAGE outward push (jacobi — the
+    average is computed locally in the single owning thread, so no atomics and
+    no race even when a vertex sits inside several muscles).
 
 muscle_id comes from the rest geo's per-tet ``muscle_id`` prim attr (199 strings
 for humanV2); each muscle's surface is extracted from its own tet subset so the
@@ -34,68 +39,174 @@ import warp as wp
 from muscle.coupleOneWayGmg.example import _vectorized_surface_tris
 from muscle.util.geo_io import GeoFile
 
-
-@wp.kernel
-def _accum_worklist_kernel(work_vidx: wp.array(dtype=wp.int32),
-                           work_mesh: wp.array(dtype=wp.uint64),
-                           pos: wp.array(dtype=wp.vec3),
-                           inv_mass: wp.array(dtype=wp.float32),
-                           max_dist: wp.float32,
-                           contact_offset: wp.float32,
-                           dP: wp.array(dtype=wp.vec3),
-                           cnt: wp.array(dtype=wp.int32)):
-    """Accumulate the inter-muscle push for one (vertex, target-mesh) work item.
-
-    Broadphase emits one entry per (candidate vertex, other-muscle mesh) so the
-    whole resolve is a SINGLE launch instead of one per muscle pair (~3000 pairs
-    in humanV2 — per-pair launches were launch-overhead bound).  Corrections are
-    atomic-accumulated (not written in place) so a vertex embedded in several
-    muscles gets the AVERAGE of its per-target pushes — jacobi, race-free, so K
-    passes converge instead of fighting (in-place writes diverged at K>1).
-    """
-    k = wp.tid()
-    i = work_vidx[k]
-    if inv_mass[i] == 0.0:
-        return
-    x = pos[i]
-    query = wp.mesh_query_point_sign_normal(work_mesh[k], x, max_dist)
-    if query.result:
-        cp = wp.mesh_eval_position(work_mesh[k], query.face, query.u, query.v)
-        delta = x - cp
-        dist = wp.length(delta) * query.sign      # < 0 inside the mesh
-        err = dist - contact_offset
-        if err < 0.0:
-            n = wp.normalize(delta) * query.sign
-            wp.atomic_add(dP, i, -n * err)        # outward push (err < 0)
-            wp.atomic_add(cnt, i, 1)
+_INF = wp.constant(1.0e30)
 
 
 @wp.kernel
-def _apply_accum_kernel(pos: wp.array(dtype=wp.vec3),
-                        dP: wp.array(dtype=wp.vec3),
-                        cnt: wp.array(dtype=wp.int32)):
-    """Apply the averaged correction and clear the accumulators (jacobi)."""
+def _reset_aabb_kernel(lo: wp.array(dtype=wp.float32),
+                       hi: wp.array(dtype=wp.float32)):
     i = wp.tid()
-    c = cnt[i]
-    if c > 0:
-        pos[i] = pos[i] + dP[i] / wp.float32(c)
-        dP[i] = wp.vec3(0.0, 0.0, 0.0)
-        cnt[i] = 0
+    lo[i] = _INF
+    hi[i] = -_INF
 
 
 @wp.kernel
-def _count_inside_indexed_kernel(vidx: wp.array(dtype=wp.int32),
-                                 pos: wp.array(dtype=wp.vec3),
-                                 mesh: wp.uint64,
-                                 max_dist: wp.float32,
-                                 count: wp.array(dtype=wp.int32)):
-    k = wp.tid()
-    i = vidx[k]
-    q = wp.mesh_query_point_sign_normal(mesh, pos[i], max_dist)
+def _muscle_aabb_kernel(pos: wp.array(dtype=wp.vec3),
+                        vert_muscle: wp.array(dtype=wp.int32),
+                        lo: wp.array(dtype=wp.float32),
+                        hi: wp.array(dtype=wp.float32)):
+    """Per-muscle AABB by atomic min/max of each muscle's vertices (lo/hi are
+    flat ``[n_muscle * 3]``)."""
+    i = wp.tid()
+    m = vert_muscle[i]
+    if m < 0:
+        return
+    p = pos[i]
+    b = m * 3
+    for c in range(3):
+        wp.atomic_min(lo, b + c, p[c])
+        wp.atomic_max(hi, b + c, p[c])
+
+
+@wp.kernel
+def _adjacency_kernel(lo: wp.array(dtype=wp.float32),
+                      hi: wp.array(dtype=wp.float32),
+                      margin: wp.float32, nm: wp.int32,
+                      adj: wp.array(dtype=wp.int32),
+                      active: wp.array(dtype=wp.int32),
+                      n_pairs: wp.array(dtype=wp.int32)):
+    """Mark overlapping muscle pairs (i < j) in the dense ``nm x nm`` matrix and
+    flag both muscles ``active`` (only active muscles need a refit / push).
+
+    Empty muscles keep ``lo = +inf`` so their overlap test always fails."""
+    idx = wp.tid()
+    i = idx / nm
+    j = idx % nm
+    if i >= j:
+        return
+    ov = True
+    for c in range(3):
+        if lo[i * 3 + c] > hi[j * 3 + c] + margin:
+            ov = False
+        if lo[j * 3 + c] > hi[i * 3 + c] + margin:
+            ov = False
+    if ov:
+        adj[i * nm + j] = 1
+        adj[j * nm + i] = 1
+        active[i] = 1
+        active[j] = 1
+        wp.atomic_add(n_pairs, 0, 1)
+
+
+@wp.func
+def _push_against(mesh: wp.uint64, x: wp.vec3, max_dist: wp.float32,
+                  offset: wp.float32):
+    """Outward correction that moves ``x`` to ``mesh``'s surface if inside it
+    (zero vec + 0 otherwise).  Returns (correction, hit)."""
+    q = wp.mesh_query_point_sign_normal(mesh, x, max_dist)
     if q.result:
         cp = wp.mesh_eval_position(mesh, q.face, q.u, q.v)
-        if wp.length(pos[i] - cp) * q.sign < 0.0:
-            wp.atomic_add(count, 0, 1)
+        delta = x - cp
+        dist = wp.length(delta) * q.sign          # < 0 inside the mesh
+        err = dist - offset
+        if err < 0.0:
+            n = wp.normalize(delta) * q.sign
+            return -n * err, 1                     # outward push (err < 0)
+    return wp.vec3(0.0, 0.0, 0.0), 0
+
+
+@wp.kernel
+def _push_adj_kernel(pos: wp.array(dtype=wp.vec3),
+                     vert_muscle: wp.array(dtype=wp.int32),
+                     inv_mass: wp.array(dtype=wp.float32),
+                     mesh_ids: wp.array(dtype=wp.uint64),
+                     adj: wp.array(dtype=wp.int32), nm: wp.int32,
+                     max_dist: wp.float32, offset: wp.float32,
+                     push_cap: wp.float32):
+    """One thread per muscle vertex: average the push out of every overlapping
+    neighbour muscle it is inside, and apply it (clamped to ``push_cap``).
+
+    The owning thread accumulates locally over its neighbour loop, so the jacobi
+    average needs no atomics and cannot race even when the vertex sits inside
+    several muscles.  ``x`` is read once, so within a launch the push is jacobi.
+
+    ``push_cap`` limits the per-pass displacement (0 = unlimited).  A deep vertex
+    is eased out a little each pass and re-queried, following the real exit path
+    instead of teleporting straight to the nearest surface — which, in densely
+    packed muscle, overshoots THROUGH the neighbour behind it and deepens the
+    penetration.  Use several ``iters`` (and a small cap) to clear deep overlap."""
+    i = wp.tid()
+    m = vert_muscle[i]
+    if m < 0 or inv_mass[i] == 0.0:
+        return
+    x = pos[i]
+    acc = wp.vec3(0.0, 0.0, 0.0)
+    c = int(0)
+    row = m * nm
+    for j in range(nm):
+        if adj[row + j] != 0:
+            d, hit = _push_against(mesh_ids[j], x, max_dist, offset)
+            acc += d
+            c += hit
+    if c > 0:
+        step = acc / wp.float32(c)
+        if push_cap > 0.0:
+            mag = wp.length(step)
+            if mag > push_cap:
+                step = step * (push_cap / mag)
+        pos[i] = x + step
+
+
+@wp.kernel
+def _count_inside_adj_kernel(pos: wp.array(dtype=wp.vec3),
+                             vert_muscle: wp.array(dtype=wp.int32),
+                             mesh_ids: wp.array(dtype=wp.uint64),
+                             adj: wp.array(dtype=wp.int32), nm: wp.int32,
+                             max_dist: wp.float32,
+                             count: wp.array(dtype=wp.int32)):
+    """Penetration METER: count this vertex once per neighbour muscle it is
+    inside (matches the directional inside-vertex tally)."""
+    i = wp.tid()
+    m = vert_muscle[i]
+    if m < 0:
+        return
+    x = pos[i]
+    row = m * nm
+    for j in range(nm):
+        if adj[row + j] != 0:
+            q = wp.mesh_query_point_sign_normal(mesh_ids[j], x, max_dist)
+            if q.result:
+                cp = wp.mesh_eval_position(mesh_ids[j], q.face, q.u, q.v)
+                if wp.length(x - cp) * q.sign < 0.0:
+                    wp.atomic_add(count, 0, 1)
+
+
+@wp.kernel
+def _depth_inside_adj_kernel(pos: wp.array(dtype=wp.vec3),
+                             vert_muscle: wp.array(dtype=wp.int32),
+                             mesh_ids: wp.array(dtype=wp.uint64),
+                             adj: wp.array(dtype=wp.int32), nm: wp.int32,
+                             max_dist: wp.float32,
+                             depth: wp.array(dtype=wp.float32)):
+    """Penetration-DEPTH meter: per vertex, the deepest it sits inside any
+    overlapping neighbour muscle (0 if outside all of them), metres."""
+    i = wp.tid()
+    depth[i] = 0.0
+    m = vert_muscle[i]
+    if m < 0:
+        return
+    x = pos[i]
+    row = m * nm
+    d = float(0.0)
+    for j in range(nm):
+        if adj[row + j] != 0:
+            q = wp.mesh_query_point_sign_normal(mesh_ids[j], x, max_dist)
+            if q.result:
+                cp = wp.mesh_eval_position(mesh_ids[j], q.face, q.u, q.v)
+                sd = wp.length(x - cp) * q.sign      # < 0 inside
+                if -sd > d:
+                    d = -sd
+    depth[i] = d
 
 
 class InterMuscleCollider:
@@ -103,17 +214,27 @@ class InterMuscleCollider:
 
     Each muscle's ``wp.Mesh`` shares ``sim.pos`` as its points array (no copy),
     so a single ``refit()`` per muscle per call tracks the deforming muscle; only
-    the per-muscle BVHs are extra memory.
+    the per-muscle BVHs are extra memory.  The broadphase and resolve are GPU
+    kernels driven by a per-vertex ``vert_muscle`` map and a dense muscle
+    adjacency matrix — no host sync per frame.
     """
 
     def __init__(self, sim, rest_path: str, *, max_dist: float = 0.02,
                  contact_offset: float = 1e-4, device=None,
-                 flip_winding: bool = True, iters: int = 1):
+                 flip_winding: bool = True, iters: int = 1, substep_stride: int = 2,
+                 push_cap: float = 0.0):
         self.sim = sim
         self.device = device or sim._device
         self.max_dist = float(max_dist)
         self.contact_offset = float(contact_offset)
         self.iters = max(1, int(iters))
+        self.push_cap = float(push_cap)
+        # Run the refit+push only every Nth substep (1 = every substep).  The
+        # ~10 per-frame refits are the cost; raising this trades resolution depth
+        # for speed.  The LAST substep always runs so the frame ends resolved.
+        self.substep_stride = max(1, int(substep_stride))
+        self._sub = 0
+        self._nsub = int(getattr(sim, "nsubsteps", 1))
 
         gf = GeoFile(rest_path)
         tets = np.asarray(gf.tet_indices, dtype=np.int32)        # (NT, 4)
@@ -123,122 +244,133 @@ class InterMuscleCollider:
         self.names = gf.prim_attr_strings("muscle_id")
         self.n_muscle = len(self.names)
         self.nvm = int(np.asarray(gf.positions).shape[0])        # muscle vert count
+        nv = sim.pos.shape[0]
 
-        # Per-muscle surface meshes + vertex index lists.  Each muscle's surface
-        # is extracted from its OWN tet subset, so two touching muscles each own
-        # the shared interface (both treat it as a closed boundary).
+        # Per-vertex muscle id (-1 for non-muscle verts, e.g. fascia).  A vertex
+        # shared by several muscles' tets gets the last one — those interface
+        # verts are rare and sit on the boundary either way.
+        vert_muscle = np.full(nv, -1, dtype=np.int32)
+        for k in range(4):
+            vert_muscle[tets[:, k]] = mid
+        self._vert_muscle = wp.array(vert_muscle, dtype=wp.int32, device=self.device)
+
+        # Per-muscle surface meshes.  Each muscle's surface is extracted from its
+        # OWN tet subset, so two touching muscles each own the shared interface
+        # (both treat it as a closed boundary).
         self._meshes = []
-        self._vidx = []        # wp.array(int32) of this muscle's vertices
-        self._vidx_np = []     # host copy for the AABB broadphase
         for m in range(self.n_muscle):
             mtets = tets[mid == m]
             if mtets.shape[0] == 0:
-                self._meshes.append(None); self._vidx.append(None)
-                self._vidx_np.append(np.empty(0, np.int32)); continue
+                self._meshes.append(None); continue
             surf = _vectorized_surface_tris(mtets).astype(np.int32)   # (k, 3)
             if flip_winding:
                 surf = np.ascontiguousarray(surf[:, [0, 2, 1]])
-            mesh = wp.Mesh(points=sim.pos,                  # SHARED with the sim
-                           indices=wp.array(surf.reshape(-1), dtype=wp.int32,
-                                            device=self.device))
-            self._meshes.append(mesh)
-            verts = np.unique(mtets.reshape(-1)).astype(np.int32)
-            self._vidx.append(wp.array(verts, dtype=wp.int32, device=self.device))
-            self._vidx_np.append(verts)
+            self._meshes.append(wp.Mesh(
+                points=sim.pos,                          # SHARED with the sim
+                indices=wp.array(surf.reshape(-1), dtype=wp.int32,
+                                 device=self.device)))
 
-        # Per-muscle mesh.id, captured once (ids are stable across refit).
-        self._mesh_ids = np.array(
-            [m.id if m is not None else 0 for m in self._meshes], dtype=np.uint64)
+        # mesh.id per muscle, on the GPU (ids are stable across refit; 0 for an
+        # empty muscle, which the adjacency matrix never references).
+        ids = np.array([m.id if m is not None else 0 for m in self._meshes],
+                       dtype=np.uint64)
+        self._mesh_ids = wp.array(ids, dtype=wp.uint64, device=self.device)
 
         self.inv_mass = sim.inv_mass
-        nv = sim.pos.shape[0]
-        self._dP = wp.zeros(nv, dtype=wp.vec3, device=self.device)
-        self._cnt = wp.zeros(nv, dtype=wp.int32, device=self.device)
+        nm = self.n_muscle
+        self._lo = wp.zeros(nm * 3, dtype=wp.float32, device=self.device)
+        self._hi = wp.zeros(nm * 3, dtype=wp.float32, device=self.device)
+        self._adj = wp.zeros(nm * nm, dtype=wp.int32, device=self.device)
+        self._active = wp.zeros(nm, dtype=wp.int32, device=self.device)
+        self._n_pairs = wp.zeros(1, dtype=wp.int32, device=self.device)
         self._count = wp.zeros(1, dtype=wp.int32, device=self.device)
+        self._depth = wp.zeros(self.nvm, dtype=wp.float32, device=self.device)
         self.last_pairs = 0
-        # Fused work list (vertex, target-mesh), rebuilt once per frame.
-        self._work_vidx = None
-        self._work_mesh = None
+        self.last_active = 0
         self.refresh()
 
-    def _broadphase(self, pos_np: np.ndarray, margin: float):
-        """Per-muscle AABB overlap → list of (i, j) muscle pairs (i < j)."""
-        lo = np.full((self.n_muscle, 3), np.inf, np.float32)
-        hi = np.full((self.n_muscle, 3), -np.inf, np.float32)
-        for m, v in enumerate(self._vidx_np):
-            if v.size:
-                lo[m] = pos_np[v].min(0); hi[m] = pos_np[v].max(0)
-        lo -= margin; hi += margin
-        pairs = []
-        for i in range(self.n_muscle):
-            if not np.isfinite(lo[i]).all():
-                continue
-            # vectorised overlap of box i against all j > i
-            j = np.arange(i + 1, self.n_muscle)
-            ov = (np.all(lo[i] <= hi[j], axis=1) & np.all(hi[i] >= lo[j], axis=1)
-                  & np.isfinite(lo[j]).all(axis=1))
-            for jj in j[ov]:
-                pairs.append((i, int(jj)))
-        return pairs
-
     def refresh(self):
-        """Rebuild the broadphase work list — call once per frame.
-
-        Muscles deform little within a frame's substeps, so the overlapping-pair
-        set and the candidate verts are reused across the substep pushes (the SDF
-        query itself still runs against the refit surface every substep).  One
-        host sync (``pos.numpy()``) per frame instead of per substep.
-        """
-        pos_np = self.sim.pos.numpy()
-        pairs = self._broadphase(pos_np, self.max_dist + self.contact_offset)
-        self.last_pairs = len(pairs)
-        vparts, mparts = [], []
-        for i, j in pairs:
-            vparts.append(self._vidx_np[i]); mparts.append(np.full(
-                self._vidx_np[i].size, self._mesh_ids[j], dtype=np.uint64))
-            vparts.append(self._vidx_np[j]); mparts.append(np.full(
-                self._vidx_np[j].size, self._mesh_ids[i], dtype=np.uint64))
-        if vparts:
-            self._work_vidx = wp.array(np.concatenate(vparts), dtype=wp.int32,
-                                       device=self.device)
-            self._work_mesh = wp.array(np.concatenate(mparts), dtype=wp.uint64,
-                                       device=self.device)
-        else:
-            self._work_vidx = self._work_mesh = None
+        """Recompute the muscle adjacency from the current positions — call once
+        per frame.  The overlapping-pair set is reused across the substep pushes;
+        the surface itself is still refit every substep (intra-frame muscle
+        deformation is large, so a frame-start surface is too stale to push
+        against).  Reads back the 199-int ``active`` mask once so the per-substep
+        refit can skip idle muscles (never queried this frame)."""
+        nm = self.n_muscle
+        wp.launch(_reset_aabb_kernel, dim=nm * 3, inputs=[self._lo, self._hi],
+                  device=self.device)
+        wp.launch(_muscle_aabb_kernel, dim=self.sim.pos.shape[0],
+                  inputs=[self.sim.pos, self._vert_muscle, self._lo, self._hi],
+                  device=self.device)
+        self._adj.zero_()
+        self._active.zero_()
+        self._n_pairs.zero_()
+        margin = self.max_dist + self.contact_offset
+        wp.launch(_adjacency_kernel, dim=nm * nm,
+                  inputs=[self._lo, self._hi, wp.float32(margin), wp.int32(nm),
+                          self._adj, self._active, self._n_pairs],
+                  device=self.device)
+        # Cache the active meshes (one host sync/frame) so the per-substep refit
+        # touches only muscles that overlap something this frame.
+        act = self._active.numpy()
+        self.last_active = int(act.sum())
+        self._active_meshes = [self._meshes[m] for m in range(nm)
+                               if act[m] and self._meshes[m] is not None]
+        self._sub = 0
 
     def __call__(self):
-        for mesh in self._meshes:
-            if mesh is not None:
-                mesh.refit()
-        if self._work_vidx is not None:
-            # K jacobi passes: accumulate averaged per-target pushes, then apply.
-            # A vertex inside several muscles converges to a compromise position
-            # over the passes (in-place gauss-seidel raced and diverged at K>1).
-            # Work list reused; only the SDF queries re-run against the new pos.
-            for _ in range(self.iters):
-                wp.launch(_accum_worklist_kernel, dim=self._work_vidx.shape[0],
-                          inputs=[self._work_vidx, self._work_mesh, self.sim.pos,
-                                  self.inv_mass, wp.float32(self.max_dist),
-                                  wp.float32(self.contact_offset),
-                                  self._dP, self._cnt], device=self.device)
-                wp.launch(_apply_accum_kernel, dim=self._dP.shape[0],
-                          inputs=[self.sim.pos, self._dP, self._cnt],
-                          device=self.device)
+        # Run on every Nth substep AND always on the last one, so the frame ends
+        # fully resolved (skipping the final substep leaves the muscle wherever
+        # the solver moved it — measured as no relief).
+        run = (self._sub % self.substep_stride == 0) or (self._sub == self._nsub - 1)
+        self._sub += 1
+        if not run:
+            return
+        for mesh in self._active_meshes:    # per-substep refit, active only
+            mesh.refit()
+        for _ in range(self.iters):
+            wp.launch(_push_adj_kernel, dim=self.nvm,
+                      inputs=[self.sim.pos, self._vert_muscle, self.inv_mass,
+                              self._mesh_ids, self._adj, wp.int32(self.n_muscle),
+                              wp.float32(self.max_dist),
+                              wp.float32(self.contact_offset),
+                              wp.float32(self.push_cap)],
+                      device=self.device)
+
+    def pair_count(self) -> int:
+        """Overlapping muscle pairs from the last ``refresh`` (host sync)."""
+        self.last_pairs = int(self._n_pairs.numpy()[0])
+        return self.last_pairs
 
     def inside_count(self) -> int:
-        """Total inter-muscle inside-vertices over all overlapping pairs (a
-        penetration METER; counts each direction independently)."""
-        for mesh in self._meshes:
-            if mesh is not None:
-                mesh.refit()
-        pos_np = self.sim.pos.numpy()
-        pairs = self._broadphase(pos_np, self.max_dist + self.contact_offset)
+        """Total inter-muscle inside-vertices (a penetration METER; counts each
+        direction independently).  Refreshes the adjacency + refits the active
+        muscles first; the meter only queries active muscles' surfaces."""
+        self.refresh()
+        for mesh in self._active_meshes:
+            mesh.refit()
         self._count.zero_()
-        for i, j in pairs:
-            for vidx, mesh in ((self._vidx[i], self._meshes[j]),
-                               (self._vidx[j], self._meshes[i])):
-                wp.launch(_count_inside_indexed_kernel, dim=vidx.shape[0],
-                          inputs=[vidx, self.sim.pos, mesh.id,
-                                  wp.float32(self.max_dist), self._count],
-                          device=self.device)
+        wp.launch(_count_inside_adj_kernel, dim=self.nvm,
+                  inputs=[self.sim.pos, self._vert_muscle, self._mesh_ids,
+                          self._adj, wp.int32(self.n_muscle),
+                          wp.float32(self.max_dist), self._count],
+                  device=self.device)
+        self.pair_count()
         return int(self._count.numpy()[0])
+
+    def inside_depth(self, meter_max_dist: float = None) -> np.ndarray:
+        """Per-muscle-vertex deepest inter-muscle penetration depth (metres, 0 if
+        outside all neighbours).  ``meter_max_dist`` overrides the search radius
+        for MEASUREMENT only (use a large value so deep penetration is not capped
+        at the resolver's ``max_dist``).  Refreshes + refits active muscles."""
+        md = self.max_dist if meter_max_dist is None else float(meter_max_dist)
+        self.refresh()
+        for mesh in self._active_meshes:
+            mesh.refit()
+        wp.launch(_depth_inside_adj_kernel, dim=self.nvm,
+                  inputs=[self.sim.pos, self._vert_muscle, self._mesh_ids,
+                          self._adj, wp.int32(self.n_muscle),
+                          wp.float32(md), self._depth],
+                  device=self.device)
+        self.pair_count()
+        return self._depth.numpy()
