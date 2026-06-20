@@ -19,8 +19,6 @@ so no `activate` and no `PYTHONPATH` are needed (the `example` package is on
 `src/`, registered in `pyproject.toml`). Every command below is `uv run -m
 example.<name>`.
 
-> Not using uv? Prefix instead: `PYTHONPATH=src .venv/bin/python -m example.<name>`.
-
 All examples live in `src/example/` and default to writing a **single USD file
 with animation** under `output/`.
 
