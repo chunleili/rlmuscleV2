@@ -117,26 +117,23 @@ def _set_sum_is_collide(stage, prim_path, total, time):
     attr.Set(int(total), time)
 
 
-def _bake_static_primvars(stage, prim_path, sim):
+def _bake_static_primvars(stage, prim_path, sim, used):
     """Write the time-INVARIANT per-vertex muscle attributes (materialW fiber
-    direction, tendonmask, optional Cd) as default-timecode USD primvars.
+    direction, tendonmask, optional Cd, muscle_id name) as default-timecode USD
+    primvars.
 
     These never change across the sequence, so they are written once at the
-    default timecode (not time-sampled) — a few MB total. ``materialW`` lands as
-    a Float3Array, ``tendonmask`` as a FloatArray, ``Cd`` as a Color3fArray
-    named ``displayColor`` so usdview shades by it. All vertex-interpolated to
-    match the muscle mesh points (the full NV vertex set)."""
+    default timecode (not time-sampled). ``used`` is the compacted vertex index
+    set actually rendered by the muscle prim (the verts referenced by its surface
+    tris); every primvar is sliced to it so it matches the prim's point count."""
     from pxr import UsdGeom, Sdf, Vt, Usd
     prim = stage.GetPrimAtPath(prim_path)
     api = UsdGeom.PrimvarsAPI(prim)
     default = Usd.TimeCode.Default()
-    # The muscle prim renders ALL particles (sim.NV) — under a fascia merge that
-    # is muscle + fascia verts, while these attrs cover only the muscle verts.
-    # Vertex primvars must match the point count, so pad the tail (fascia verts,
-    # unreferenced by the muscle surface tris) with zeros.
     nv = int(sim.NV)
 
-    def _pad(arr):
+    def _full(arr):
+        """Pad a per-muscle-vertex array up to the full NV vertex set."""
         if arr.shape[0] == nv:
             return arr
         out = np.zeros((nv,) + arr.shape[1:], dtype=np.float32)
@@ -146,14 +143,14 @@ def _bake_static_primvars(stage, prim_path, sim):
     def _vec3(name, arr):
         pv = api.GetPrimvar(name) or api.CreatePrimvar(
             name, Sdf.ValueTypeNames.Float3Array, UsdGeom.Tokens.vertex)
-        pv.Set(Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(_pad(arr), np.float32)),
-               default)
+        pv.Set(Vt.Vec3fArray.FromNumpy(
+            np.ascontiguousarray(_full(arr)[used], np.float32)), default)
 
     def _scalar(name, arr):
         pv = api.GetPrimvar(name) or api.CreatePrimvar(
             name, Sdf.ValueTypeNames.FloatArray, UsdGeom.Tokens.vertex)
-        pv.Set(Vt.FloatArray.FromNumpy(np.ascontiguousarray(_pad(arr), np.float32)),
-               default)
+        pv.Set(Vt.FloatArray.FromNumpy(
+            np.ascontiguousarray(_full(arr)[used], np.float32)), default)
 
     baked = []
     if getattr(sim, "materialW_np", None) is not None:
@@ -169,7 +166,7 @@ def _bake_static_primvars(stage, prim_path, sim):
                 "displayColor", Sdf.ValueTypeNames.Color3fArray,
                 UsdGeom.Tokens.vertex)
             pv.Set(Vt.Vec3fArray.FromNumpy(
-                np.ascontiguousarray(_pad(cd[:, :3]), np.float32)), default)
+                np.ascontiguousarray(_full(cd[:, :3])[used], np.float32)), default)
             baked.append("Cd")
     # muscle_id is a PER-TET attribute (index into muscle_id_strings); scatter it
     # to the verts of each muscle tet, then resolve to the muscle NAME. Muscles
@@ -186,7 +183,7 @@ def _bake_static_primvars(stage, prim_path, sim):
             vid[tets[:nt_m, k]] = mid
         strings = list(getattr(sim, "muscle_id_strings", []) or [])
         lut = strings + ["none"]                  # index -1 -> last entry "none"
-        idx = vid.copy()
+        idx = vid[used].copy()
         idx[idx < 0] = len(strings)
         names = [lut[i] for i in idx]
         pv = api.GetPrimvar("muscle_id") or api.CreatePrimvar(
@@ -405,6 +402,22 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
         Path(geo_out).mkdir(parents=True, exist_ok=True)
         print(f"[geo] in-place .geo (template {tpl}) -> {geo_out}/")
 
+    # Compact each prim to ONLY the verts its surface tris reference, so the USD
+    # mesh carries no orphan points (interior muscle verts, fascia verts in the
+    # muscle prim, etc). pos_np is the full NV set every frame; index it by the
+    # prim's used-vert list and remap the tris to local [0, n) indices.
+    def _compact(tris_flat, n_verts):
+        used = np.unique(tris_flat)
+        remap = np.full(n_verts, -1, dtype=np.int64)
+        remap[used] = np.arange(used.shape[0])
+        local = remap[tris_flat].astype(np.int32)
+        return used, local
+
+    muscle_used, muscle_local = _compact(surf_flat, sim.NV)
+    fascia_used, fascia_local = (_compact(fascia_flat, sim.NV)
+                                 if fascia_flat is not None else (None, None))
+    bone_used, bone_local = _compact(collider.tris_flat, collider.n_bone_verts)
+
     t0 = time.perf_counter()
     for frame in range(sim.start_frame, sim.end_frame + 1):
         if not static_bone:
@@ -434,19 +447,22 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
             # indices are already written once by warp; points must be per-frame.)
             first = frame == sim.start_frame
             muscle_path = inner.render_mesh(
-                name="muscle", points=pos_np, indices=surf_flat,
+                name="muscle", points=pos_np[muscle_used], indices=muscle_local,
                 colors=(0.8, 0.3, 0.25) if first else None)
             if not no_collide_primvars:
-                _set_is_collide_primvar(inner.stage, muscle_path, is_collide, inner.time)
-                _set_pen_depth_primvar(inner.stage, muscle_path, depth, inner.time)
+                _set_is_collide_primvar(inner.stage, muscle_path,
+                                        is_collide[muscle_used], inner.time)
+                _set_pen_depth_primvar(inner.stage, muscle_path,
+                                       depth[muscle_used], inner.time)
             _set_sum_is_collide(inner.stage, muscle_path, int(is_collide.sum()), inner.time)
             if first:
-                _bake_static_primvars(inner.stage, muscle_path, sim)
+                _bake_static_primvars(inner.stage, muscle_path, sim, muscle_used)
             if fascia_flat is not None:
-                inner.render_mesh(name="fascia", points=pos_np, indices=fascia_flat,
+                inner.render_mesh(name="fascia", points=pos_np[fascia_used],
+                                  indices=fascia_local,
                                   colors=(0.55, 0.75, 0.9) if first else None)
-            inner.render_mesh(name="bones", points=collider._cur_verts,
-                              indices=collider.tris_flat,
+            inner.render_mesh(name="bones", points=collider._cur_verts[bone_used],
+                              indices=bone_local,
                               colors=(0.9, 0.88, 0.8) if first else None)
             inner.end_frame()
 
