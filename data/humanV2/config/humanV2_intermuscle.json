@@ -54,8 +54,7 @@
             "offset": 1e-4,
             "iters": 4,
             "stride": 1,
-            "push_cap": 0.003,
-            "refit_stride": 5
+            "push_cap": 0.003
         }
     }
 }
