@@ -1,6 +1,6 @@
 {
     "start_frame": 1,
-    "end_frame": 50,
+    "end_frame": 200,
     "geo_dir": "data/humanV2/model",
     "cons_dir": "data/humanV2/model/cons",
     "rest_path": "data/humanV2/model/muscle/restpos.geo",
@@ -33,7 +33,7 @@
     "nsubsteps": 10,
 
     "demo": {
-        "out": "output/humanV2_intermuscle.usd",
+        "out": "output/humanV2/humanV2_intermuscle.usd",
         "bone_dir": "data/humanV2/model/bone",
         "device": "cuda:0",
         "no_export": false,
