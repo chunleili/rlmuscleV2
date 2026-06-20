@@ -24,7 +24,7 @@ consumed by ``OneWaySim``):
       "device": "cuda:0",
       "no_export": false,
       "geo_out": null,
-      "no_collide_primvars": false,
+      "no_collide_primvars": true,
       "activate": null,                      # muscle-name substring; needs use_fiber
       "collision": {
         "enabled": true,
@@ -363,7 +363,7 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
     static_bone = bool(coll.get("static_bone", False))
     collide_eps = float(coll.get("collide_eps", 1e-6))
     no_export = bool(demo.get("no_export", False))
-    no_collide_primvars = bool(demo.get("no_collide_primvars", False))
+    no_collide_primvars = bool(demo.get("no_collide_primvars", True))
     out = demo.get("out", "output/humanV2.usd")
     geo_out = demo.get("geo_out")
 
