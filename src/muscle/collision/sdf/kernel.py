@@ -126,7 +126,8 @@ def solve_mesh_contact_pos_kernel(
     mesh: wp.uint64,                 # wp.Mesh.id of the rigid collider (e.g. bone)
     max_dist: wp.float32,            # closest-point search radius
     contact_offset: wp.float32,      # keep verts this far outside the surface
-    max_push: wp.float32,            # reject contacts deeper than this (spurious)
+    max_push: wp.float32,            # >0: reject contacts deeper than this
+                                     #     (spurious sign-flips); <=0: disabled
 ):
     """Position-only push of verts out of a rigid TRIANGLE-MESH collider.
 
@@ -142,10 +143,13 @@ def solve_mesh_contact_pos_kernel(
     bone features / sharp edges (the reason the bone winding is pre-flipped). A
     spurious sign flip reports a vert that is actually just OUTSIDE as deeply
     INSIDE relative to a far face, and the raw push ``x - n*err`` then catapults
-    it cm-scale onto that face (single-vert spikes). Real per-substep penetration
-    is sub-cm, so a contact reporting depth > ``max_push`` is rejected as a bad
-    query. The degenerate ``|delta|≈0`` case (vert on the surface → unstable
-    ``normalize``) is also skipped.
+    it cm-scale onto that face (single-vert spikes). With ``max_push > 0`` a
+    contact reporting depth > ``max_push`` is rejected as a bad query (real
+    per-substep penetration is sub-cm). ``max_push <= 0`` DISABLES that guard —
+    every inside vert is pushed out regardless of depth, which resolves genuine
+    deep penetration (e.g. a non-collision-free target pose) at the cost of
+    re-admitting the sign-flip spikes. The degenerate ``|delta|≈0`` case (vert on
+    the surface → unstable ``normalize``) is always skipped.
     """
     i = wp.tid()
     if inv_mass[i] == 0.0:
@@ -160,7 +164,8 @@ def solve_mesh_contact_pos_kernel(
             return
         dist = dlen * query.sign                   # signed: < 0 inside the mesh
         err = dist - contact_offset
-        if err < 0.0 and -err <= max_push:         # reject spurious deep (sign-flip)
+        # max_push <= 0 disables the deep-contact reject (push every inside vert).
+        if err < 0.0 and (max_push <= 0.0 or -err <= max_push):
             n = (delta / dlen) * query.sign        # outward surface normal
             pos[i] = x - n * err                    # push out to offset surface
 

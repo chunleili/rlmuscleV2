@@ -54,10 +54,12 @@ from muscle.util.geo_io import GeoFile, GeoWriter, read_geo_attr_cached
 
 
 @wp.kernel
-def _count_inside_kernel(pos: wp.array(dtype=wp.vec3),
+def _count_inside_kernel(pos: wp.array(dtype=wp.vec3), vmask: wp.array(dtype=wp.float32),
                          mesh: wp.uint64, max_dist: wp.float32,
                          count: wp.array(dtype=wp.int32)):
     i = wp.tid()
+    if vmask[i] == 0.0:                           # excluded (fascia) — not a meter vert
+        return
     q = wp.mesh_query_point_sign_normal(mesh, pos[i], max_dist)
     if q.result:
         cp = wp.mesh_eval_position(mesh, q.face, q.u, q.v)
@@ -66,12 +68,19 @@ def _count_inside_kernel(pos: wp.array(dtype=wp.vec3),
 
 
 @wp.kernel
-def _mark_inside_kernel(pos: wp.array(dtype=wp.vec3),
+def _mark_inside_kernel(pos: wp.array(dtype=wp.vec3), vmask: wp.array(dtype=wp.float32),
                         mesh: wp.uint64, max_dist: wp.float32,
                         depth: wp.array(dtype=wp.float32)):
-    """Per-vertex penetration depth (>0 inside the bone, 0 outside)."""
+    """Per-vertex muscle-bone penetration depth (>0 inside the bone, 0 outside).
+
+    ``vmask`` excludes verts that must not contribute to the meter (fascia): the
+    outer fascia shell never sits inside bone, so any "inside" it reports is a
+    ``mesh_query_point_sign_normal`` sign-flip false positive. Excluding it here
+    keeps the muscle-bone count honest — same set the SDF resolver acts on."""
     i = wp.tid()
     depth[i] = 0.0
+    if vmask[i] == 0.0:
+        return
     q = wp.mesh_query_point_sign_normal(mesh, pos[i], max_dist)
     if q.result:
         cp = wp.mesh_eval_position(mesh, q.face, q.u, q.v)
@@ -80,40 +89,48 @@ def _mark_inside_kernel(pos: wp.array(dtype=wp.vec3),
             depth[i] = -d                         # positive penetration depth
 
 
-def _set_is_collide_primvar(stage, prim_path, flag01, time):
-    """Write a per-vertex int primvar ``is_collide`` (0/1) on a mesh prim.
+def _set_is_collide_primvar(stage, prim_path, flag01, time,
+                            name="is_collide_muscle_bone"):
+    """Write a per-vertex int primvar (0/1) on a mesh prim.
 
     Lets usdview select / colour the penetrating muscle verts directly, even
     when they are hidden inside the bone mesh. ``flag01`` is one int per point
     (vertex interpolation); time-sampled to match the mesh's animation.
+    ``name`` separates the kinds of penetration — ``is_collide_muscle_bone`` is
+    muscle-vs-bone, ``is_collide_muscle_muscle`` is muscle-vs-muscle (self)
+    penetration.
     """
     from pxr import UsdGeom, Sdf, Vt
     prim = stage.GetPrimAtPath(prim_path)
-    pv = UsdGeom.PrimvarsAPI(prim).GetPrimvar("is_collide")
+    pv = UsdGeom.PrimvarsAPI(prim).GetPrimvar(name)
     if not pv:
         pv = UsdGeom.PrimvarsAPI(prim).CreatePrimvar(
-            "is_collide", Sdf.ValueTypeNames.IntArray, UsdGeom.Tokens.vertex)
+            name, Sdf.ValueTypeNames.IntArray, UsdGeom.Tokens.vertex)
     pv.Set(Vt.IntArray.FromNumpy(flag01.astype(np.int32)), time)
 
 
-def _set_pen_depth_primvar(stage, prim_path, depth, time):
-    """Write a per-vertex float primvar ``pen_depth`` (metres) on a mesh prim."""
+def _set_pen_depth_primvar(stage, prim_path, depth, time,
+                           name="pen_depth_muscle_bone"):
+    """Write a per-vertex float primvar (metres) on a mesh prim. ``name`` is
+    ``pen_depth_muscle_bone`` or ``pen_depth_muscle_muscle``."""
     from pxr import UsdGeom, Sdf, Vt
     prim = stage.GetPrimAtPath(prim_path)
-    pv = UsdGeom.PrimvarsAPI(prim).GetPrimvar("pen_depth")
+    pv = UsdGeom.PrimvarsAPI(prim).GetPrimvar(name)
     if not pv:
         pv = UsdGeom.PrimvarsAPI(prim).CreatePrimvar(
-            "pen_depth", Sdf.ValueTypeNames.FloatArray, UsdGeom.Tokens.vertex)
+            name, Sdf.ValueTypeNames.FloatArray, UsdGeom.Tokens.vertex)
     pv.Set(Vt.FloatArray.FromNumpy(depth.astype(np.float32)), time)
 
 
-def _set_sum_is_collide(stage, prim_path, total, time):
-    """Write a per-frame scalar custom attr ``sum_is_collide`` on a prim."""
+def _set_sum_is_collide(stage, prim_path, total, time,
+                        name="sum_is_collide_muscle_bone"):
+    """Write a per-frame scalar custom int attr on a prim. ``name`` is
+    ``sum_is_collide_muscle_bone`` or ``sum_is_collide_muscle_muscle``."""
     from pxr import Sdf
     prim = stage.GetPrimAtPath(prim_path)
-    attr = prim.GetAttribute("sum_is_collide")
+    attr = prim.GetAttribute(name)
     if not attr:
-        attr = prim.CreateAttribute("sum_is_collide", Sdf.ValueTypeNames.Int)
+        attr = prim.CreateAttribute(name, Sdf.ValueTypeNames.Int)
     attr.Set(int(total), time)
 
 
@@ -208,7 +225,7 @@ class AnimatedBoneMeshCollider:
 
     def __init__(self, sim: OneWaySim, bone_dir: str,
                  max_dist: float = 0.2, contact_offset: float = 0.0,
-                 max_push: float = 0.005):
+                 max_push: float = -1.0):     # <=0 = no deep-contact reject
         self.sim = sim
         self.device = sim._device
         self.bone_dir = Path(bone_dir)
@@ -242,6 +259,15 @@ class AnimatedBoneMeshCollider:
             coll_inv_mass_np[nvm:] = 0.0
         self.coll_inv_mass = wp.array(coll_inv_mass_np, dtype=wp.float32,
                                       device=self.device)
+        # Meter mask: 1 for muscle verts (< nvm), 0 for fascia. The muscle-bone
+        # penetration METER must measure the same set the resolver acts on —
+        # fascia's "inside" is a sign-flip false positive (see above), so it is
+        # excluded from is_collide_muscle_bone / pen_depth_muscle_bone too. (This
+        # is independent of inv_mass, so pinned muscle verts still get measured.)
+        meter_np = np.ones(int(sim.NV), dtype=np.float32)
+        if nvm < sim.NV:
+            meter_np[nvm:] = 0.0
+        self.meter_mask = wp.array(meter_np, dtype=wp.float32, device=self.device)
         self._count = wp.zeros(1, dtype=wp.int32, device=self.device)
         self._depth = wp.zeros(sim.NV, dtype=wp.float32, device=self.device)
         self._cur_verts = verts0  # for viz / dump
@@ -278,7 +304,7 @@ class AnimatedBoneMeshCollider:
     def inside_count(self) -> int:
         self._count.zero_()
         wp.launch(_count_inside_kernel, dim=self.sim.NV,
-                  inputs=[self.sim.pos, self.mesh.id,
+                  inputs=[self.sim.pos, self.meter_mask, self.mesh.id,
                           wp.float32(self.max_dist), self._count],
                   device=self.device)
         return int(self._count.numpy()[0])
@@ -286,7 +312,7 @@ class AnimatedBoneMeshCollider:
     def inside_depth(self) -> np.ndarray:
         """Per-muscle-vertex penetration depth (0 outside, >0 inside, metres)."""
         wp.launch(_mark_inside_kernel, dim=self.sim.NV,
-                  inputs=[self.sim.pos, self.mesh.id,
+                  inputs=[self.sim.pos, self.meter_mask, self.mesh.id,
                           wp.float32(self.max_dist), self._depth],
                   device=self.device)
         return self._depth.numpy()
@@ -372,11 +398,20 @@ def build_humanV2_sim_from_args(args):
 
 
 def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
-                     *, pre_step=None):
-    """Per-frame step + USD/geo export, with ``collider`` as the penetration
-    MEASUREMENT instrument (bone mesh + inside_depth) regardless of who resolves
-    contact.  ``pre_step(frame)`` runs after the bones are positioned but before
-    the solve — the self-collision modes use it to refresh their colliders.
+                     *, pre_step=None, mm_meter=None):
+    """Per-frame step + USD/geo export, with ``collider`` as the muscle-BONE
+    penetration MEASUREMENT instrument (bone mesh + inside_depth) regardless of
+    who resolves contact.  ``pre_step(frame)`` runs after the bones are
+    positioned but before the solve — the self-collision modes use it to refresh
+    their colliders.
+
+    ``mm_meter()`` is the optional muscle-vs-muscle (self) penetration meter: a
+    callable returning a per-muscle-vertex depth array (metres, 0 outside). It
+    is reported SEPARATELY from the bone meter — bone penetration is
+    ``is_collide_muscle_bone`` / ``pen_depth_muscle_bone``, self penetration is
+    ``is_collide_muscle_muscle`` / ``pen_depth_muscle_muscle``. Splitting them
+    keeps the muscle-bone count from being inflated by the (different,
+    deformable-surface) muscle-muscle overlaps.
     """
     coll = demo.get("collision", {})
     static_bone = bool(coll.get("static_bone", False))
@@ -433,7 +468,17 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
         # Threshold at collide_eps, not >0: after SDF projection verts sit ON
         # the surface (sub-micron inside per the signed test) — that is resolved,
         # not a collision. eps filters that touch-noise out of the count.
-        is_collide = (depth > collide_eps).astype(np.int32)  # per-vertex 0/1
+        is_collide = (depth > collide_eps).astype(np.int32)  # muscle-BONE 0/1
+        # Muscle-vs-muscle (self) penetration is a SEPARATE meter — never folded
+        # into the bone count above. Its depth array spans the muscle verts only
+        # (length nvm); pad to NV so the per-prim slicing below matches `depth`.
+        depth_mm = None
+        if mm_meter is not None:
+            dmm = mm_meter()
+            depth_mm = np.zeros(sim.NV, dtype=np.float32)
+            depth_mm[:dmm.shape[0]] = dmm
+        is_collide_mm = (depth_mm > collide_eps).astype(np.int32) \
+            if depth_mm is not None else None
 
         if renderer is not None:
             pos_np = sim.positions_np()
@@ -451,10 +496,24 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
                 colors=(0.8, 0.3, 0.25) if first else None)
             if not no_collide_primvars:
                 _set_is_collide_primvar(inner.stage, muscle_path,
-                                        is_collide[muscle_used], inner.time)
+                                        is_collide[muscle_used], inner.time,
+                                        name="is_collide_muscle_bone")
                 _set_pen_depth_primvar(inner.stage, muscle_path,
-                                       depth[muscle_used], inner.time)
-            _set_sum_is_collide(inner.stage, muscle_path, int(is_collide.sum()), inner.time)
+                                       depth[muscle_used], inner.time,
+                                       name="pen_depth_muscle_bone")
+                if is_collide_mm is not None:
+                    _set_is_collide_primvar(inner.stage, muscle_path,
+                                            is_collide_mm[muscle_used], inner.time,
+                                            name="is_collide_muscle_muscle")
+                    _set_pen_depth_primvar(inner.stage, muscle_path,
+                                           depth_mm[muscle_used], inner.time,
+                                           name="pen_depth_muscle_muscle")
+            _set_sum_is_collide(inner.stage, muscle_path, int(is_collide.sum()),
+                                inner.time, name="sum_is_collide_muscle_bone")
+            if is_collide_mm is not None:
+                _set_sum_is_collide(inner.stage, muscle_path,
+                                    int(is_collide_mm.sum()), inner.time,
+                                    name="sum_is_collide_muscle_muscle")
             if first:
                 _bake_static_primvars(inner.stage, muscle_path, sim, muscle_used)
             if fascia_flat is not None:
@@ -471,9 +530,12 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
                                  pos_np, is_collide, depth)
         if frame % 5 == 0 or frame == sim.end_frame:
             elapsed = time.perf_counter() - t0
+            mm = (f"muscle-muscle collide={int(is_collide_mm.sum())} "
+                  f"({depth_mm.max()*1000:.1f}mm)" if is_collide_mm is not None
+                  else "")
             print(f"  frame {frame:>3d}  {elapsed:6.1f}s  "
-                  f"is_collide={int(is_collide.sum())}  "
-                  f"max_depth={depth.max()*1000:.1f}mm")
+                  f"collide={int(is_collide.sum())}  "
+                  f"maxDepth={depth.max()*1000:.1f}(mm){mm}")
     if renderer is not None:
         renderer.save()
         print(f"USD saved -> {out}")
@@ -482,14 +544,16 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
 def _make_self_collider(sim, cfg, demo, surf_flat):
     """Build the optional self-collision resolver from ``demo.self_collision``.
 
-    Returns ``(post_fn_or_collider, pre_step, finalize)`` where ``post_fn`` is
-    appended to ``collision_solvers`` BEFORE the SDF bone (so the bone gets the
-    final word), ``pre_step(frame)`` refreshes the collider each frame, and
-    ``finalize()`` prints end-of-run stats. Any may be None."""
+    Returns ``(post_fn_or_collider, pre_step, finalize, mm_meter)`` where
+    ``post_fn`` is appended to ``collision_solvers`` BEFORE the SDF bone (so the
+    bone gets the final word), ``pre_step(frame)`` refreshes the collider each
+    frame, ``finalize()`` prints end-of-run stats, and ``mm_meter()`` returns a
+    per-muscle-vertex muscle-muscle penetration depth array for the USD export
+    (None if the method has no per-vertex meter). Any may be None."""
     sc = demo.get("self_collision", {}) or {}
     method = sc.get("method", "none")
     if method in (None, "none"):
-        return None, None, None
+        return None, None, None, None
 
     if method == "dcd":
         from muscle.collision.udcf.solver import (
@@ -542,7 +606,9 @@ def _make_self_collider(sim, cfg, demo, surf_flat):
 
         print(f"[self] DCD muscle self-collision (mult={sc.get('multiplier', 0.3)} "
               f"x {K} iters)")
-        return self_fn, pre_step, finalize
+        # DCD has no cheap per-vertex inside-depth meter (its contacts are
+        # tri-tri pairs, not signed point queries) — no muscle-muscle primvar.
+        return self_fn, pre_step, finalize, None
 
     if method == "intermuscle":
         from muscle.collision.closest_point.intermuscle import InterMuscleCollider
@@ -559,7 +625,13 @@ def _make_self_collider(sim, cfg, demo, surf_flat):
             print(f"inter-muscle final inside_count={inter.inside_count()}  "
                   f"pairs={inter.last_pairs}")
 
-        return inter, (lambda frame: inter.refresh()), finalize
+        # Muscle-muscle meter for the USD export: deepest inter-muscle
+        # penetration per muscle vertex. Use a generous search radius so deep
+        # overlap is measured, not capped at the resolver's max_dist.
+        meter_md = float(sc.get("meter_max_dist", max(0.05, 2.5 * float(
+            sc.get("max_dist", 0.02)))))
+        mm_meter = lambda: inter.inside_depth(meter_max_dist=meter_md)
+        return inter, (lambda frame: inter.refresh()), finalize, mm_meter
 
     raise ValueError(f"unknown self_collision.method '{method}' "
                      f"(expected none | dcd | intermuscle)")
@@ -588,12 +660,16 @@ def main(argv=None):
     collider = AnimatedBoneMeshCollider(
         sim, bone_dir,
         max_dist=float(coll.get("max_dist", 0.2)),
-        contact_offset=float(coll.get("contact_offset", 1e-5)))
+        contact_offset=float(coll.get("contact_offset", 1e-5)),
+        # <=0 (default) = push every inside vert out, however deep (resolves the
+        # non-collision-free target). >0 re-enables the sign-flip-spike reject
+        # at that depth (metres).
+        max_push=float(coll.get("max_push", -1.0)))
     if not static_bone:
         collider.preload(range(sim.start_frame, sim.end_frame + 1))
 
     # Optional self-collision resolver (post_phase, BEFORE the SDF bone).
-    self_collider, self_pre, self_finalize = _make_self_collider(
+    self_collider, self_pre, self_finalize, self_mm_meter = _make_self_collider(
         sim, cfg, demo, surf_flat)
 
     post = []
@@ -610,7 +686,7 @@ def main(argv=None):
           f"{collider.n_bone_verts} bone verts)")
 
     run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
-                     pre_step=self_pre)
+                     pre_step=self_pre, mm_meter=self_mm_meter)
     if self_finalize is not None:
         self_finalize()
 
