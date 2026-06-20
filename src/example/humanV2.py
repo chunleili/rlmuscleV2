@@ -172,10 +172,11 @@ def _bake_static_primvars(stage, prim_path, sim):
                 np.ascontiguousarray(_pad(cd[:, :3]), np.float32)), default)
             baked.append("Cd")
     # muscle_id is a PER-TET attribute (index into muscle_id_strings); scatter it
-    # to the verts of each muscle tet. Muscles are vertex-disjoint here, so every
-    # muscle vert gets a single unambiguous id; fascia / unreferenced verts stay
-    # -1. Written once as a static int vertex primvar so usdview can select /
-    # colour individual muscles.
+    # to the verts of each muscle tet, then resolve to the muscle NAME. Muscles
+    # are vertex-disjoint here, so every muscle vert gets a single unambiguous
+    # name; fascia / unreferenced verts get "none". Written once as a static
+    # per-vertex token primvar so usdview shows the human-readable muscle name
+    # directly (tokens are interned -> ~199 unique strings + per-vertex indices).
     if getattr(sim, "muscle_id_np", None) is not None:
         mid = np.asarray(sim.muscle_id_np).astype(np.int32)
         tets = sim.tet_idx.numpy()
@@ -183,9 +184,14 @@ def _bake_static_primvars(stage, prim_path, sim):
         vid = np.full(nv, -1, dtype=np.int32)
         for k in range(4):
             vid[tets[:nt_m, k]] = mid
+        strings = list(getattr(sim, "muscle_id_strings", []) or [])
+        lut = strings + ["none"]                  # index -1 -> last entry "none"
+        idx = vid.copy()
+        idx[idx < 0] = len(strings)
+        names = [lut[i] for i in idx]
         pv = api.GetPrimvar("muscle_id") or api.CreatePrimvar(
-            "muscle_id", Sdf.ValueTypeNames.IntArray, UsdGeom.Tokens.vertex)
-        pv.Set(Vt.IntArray.FromNumpy(np.ascontiguousarray(vid, np.int32)), default)
+            "muscle_id", Sdf.ValueTypeNames.TokenArray, UsdGeom.Tokens.vertex)
+        pv.Set(Vt.TokenArray(names), default)
         baked.append("muscle_id")
     if baked:
         print(f"[usd] baked static primvars: {', '.join(baked)}")
