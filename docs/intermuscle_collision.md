@@ -36,13 +36,12 @@ The key is to **decouple** the two questions:
    returns the candidate tets containing `x`; a barycentric test
    (`_tet_inside_score`) on the non-self ones decides containment. Exact and
    **unbounded** — a vertex 5 cm deep is still detected.
-2. **Push target** — the nearest point on the containing muscle `mb`'s boundary
-   surface, found by a **bounded scan over `mb`'s own boundary faces** (no
-   per-muscle `wp.Mesh`, no refit). `muscle_id` is sorted ascending, so each
-   muscle's tets — and hence its boundary faces — form a contiguous block
-   `[start, start+count)`; the scan walks only that range, AABB-culling each face
-   against `x ± surf_dist` and point-tri testing the survivors. The push moves
-   `x` to the nearest surface point plus a small outward `offset`.
+2. **Push target** — the nearest point on the containing muscle's boundary
+   surface (its own per-muscle `wp.Mesh`), found with a plain closest-point
+   query. Only the *geometric* closest point (face + bary) is used, never the
+   query's sign, so the surface search radius (`surf_dist`) can be large enough
+   to reach a deep vertex **without** re-introducing any sign-flip. The push
+   moves `x` to that surface point plus a small outward `offset`.
 
 Because the inside test no longer lies and the push can see deep penetration,
 **iterating now converges** instead of diverging.
@@ -52,22 +51,19 @@ Because the inside test no longer lies and the push can see deep penetration,
 Build (`__init__`):
 - per-tet `muscle_id` → `vert_muscle` (per-vertex), `tet_muscle` (per-tet tag).
 - global tet arrays + AABB buffers for the inside-test BVH.
-- compact **per-muscle boundary-face list** (`_bface` + `_bf_start/_bf_count`):
-  a tet face is a boundary face iff it occurs once within its muscle's tets;
-  `muscle_id` is sorted, so these come out grouped by muscle into a contiguous
-  range. ~13 % of tet faces are boundary. No `wp.Mesh`, no per-frame refit.
+- per-muscle surface `wp.Mesh` (points **shared** with `sim.pos`) for the push
+  target. Winding no longer matters (only the geometric closest point is used).
 
-Per frame (`refresh`): per-muscle AABB + adjacency → `active`/pairs report (one
-host sync). No longer gates any refit (there is none).
+Per frame (`refresh`): per-muscle AABB + adjacency → `active` mask (one host
+sync), used only to gate which surface meshes get refit.
 
 Per resolve pass (`__call__`, post_phase, self before SDF-bone, `stride`-gated,
 last substep always runs):
-1. rebuild the tet BVH + per-tet AABBs on current positions (once per call,
-   reused across `iters`).
-2. ×`iters`: `_push_kernel` (one thread per muscle vertex: `_inside_target`
-   finds the deepest non-self muscle it is inside; `_closest_surface` scans that
-   muscle's boundary-face range, AABB-culled, for the nearest surface point; push
-   to it + `offset`, clamped to `push_cap`).
+1. refit the active surface meshes.
+2. ×`iters`: rebuild the tet BVH on current positions → `_push_kernel`
+   (one thread per muscle vertex: `_inside_target` finds the deepest non-self
+   muscle it is inside; push to that muscle's nearest surface + `offset`,
+   clamped to `push_cap`).
 
 Meters: `inside_count` / `inside_depth` use the same barycentric gate, so the
 reported count and depth are honest (no false positives). `inside_depth` is the
@@ -94,49 +90,41 @@ that the per-substep hard pin re-creates faster than one resolve pass clears.
 | key | meaning | default |
 |-----|---------|---------|
 | `method` | `intermuscle` | — |
-| `max_dist` | resolver scale; `surf_dist` defaults to `max(0.05, 5·max_dist)` | 0.02 |
+| `max_dist` | resolver scale; `surf_dist` defaults to `max(0.2, 10·max_dist)` | 0.02 |
 | `offset` | outward margin past the surface (`contact_offset`) | 1e-4 |
 | `iters` | push passes per resolve (more = lower count, slower) | 4 |
 | `stride` | run every Nth substep (last always runs) | 1 |
 | `push_cap` | per-pass displacement clamp (0 = unlimited) | 0.0 |
-| `surf_dist` | boundary-face AABB-cull radius (only spans penetration depth) | — |
+| `refit_stride` | refit the surface meshes every Nth substep (1 = every push) | 1 |
+| `surf_dist` | explicit surface search radius (overrides the default) | — |
 | `meter_max_dist` | surface radius for the depth meter only | = `surf_dist` |
 
 Baseline config: `data/humanV2/config/humanV2_intermuscle.json`
-(`iters=4`, `stride=1`, `push_cap=0.003`).
+(`iters=4`, `stride=1`, `push_cap=0.003`, `refit_stride=5`).
 
-## Speed — surface search without a mesh
+## Speed
 
-The push target needs a nearest-point-on-surface query. The first version gave
-each muscle its own `wp.Mesh` (a per-muscle BVH, distance-pruned `O(log)`
-queries) but paid ~199 host-side `refit()` launches per substep. Removing the
-meshes — driving the surface search off the **one** tet structure instead, keyed
-by `muscle_id` — went through three forms (humanV2 50f, no export, RTX 4090):
+Profiled cost distribution (humanV2 50f, `iters=4`/`stride=1`, before tuning):
+`refit 50% · tet-BVH 22% · push 21% · meter 6%`.
 
-| surface-search structure | sim time | count | depth |
-|--------------------------|---------:|------:|------:|
-| per-muscle `wp.Mesh` (+199 refit/substep) | 3.3 s | 397 | 2.4 mm |
-| global tet-BVH expanding `bvh_query_aabb(x±r)` | 76 s | 290 | — |
-| scan target muscle's whole tet range, AABB-culled | 13.7 s | 302 | 1.1 mm |
-| **scan target muscle's BOUNDARY FACES, AABB-culled** | **5.7 s** | **303** | **1.1 mm** |
+Two cheap wins, neither hurts the count:
 
-Lessons:
+- **`refit_stride`** — the per-muscle surface refit is ~199 host-side `refit()`
+  launches **per substep** (in a packed body every muscle is within ~2 cm of
+  some neighbour, so `last_active` is the full 199 even with a tight broadphase
+  margin). The surface deforms little between substeps, so refitting every 5th
+  substep instead of every one cuts that cost ~5× with no quality change
+  (count flat across `refit_stride` 1–10).
+- **tet-BVH reuse** — build the tet BVH **once per resolve call** and reuse it
+  across the `iters` capped passes (the push moves verts ≤ `push_cap`/pass, so
+  the AABBs go only mildly stale). 4 rebuilds → 1, ~4× off the BVH cost; the
+  count is unchanged (slightly better).
 
-- **`bvh_query_aabb` has no distance pruning** — a box query visits *every* tet
-  in the box, so reusing the global tet BVH for the surface search is 23×
-  *slower* than the per-muscle mesh (which prunes by distance). Dead end.
-- **Bounding the scan to one muscle** (contiguous tet/face range, possible
-  because `muscle_id` is sorted and each muscle's verts/tets are one block) is
-  what makes a mesh-free linear scan viable — 76 s → 13.7 s.
-- **Scanning only the boundary faces** (~13 % of tet faces; interior tets never
-  yield a surface point) with a per-face AABB cull is another 2.4× — 13.7 →
-  5.7 s, at *better* quality than the mesh version (count 397 → 303, depth
-  2.4 → 1.1 mm, because the scan point-projects on the live geometry with no
-  refit-staleness and no sign-flip).
+Note the broadphase **margin** for the active mask is `max_dist`, not
+`surf_dist`: a muscle can only be a push target if some vertex is INSIDE it
+(containment ⊂ tight AABB overlap), so the large surface-search radius must not
+widen the refit gate.
 
-Net: ~1.7× the mesh version's wall-clock but no `wp.Mesh`/refit and better
-penetration numbers. The linear scan is `O(boundary faces of mb)`; a per-muscle
-boundary-face BVH would restore `O(log)` but reintroduce per-muscle structures
-and per-pass rebuilds, not worth it. The remaining cost is now the global tet
-BVH rebuild + the `_inside_target` query over all 157 k muscle verts, not the
-surface scan.
+Result (humanV2 50f, no export, RTX 4090): self-collision overhead **~130 → ~50
+ms/frame** at the same count (~380, depth 1 mm). The push kernel (real BVH
+traversal + barycentric + closest-point per vertex) is now the dominant term.
