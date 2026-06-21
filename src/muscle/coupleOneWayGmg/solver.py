@@ -191,6 +191,35 @@ def arap_svd_kernel(
 
 
 @wp.kernel
+def arap_residual_kernel(
+    pos: wp.array(dtype=wp.vec3),
+    tet_indices: wp.array(dtype=wp.vec4i),
+    B: wp.array(dtype=wp.mat33),
+    rest_volume: wp.array(dtype=wp.float32),
+    out: wp.array(dtype=wp.float32),     # [sum C^2 * V0, sum V0]
+):
+    """Measure-only ARAP residual: per tet C^2 = sum_i (sigma_i - 1)^2 of F=Ds*B,
+    volume-weighted. No projection. Global RMS = sqrt(out[0]/out[1])."""
+    t = wp.tid()
+    idx = tet_indices[t]
+    x0 = pos[idx[0]]
+    e1 = pos[idx[1]] - x0
+    e2 = pos[idx[2]] - x0
+    e3 = pos[idx[3]] - x0
+    Ds = wp.mat33(e1[0], e2[0], e3[0],
+                  e1[1], e2[1], e3[1],
+                  e1[2], e2[2], e3[2])
+    F = Ds * B[t]
+    svd = ssvd_fn(F)
+    s = svd.sigma
+    C2 = (s[0] - 1.0) * (s[0] - 1.0) + (s[1] - 1.0) * (s[1] - 1.0) \
+        + (s[2] - 1.0) * (s[2] - 1.0)
+    v = rest_volume[t]
+    wp.atomic_add(out, 0, C2 * v)
+    wp.atomic_add(out, 1, v)
+
+
+@wp.kernel
 def solve_volume_kernel(
     pos_mid: wp.array(dtype=wp.vec3),
     tet_indices: wp.array(dtype=wp.vec4i),
@@ -601,6 +630,67 @@ def pintotarget_overwrite_kernel(
 
 
 @wp.kernel
+def scatter_target_kernel(
+    pts: wp.array(dtype=wp.int32),
+    target_pos: wp.array(dtype=wp.vec3),
+    rest_offset: wp.array(dtype=wp.vec3),
+    dense_target: wp.array(dtype=wp.vec3),
+):
+    """Scatter the per-constraint bone target into a dense per-vertex array.
+
+    ``dense_target[pts[i]] = target_pos[i] + rest_offset[i]``. For humanV2
+    pts covers every muscle vertex, so dense_target is fully written; it
+    feeds restrict_direct_kernel to build the coarse full-pin target.
+    """
+    i = wp.tid()
+    dense_target[pts[i]] = target_pos[i] + rest_offset[i]
+
+
+@wp.kernel
+def restrict_galerkin_scatter_kernel(
+    cage_idx: wp.array(dtype=wp.int32),       # fine vert -> coarse tet (prolong P)
+    uvw: wp.array(dtype=wp.vec3),
+    coarse_tet: wp.array(dtype=wp.vec4i),
+    dense_target: wp.array(dtype=wp.vec3),
+    b: wp.array(dtype=wp.vec3),               # out: b = P^T T (atomic scatter)
+):
+    """b = P^T T_dense: scatter each fine vert's bone target into its coarse tet's
+    4 corners weighted by the prolong barycentric weights. First half of the
+    Galerkin restrict Cdef = (P^T P)^-1 (P^T T)."""
+    i = wp.tid()
+    tet = coarse_tet[cage_idx[i]]
+    uv = uvw[i]
+    a = 1.0 - uv[0] - uv[1] - uv[2]
+    T = dense_target[i]
+    wp.atomic_add(b, tet[0], a * T)
+    wp.atomic_add(b, tet[1], uv[0] * T)
+    wp.atomic_add(b, tet[2], uv[1] * T)
+    wp.atomic_add(b, tet[3], uv[2] * T)
+
+
+@wp.kernel
+def block_solve_kernel(
+    minv: wp.array(dtype=wp.float32),         # per-muscle pinv(P^T P), row-major blocks
+    base: wp.array(dtype=wp.int32),           # per coarse vert: first vert of its block
+    dim: wp.array(dtype=wp.int32),            # per coarse vert: block size
+    matoff: wp.array(dtype=wp.int32),         # per coarse vert: block offset in minv
+    b: wp.array(dtype=wp.vec3),
+    coarse_target: wp.array(dtype=wp.vec3),   # out: Cdef = Minv b
+):
+    """Cdef[c] = sum_j Minv_block[c, j] * b[base+j]. Minv is block-diagonal per
+    muscle (a fine vert only weights its own muscle's cage), so each coarse vert
+    reads its block's row."""
+    c = wp.tid()
+    bs = base[c]
+    d = dim[c]
+    row = matoff[c] + (c - bs) * d
+    acc = wp.vec3(0.0, 0.0, 0.0)
+    for j in range(d):
+        acc = acc + minv[row + j] * b[bs + j]
+    coarse_target[c] = acc
+
+
+@wp.kernel
 def pintotarget_overwrite_masked_kernel(
     pts: wp.array(dtype=wp.int32),
     target_pos: wp.array(dtype=wp.vec3),
@@ -643,6 +733,50 @@ def pintotarget_soft_kernel(
     pid = pts[i]
     tgt = target_pos[i] + rest_offset[i]
     pos[pid] = pos[pid] + stiffness * (tgt - pos[pid])
+
+
+@wp.kernel
+def attach_target_kernel(
+    pts: wp.array(dtype=wp.int32),
+    target_pos: wp.array(dtype=wp.vec3),
+    rest_offset: wp.array(dtype=wp.vec3),
+    pin_active: wp.array(dtype=wp.int32),   # 1 = hard-pinned tendon (skip), 0 = belly
+    inv_mass: wp.array(dtype=wp.float32),
+    pos_mid: wp.array(dtype=wp.vec3),
+    L: wp.array(dtype=wp.float32),
+    compliance: float,                      # 1/stiffness (m^2/N-ish); larger = softer
+    dt: float,
+    omega: float,
+    pos: wp.array(dtype=wp.vec3),
+):
+    """XPBD zero-rest-length attach of each BELLY vert to its bone target.
+
+    The belly (tendonmask==0, pin_active==0) is NOT hard-overwritten; instead it
+    is tied to ``target_pos[i] + rest_offset[i]`` by a compliant point
+    constraint solved INSIDE the iteration loop (same pos_mid snapshot as ARAP /
+    volume / fiber). Because it is a finite-stiffness force rather than a
+    position overwrite, the per-substep collision push (post_phase) persists and
+    the attach only pulls it partway back next substep — collision, fascia glue
+    and the attach negotiate instead of the pin winning outright. Tendons
+    (pin_active==1) are skipped here; they stay hard-pinned in apply_pintotarget.
+    """
+    i = wp.tid()
+    if pin_active[i] != 0:
+        return
+    pid = pts[i]
+    w = inv_mass[pid]
+    if w <= 0.0:
+        return
+    tgt = target_pos[i] + rest_offset[i]
+    d = pos_mid[pid] - tgt
+    C = wp.length(d)
+    if C < 1.0e-9:
+        return
+    n = d / C
+    alpha_tilde = compliance / (dt * dt)
+    dlambda = -(C + alpha_tilde * L[i]) / (w + alpha_tilde)
+    L[i] = L[i] + dlambda                   # one slot per constraint — no race
+    wp.atomic_add(pos, pid, (omega * dlambda * w) * n)
 
 
 @wp.kernel
@@ -1016,6 +1150,20 @@ class OneWaySim(XpbdEngine):
                                         cfg.get("coarse_model_path", None))
         if self.coarse_rest_path is not None:
             self.coarse_rest_path = str(self.coarse_rest_path)
+        # Conforming per-muscle voxel cage baked by tools/gen_coarse_cage.py.
+        # When set it REPLACES coarse_rest_path: a true enclosing cage (every fine
+        # vert inside a same-muscle coarse tet, prolong weights in [0,1]) instead
+        # of the surface-fit lowres (61.8% of fine verts extrapolated -> spikes).
+        self.coarse_npz_path = cfg.get("coarse_npz_path", None)
+        if self.coarse_npz_path is not None:
+            self.coarse_npz_path = str(self.coarse_npz_path)
+        # Opt-in convergence probe: when true, the global volume-weighted ARAP
+        # residual RMS is appended to self.residual_log after each fine iter
+        # (and once at iter 0 = the post-pre_phase initial guess). Used to
+        # compare multigrid vs non-MG convergence; off by default (adds a sync).
+        self.debug_residual = bool(cfg.get("debug_residual", False))
+        self.residual_log = []
+        self._resid_buf = None
 
         # Optional explicit hydrostatic volume constraint (incompressibility).
         # ARAP-SVD matches shape only; with use_volume the fine loop adds a
@@ -1179,13 +1327,48 @@ class OneWaySim(XpbdEngine):
                   f"{int(active.sum())}/{len(active)} hard pins, "
                   f"rest soft (stiffness={self.fascia_soft_pin})")
 
+        # Belly attach mode: tendons (pin_active==1) stay hard-pinned; the belly
+        # (pin_active==0) is tied to its bone target by a compliant XPBD point
+        # constraint solved in the iteration loop (attach_target_kernel) instead
+        # of the position-blend soft pin. Force-based, so collision/fascia can
+        # compete with it. Requires pin_active (set via tendon_pin_threshold).
+        self.pin_belly_attach = bool(cfg.get("pin_belly_attach", False))
+        self.pin_attach_compliance = float(cfg.get("pin_attach_compliance", 1e-6))
+        self.attach_L = None
+        if self.pin_belly_attach:
+            if self.pin_active is None:
+                raise ValueError("pin_belly_attach=true needs tendon_pin_threshold "
+                                 "(to define the hard tendon vs belly split)")
+            # MG + attach: free coarse ARAP would drift off the (unanchored)
+            # restricted tendon positions and the prolonged belly — which the
+            # fine level no longer hard-pins — accumulates that drift → NaN.
+            # Fix (pre_phase): coarse is FULL-pinned to the bone target each
+            # substep (restrict the dense fine target onto coarse, copy it in,
+            # skip coarse ARAP). Coarse becomes a bone-driven scaffold; prolong
+            # hands the belly a coarse-smoothed bone-following start, then the
+            # fine attach + collision deviate it. See _init_coarse / pre_phase.
+            self.attach_L = wp.zeros(self.NCONS, dtype=wp.float32, device=device)
+            print(f"[belly-attach] XPBD point attach for belly verts "
+                  f"(compliance={self.pin_attach_compliance:g}); soft-blend off")
+
         if self.use_multigrid:
-            if self.coarse_rest_path is None:
+            if self.coarse_npz_path is not None:
+                # The conforming voxel cage is built for the full-pin scaffold
+                # path (restrict via nearest-vert gather, no coarse ARAP). The
+                # free-ARAP path would need the tet barycentric c2f map, which
+                # the npz doesn't carry.
+                if not self.pin_belly_attach:
+                    raise ValueError(
+                        "coarse_npz_path requires pin_belly_attach=true "
+                        "(the cage feeds the full-pin scaffold path)")
+                self._init_coarse_cage()
+            elif self.coarse_rest_path is None:
                 raise ValueError(
                     "use_multigrid=true but no coarse_rest_path / "
                     "coarse_model_path in config"
                 )
-            self._init_coarse(rest.positions)
+            else:
+                self._init_coarse(rest.positions)
 
         if self.fascia_path:
             self._init_fascia(rest.positions.copy())
@@ -1295,7 +1478,19 @@ class OneWaySim(XpbdEngine):
             total_mass=self.total_mass, device=self._device)
 
         # Build the pin_active mask over the existing pin pts: free verts in free_ids.
+        # Start from the tendon mask when tendon_pin_threshold is set: hard-pin ONLY
+        # the tendon attachments (tendonmask>thr), free the belly to the soft pull.
+        # Without this the rebuild below re-pins the WHOLE belly even under fascia,
+        # so every collision push (bone SDF / inter-muscle, run in post_phase) is
+        # overwritten by the next substep's pin — neutralizing the feature. The
+        # glue ring is freed on top of the tendon free-set (union).
         active = np.ones(self._pin_pts_np.shape[0], dtype=np.int32)
+        if self.tendon_pin_threshold is not None and self.tendonmask_np is not None:
+            tm = self.tendonmask_np
+            active = (tm[self._pin_pts_np]
+                      > float(self.tendon_pin_threshold)).astype(np.int32)
+            print(f"[partial-pin+fascia] tendonmask>{self.tendon_pin_threshold}: "
+                  f"{int(active.sum())}/{len(active)} hard pins before glue-ring free")
         active[np.isin(self._pin_pts_np, free_ids)] = 0
         self.pin_active = wp.array(active, dtype=wp.int32, device=self._device)
         log.info(f"fascia: freed {len(free_ids)} muscle verts from pin "
@@ -1415,6 +1610,48 @@ class OneWaySim(XpbdEngine):
         # with mg_fine_nv (not the merged self.NV) to stay in bounds.
         self.mg_fine_nv = self.NV
 
+        # Coarse full-pin scaffold (only used when pin_belly_attach): the dense
+        # fine bone target restricted onto the coarse mesh each substep, copied
+        # straight into coarse_pos so coarse never drifts off the bone.
+        self.coarse_target = wp.zeros(self.coarse_NV, dtype=wp.vec3, device=device)
+        self.fine_target_dense = wp.zeros(self.mg_fine_nv, dtype=wp.vec3, device=device)
+
+    def _init_coarse_cage(self) -> None:
+        """Load the conforming per-muscle voxel cage + baked transfer maps from
+        the npz produced by tools/gen_coarse_cage.py. Only the full-pin scaffold
+        path uses it: prolong (f->c barycentric, weights in [0,1]) and restrict
+        (c->f nearest-vert gather). No coarse ARAP, so no rest/mass fields."""
+        device = self._device
+        d = np.load(self.coarse_npz_path)
+        npz_fine_nv = int(d["mg_fine_nv"])
+        if npz_fine_nv != self.NV:
+            raise ValueError(
+                f"coarse cage built for fine NV={npz_fine_nv} but this sim has "
+                f"NV={self.NV}; regenerate tools/gen_coarse_cage.py against the "
+                f"same restpos.geo")
+        self.coarse_NV = int(d["coarse_pos"].shape[0])
+        self.coarse_NT = int(d["coarse_tet"].shape[0])
+        self.coarse_pos = wp.array(d["coarse_pos"], dtype=wp.vec3, device=device)
+        self.coarse_pos_mid = wp.clone(self.coarse_pos)
+        self.coarse_tet_idx = wp.array(d["coarse_tet"], dtype=wp.vec4i, device=device)
+        # f->c prolongation (per fine muscle vert).
+        self.cage_idx = wp.array(d["cage_idx"], dtype=wp.int32, device=device)
+        self.uvw = wp.array(d["uvw"], dtype=wp.vec3, device=device)
+        # c->f restriction: Galerkin projection Cdef=(P^T P)^-1 P^T T (smooth, low
+        # strain). Measured ~6x less injected strain and 3-6x faster convergence
+        # than a nearest-vert gather; gather was removed after that comparison.
+        self.minv_flat = wp.array(d["minv_flat"], dtype=wp.float32, device=device)
+        self.blk_base = wp.array(d["blk_base"], dtype=wp.int32, device=device)
+        self.blk_dim = wp.array(d["blk_dim"], dtype=wp.int32, device=device)
+        self.blk_matoff = wp.array(d["blk_matoff"], dtype=wp.int32, device=device)
+        self.coarse_b = wp.zeros(self.coarse_NV, dtype=wp.vec3, device=device)
+        self.mg_fine_nv = self.NV
+        self.coarse_target = wp.zeros(self.coarse_NV, dtype=wp.vec3, device=device)
+        self.fine_target_dense = wp.zeros(self.mg_fine_nv, dtype=wp.vec3, device=device)
+        print(f"[coarse-cage] loaded {self.coarse_npz_path}: "
+              f"coarse NV={self.coarse_NV} NT={self.coarse_NT} "
+              f"(voxel={float(d['voxel']):.3f}m); Galerkin lsq restrict")
+
     # ------------------------------------------------------------------
 
     def tet_mask_for_muscles(self, names) -> np.ndarray:
@@ -1471,8 +1708,10 @@ class OneWaySim(XpbdEngine):
             )
             # Soft-pull the freed verts toward their bone target so they track
             # gross body motion (per-frame target jumps) while still yielding
-            # inward to the fascia squeeze.
-            if self.fascia_soft_pin > 0.0:
+            # inward to the fascia squeeze. Skipped under belly-attach mode: the
+            # belly is handled by the compliant XPBD attach in the iter loop
+            # instead (a position blend here would double-pull + overwrite it).
+            if self.fascia_soft_pin > 0.0 and not self.pin_belly_attach:
                 wp.launch(
                     pintotarget_soft_kernel,
                     dim=self.NCONS,
@@ -1493,27 +1732,73 @@ class OneWaySim(XpbdEngine):
 
         def pre_phase():
             if s.use_multigrid:
-                # Direct V-cycle: restrict fine→coarse, relax coarse, prolong
-                # back, re-apply pin-to-target (prolong overwrites pinned verts).
-                wp.launch(
-                    restrict_direct_kernel,
-                    dim=s.coarse_NV,
-                    inputs=[s.pos, s.tet_idx,
-                            s.cage_idx_c2f, s.uvw_c2f, s.coarse_pos],
-                    device=s._device,
-                )
-                s.coarse_L.zero_()
-                for _ in range(s.coarse_iters):
-                    wp.copy(s.coarse_pos_mid, s.coarse_pos)
+                if s.pin_belly_attach:
+                    # Coarse FULL pin to the bone target (no tendonmask read):
+                    # scatter the dense fine target, restrict it onto coarse,
+                    # copy it straight in. Coarse is a bone-driven scaffold —
+                    # no free ARAP, so it can't drift and feed the unpinned
+                    # belly a divergent start. prolong then hands the belly a
+                    # coarse-smoothed bone target; fine attach + collision
+                    # deviate it in iter_phase.
                     wp.launch(
-                        arap_svd_kernel,
-                        dim=s.coarse_NT,
-                        inputs=[s.coarse_pos_mid, s.coarse_tet_idx,
-                                s.coarse_B, s.coarse_inv_mass,
-                                s.coarse_alpha, s.coarse_L,
-                                s.dt, s.omega, s.coarse_pos],
+                        scatter_target_kernel,
+                        dim=s.NCONS,
+                        inputs=[s.pts, s.target_pos, s.rest_offset,
+                                s.fine_target_dense],
                         device=s._device,
                     )
+                    if getattr(s, "minv_flat", None) is not None:
+                        # Conforming voxel cage + Galerkin least-squares restrict:
+                        # Cdef=(P^T P)^-1 P^T T, the smoothest cage deformation
+                        # reproducing the bone target. b = P^T T (scatter), then
+                        # the per-muscle block solve Cdef = Minv b.
+                        s.coarse_b.zero_()
+                        wp.launch(
+                            restrict_galerkin_scatter_kernel,
+                            dim=s.mg_fine_nv,
+                            inputs=[s.cage_idx, s.uvw, s.coarse_tet_idx,
+                                    s.fine_target_dense, s.coarse_b],
+                            device=s._device,
+                        )
+                        wp.launch(
+                            block_solve_kernel,
+                            dim=s.coarse_NV,
+                            inputs=[s.minv_flat, s.blk_base, s.blk_dim,
+                                    s.blk_matoff, s.coarse_b, s.coarse_target],
+                            device=s._device,
+                        )
+                    else:
+                        # Legacy lowres coarse: tet-barycentric restriction.
+                        wp.launch(
+                            restrict_direct_kernel,
+                            dim=s.coarse_NV,
+                            inputs=[s.fine_target_dense, s.tet_idx,
+                                    s.cage_idx_c2f, s.uvw_c2f, s.coarse_target],
+                            device=s._device,
+                        )
+                    wp.copy(s.coarse_pos, s.coarse_target)
+                else:
+                    # Direct V-cycle: restrict fine→coarse, relax coarse,
+                    # prolong back, re-apply pin (prolong overwrites pinned).
+                    wp.launch(
+                        restrict_direct_kernel,
+                        dim=s.coarse_NV,
+                        inputs=[s.pos, s.tet_idx,
+                                s.cage_idx_c2f, s.uvw_c2f, s.coarse_pos],
+                        device=s._device,
+                    )
+                    s.coarse_L.zero_()
+                    for _ in range(s.coarse_iters):
+                        wp.copy(s.coarse_pos_mid, s.coarse_pos)
+                        wp.launch(
+                            arap_svd_kernel,
+                            dim=s.coarse_NT,
+                            inputs=[s.coarse_pos_mid, s.coarse_tet_idx,
+                                    s.coarse_B, s.coarse_inv_mass,
+                                    s.coarse_alpha, s.coarse_L,
+                                    s.dt, s.omega, s.coarse_pos],
+                            device=s._device,
+                        )
                 wp.launch(
                     prolong_kernel,
                     dim=getattr(s, "mg_fine_nv", s.NV),
@@ -1534,8 +1819,22 @@ class OneWaySim(XpbdEngine):
                 s.vol_L.zero_()
             if s.use_fiber:
                 s.fiber_L.zero_()
+            if s.attach_L is not None:
+                s.attach_L.zero_()
+
+        def _probe_residual():
+            if s._resid_buf is None:
+                s._resid_buf = wp.zeros(2, dtype=wp.float32, device=s._device)
+            s._resid_buf.zero_()
+            wp.launch(arap_residual_kernel, dim=s.NT,
+                      inputs=[s.pos, s.tet_idx, s.B, s.rest_volume, s._resid_buf],
+                      device=s._device)
+            num, den = s._resid_buf.numpy()
+            s.residual_log.append(float((num / den) ** 0.5) if den > 0 else 0.0)
 
         def iter_phase():
+            if s.debug_residual:
+                _probe_residual()            # iter 0: initial guess (post pre_phase)
             for it in range(s.fine_iters):
                 wp.copy(s.pos_mid, s.pos)
                 wp.launch(
@@ -1575,11 +1874,28 @@ class OneWaySim(XpbdEngine):
                                 s.contraction_ratio, s.dt, s.omega, s.pos],
                         device=s._device,
                     )
+                # Belly attach: compliant XPBD point constraint pulling each
+                # belly vert toward its bone target, from the SAME pos_mid
+                # snapshot as ARAP / volume / fiber (parallel-Jacobi). Replaces
+                # the position-blend soft pin; finite stiffness lets the bone /
+                # inter-muscle collision push persist instead of being snapped
+                # back to target.
+                if s.attach_L is not None:
+                    wp.launch(
+                        attach_target_kernel,
+                        dim=s.NCONS,
+                        inputs=[s.pts, s.target_pos, s.rest_offset,
+                                s.pin_active, s.inv_mass, s.pos_mid, s.attach_L,
+                                s.pin_attach_compliance, s.dt, s.omega, s.pos],
+                        device=s._device,
+                    )
                 # Per-iteration collision hook (UDCF DCD): interleaves contact
                 # resolution with ARAP/volume the way the reference PBD loop
                 # interleaves narrowPhase() with projectConstraints().
                 for fn in getattr(s, "collision_solvers_iter", None) or []:
                     fn(it)
+                if s.debug_residual:
+                    _probe_residual()        # after iter it+1
 
         def post_phase():
             if getattr(s, "merged", None) is not None:
