@@ -530,11 +530,11 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
                                  pos_np, is_collide, depth)
         if frame % 5 == 0 or frame == sim.end_frame:
             elapsed = time.perf_counter() - t0
-            mm = (f"mm={int(is_collide_mm.sum())} "
+            mm = (f"mm={int(is_collide_mm.sum())}"
                   f"({depth_mm.max()*1000:.1f}mm)" if is_collide_mm is not None
                   else "")
             print(f"  frame {frame:>3d}  {elapsed:6.1f}s  "
-                  f"coll={int(is_collide.sum())}  "
+                  f"coll={int(is_collide.sum())}"
                   f"({depth.max()*1000:.1f}mm) {mm}")
     if renderer is not None:
         renderer.save()
