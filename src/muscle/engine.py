@@ -408,6 +408,27 @@ def _freeze_near_inverted_kernel(
 
 
 @wp.kernel
+def count_inverted_tets_kernel(
+    tet_indices: wp.array(dtype=wp.vec4i),
+    pos: wp.array(dtype=wp.vec3),
+    rest_matrix: wp.array(dtype=wp.mat33),
+    count: wp.array(dtype=wp.int32),
+):
+    """Atomically count tets with det(F) <= 0 (inverted), in the solver's own F
+    convention (same Ds * rest_matrix as the constraint/freeze kernels)."""
+    c = wp.tid()
+    pts = tet_indices[c]
+    p0 = pos[pts[0]]; p1 = pos[pts[1]]; p2 = pos[pts[2]]; p3 = pos[pts[3]]
+    c0 = p0 - p3; c1 = p1 - p3; c2 = p2 - p3
+    Ds = wp.mat33(
+        c0[0], c1[0], c2[0],
+        c0[1], c1[1], c2[1],
+        c0[2], c1[2], c2[2])
+    if wp.determinant(Ds * rest_matrix[c]) <= 0.0:
+        wp.atomic_add(count, 0, 1)
+
+
+@wp.kernel
 def integrate_kernel(
     pos: wp.array(dtype=wp.vec3),
     pprev: wp.array(dtype=wp.vec3),

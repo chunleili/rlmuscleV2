@@ -573,7 +573,9 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
                                  pos_np, meter.bone_flag, meter.bone_depth)
         if frame % 5 == 0 or frame == sim.end_frame:
             elapsed = time.perf_counter() - t0
-            print(f"  frame {frame:>3d}  {elapsed:6.1f}s  {meter.summary()}")
+            n_inv = sim.count_inverted()
+            print(f"  frame {frame:>3d}  {elapsed:6.1f}s  {meter.summary()}  "
+                  f"inverted {n_inv}/{sim.NT} ({n_inv / sim.NT * 100:.2f}%)")
     if renderer is not None:
         renderer.save()
         print(f"USD saved -> {out}")

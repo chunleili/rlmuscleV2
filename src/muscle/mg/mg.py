@@ -237,14 +237,17 @@ class MultiGridSim(MuscleSim):
         active = (tmask[self._pin_pts_np]
                   > float(self.tendon_pin_threshold)).astype(np.int32)
         self.pin_active = wp.array(active, dtype=wp.int32, device=device)
+        n_pin = int(active.sum())
+        n_tot = len(active)
         print(f"[partial-pin] tendonmask>{self.tendon_pin_threshold}: "
-              f"{int(active.sum())}/{len(active)} hard pins, rest belly-attach")
+              f"{n_pin}/{n_tot} hard pins ({n_pin / n_tot * 100:.1f}% pinned tendon, "
+              f"{(n_tot - n_pin) / n_tot * 100:.1f}% belly-attach)")
 
         # Belly attach: the freed belly (pin_active==0) is tied to its bone target
         # by a compliant XPBD point constraint solved in the iteration loop
         # (attach_target_kernel). Force-based, so collision / fascia compete with
         # it (vs a position-blend pin they could not move). The fine attach is
-        # built after fascia (so pin_active reflects the glue-ring free).
+        # built after fascia so pin_active is final.
         self.pin_attach_compliance = float(cfg.get("pin_attach_compliance", 1e-6))
         self.attach_L = None
         print(f"[belly-attach] XPBD point attach for belly verts "

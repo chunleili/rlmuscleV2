@@ -252,39 +252,10 @@ class Fascia(MuscleSim):
 
         # Free the muscle verts the fascia glues to (+ dilated ring) from the pin
         # so the glue can pull them inward.
-        free_ring = int(cfg.get("fascia_free_ring", 1))
-        muscle_tet = mrest.tet_indices
-        free_mask = np.zeros(nvm, dtype=bool)
-        seed = np.unique(glue_muscle.astype(np.int64))
-        free_mask[seed[(seed >= 0) & (seed < nvm)]] = True
-        if free_ring > 0:
-            from collections import defaultdict
-            v2t = defaultdict(list)
-            for ti, tet in enumerate(muscle_tet):
-                for v in tet:
-                    v2t[int(v)].append(ti)
-            for _ in range(free_ring):
-                cur = np.where(free_mask)[0]
-                for v in cur:
-                    for ti in v2t[int(v)]:
-                        for w in muscle_tet[ti]:
-                            free_mask[int(w)] = True
-        free_ids = np.where(free_mask)[0].astype(np.int32)
-
-        # Rebuild the parent pin_active: hard-pin tendons (tendonmask>thr), free
-        # the glue ring (union). Without this the parent re-pins the whole belly
-        # every substep and the glue squeeze is overwritten.
-        active = np.ones(p._pin_pts_np.shape[0], dtype=np.int32)
-        if p.tendon_pin_threshold is not None and p.tendonmask_np is not None:
-            tm = p.tendonmask_np
-            active = (tm[p._pin_pts_np] > float(p.tendon_pin_threshold)).astype(np.int32)
-            print(f"[partial-pin+fascia] tendonmask>{p.tendon_pin_threshold}: "
-                  f"{int(active.sum())}/{len(active)} hard pins before glue-ring free")
-        active[np.isin(p._pin_pts_np, free_ids)] = 0
-        p.pin_active = wp.array(active, dtype=wp.int32, device=device)
-        log.info(f"fascia: freed {len(free_ids)} muscle verts from pin "
-                 f"(ring={free_ring}); {int(active.sum())}/{len(active)} pins active; "
-                 f"glue_scale={glue_scale}")
+        # pin_active is left as the parent's tendon mask (tendonmask >
+        # tendon_pin_threshold): tendons stay hard-pinned, the belly is freed and
+        # driven by belly-attach + the glue squeeze. The glue only moves verts the
+        # belly-attach leaves compliant, so no extra pin rebuild is needed here.
 
         # Upload coupling arrays.
         self.n_glue = int(len(glue_fascia))

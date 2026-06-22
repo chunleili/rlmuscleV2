@@ -19,6 +19,7 @@ from muscle.engine import (
     WarpRenderer,
     accumulate_active_fiber_force_kernel,
     calc_vol_error_kernel,
+    count_inverted_tets_kernel,
     _clamp_force_by_accel_kernel,
     clear_reaction_kernel,
     compute_cell_tendon_mask_kernel,
@@ -661,6 +662,13 @@ class MuscleSim(XpbdEngine):
         if total_rest_np == 0.0:
             return 0.0
         return (total_vol_np - total_rest_np) / total_rest_np
+
+    def count_inverted(self) -> int:
+        """Number of tets with det(F) <= 0 (inverted) at the current pos."""
+        cnt = wp.zeros(1, dtype=wp.int32)
+        wp.launch(count_inverted_tets_kernel, dim=self.tet_np.shape[0],
+                  inputs=[self.tet_indices, self.pos, self.rest_matrix, cnt])
+        return int(cnt.numpy()[0])
 
     def clear_reaction(self):
         if self.n_cons > 0:

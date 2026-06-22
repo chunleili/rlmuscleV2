@@ -9,7 +9,6 @@
     "fascia_path": "data/humanV2/model/fascia/fascia.geo",
     "fascia_rest_scale": 0.9,
     "fascia_glue_iterations": 2,
-    "fascia_free_ring": 1,
     "fascia_glue_stiffness_scale": 0.5,
 
     "quasi_static": true,
@@ -37,7 +36,7 @@
         "collision": {
             "enabled": true,
             "static_bone": false,
-            "max_dist": 0.02,
+            "max_dist": 0.2,
             "contact_offset": 1e-5,
             "collide_eps": 1e-6,
             "max_push": -1.0
