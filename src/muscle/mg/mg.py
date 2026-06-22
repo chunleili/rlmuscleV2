@@ -888,6 +888,10 @@ class MultiGridSim(MuscleSim):
     def step_frame(self, frame: int) -> None:
         self.load_frame_targets(frame)
         self.apply_pintotarget()
+        # Fascia rides the skeleton: advect the shell by this frame's bone motion
+        # ONCE (target_pos is constant across the frame's substeps) before solving.
+        if self.fascia is not None:
+            self.fascia.advect_bone()
         for _ in range(self.nsubsteps):
             self.substep()
 

@@ -32,16 +32,40 @@ from muscle.util.geo_io import GeoFile
 # ─── Cross-array coupling kernels (fascia <-> muscle) ───────────────────────
 
 @wp.kernel
-def fascia_anchor_kernel(
-    anchor_fascia: wp.array(dtype=wp.int32),
-    anchor_muscle: wp.array(dtype=wp.int32),
-    rest_offset: wp.array(dtype=wp.vec3),
-    muscle_pos: wp.array(dtype=wp.vec3),
+def fascia_advect_bone_kernel(
+    follow_cons: wp.array(dtype=wp.int32),     # fascia vert -> nearest muscle cons
+    target_pos: wp.array(dtype=wp.vec3),       # parent per-frame BONE target
+    rest_offset: wp.array(dtype=wp.vec3),      # parent cons rest offset
+    prev_world: wp.array(dtype=wp.vec3),       # last bone-world this vert saw
     fascia_pos: wp.array(dtype=wp.vec3),
 ):
-    """``fascia_pos[af[i]] = muscle_pos[am[i]] + rest_offset[i]`` (cross-array)."""
+    """Advect each fascia vert by the BONE motion field (not the muscle it
+    squeezes). ``target_pos + rest_offset`` is the lag-free per-frame world
+    position the skeleton drives the nearest muscle vert to; the DELTA since the
+    last frame is added to the fascia vert, so the shell rides the skeleton while
+    keeping its own (shrunk + glue-squeezed) shape. Per-frame, not per-substep."""
     i = wp.tid()
-    fascia_pos[anchor_fascia[i]] = muscle_pos[anchor_muscle[i]] + rest_offset[i]
+    cur = target_pos[follow_cons[i]] + rest_offset[follow_cons[i]]
+    fascia_pos[i] = fascia_pos[i] + (cur - prev_world[i])
+    prev_world[i] = cur
+
+
+@wp.kernel
+def fascia_anchor_bone_kernel(
+    anchor_local: wp.array(dtype=wp.int32),    # fascia vert id (subset)
+    anchor_cons: wp.array(dtype=wp.int32),     # its nearest muscle cons
+    anchor_offset: wp.array(dtype=wp.vec3),    # fascia_rest - bone_rest_world
+    target_pos: wp.array(dtype=wp.vec3),
+    rest_offset: wp.array(dtype=wp.vec3),
+    fascia_pos: wp.array(dtype=wp.vec3),
+):
+    """Hard-snap a sparse set of fascia verts to their BONE-driven world target
+    each substep. These are the shell's Dirichlet BCs: without them the stiff
+    ARAP/volume Jacobi relax on the otherwise free-floating shell diverges. Snap
+    to the SKELETON (target_pos), never the squeezable muscle pos."""
+    i = wp.tid()
+    c = anchor_cons[i]
+    fascia_pos[anchor_local[i]] = target_pos[c] + rest_offset[c] + anchor_offset[i]
 
 
 @wp.kernel
@@ -50,7 +74,6 @@ def solve_glue_kernel(
     pair_muscle: wp.array(dtype=wp.int32),       # muscle vert (global)
     restlen: wp.array(dtype=wp.float32),
     compliance: wp.array(dtype=wp.float32),      # 1/stiffness
-    fascia_invmass: wp.array(dtype=wp.float32),
     muscle_mass: wp.array(dtype=wp.float32),
     muscle_stopped: wp.array(dtype=wp.int32),    # pinned muscle vert = kinematic
     L: wp.array(dtype=wp.float32),
@@ -59,9 +82,10 @@ def solve_glue_kernel(
     fascia_pos: wp.array(dtype=wp.vec3),
     muscle_pos: wp.array(dtype=wp.vec3),
 ):
-    """Two-way XPBD distance between a fascia vert and a muscle vert, each in its
-    own ``pos`` array. Muscle verts that are ``stopped`` (hard-pinned) act as
-    kinematic anchors (inv_mass = 0) so only the fascia side moves there."""
+    """ONE-WAY XPBD distance from a kinematic fascia vert to a muscle vert (each
+    in its own ``pos`` array). The fascia is bone-driven (kinematic here); only
+    the muscle moves — toward the shrunk fascia, i.e. the squeeze. Muscle verts
+    that are ``stopped`` (hard-pinned) are kinematic too, so that pair is inert."""
     c = wp.tid()
     fi = pair_fascia[c]
     mi = pair_muscle[c]
@@ -71,19 +95,22 @@ def solve_glue_kernel(
         return
     dirn = n / d
     C = d - restlen[c]
-    wi = fascia_invmass[fi]
+    # The fascia side is KINEMATIC (wi = 0): driven solely by its one-to-one bone
+    # follow, never by the (many) muscle springs that map onto it. In sparse-shell
+    # regions one fascia vert is the nearest for dozens of muscle verts — a
+    # two-way pull there flung the weakly-connected (sliver-tet) vert ~1m. With
+    # wi=0 the glue only drags the muscle toward the shrunk bone-driven fascia.
     wj = float(0.0)
     if muscle_stopped[mi] == 0:
         mm = muscle_mass[mi]
         wj = wp.where(mm > 0.0, 1.0 / mm, 0.0)
     alpha_tilde = compliance[c] / (dt * dt)
-    denom = wi + wj + alpha_tilde
+    denom = wj + alpha_tilde
     if denom < 1.0e-12:
         return
     dlambda = -(C + alpha_tilde * L[c]) / denom
     L[c] = L[c] + dlambda
     f = omega * dlambda
-    wp.atomic_add(fascia_pos, fi, (f * wi) * dirn)
     wp.atomic_add(muscle_pos, mi, (-f * wj) * dirn)
 
 
@@ -229,20 +256,25 @@ class Fascia(MuscleSim):
             glue_restlen = np.concatenate([gi_r, gb_r])
             glue_stiff = np.concatenate([gi_s, gb_s]) * glue_scale
 
-        # Rigid anchor: fascia "rigid" group follows its nearest muscle vert.
-        if "rigid" in fg._groups:
-            rid = fg.point_group("rigid")
-            full_tree = cKDTree(rest_muscle_pos)
-            _, aloc = full_tree.query(fascia_pos[rid], k=1)
-            anchor_fascia = rid.astype(np.int32)
-            anchor_muscle = aloc.astype(np.int32)
-        else:
-            anchor_fascia = np.zeros(0, np.int32)
-            anchor_muscle = np.zeros(0, np.int32)
+        # Bone follow: every fascia vert rides the SKELETON, not the muscle it
+        # squeezes. The parent is fully pinned (pts == all NV), so target_pos is a
+        # complete per-frame bone-driven field over the muscle verts (lag-free,
+        # even where the belly is freed from the pin). Map each fascia vert to its
+        # nearest muscle vert's cons index; advect_bone() then moves the shell by
+        # that vert's per-frame bone DELTA. cons index == position in pts.
+        pin_pts = p._pin_pts_np                       # cons -> muscle vert
+        vert2cons = np.full(nvm, -1, dtype=np.int64)
+        vert2cons[pin_pts] = np.arange(pin_pts.shape[0])
+        _, floc = cKDTree(rest_muscle_pos).query(fascia_pos, k=1)
+        follow_cons = vert2cons[floc]
+        if (follow_cons < 0).any():                   # vert not pinned -> nearest pinned
+            miss = follow_cons < 0
+            _, ploc = cKDTree(rest_muscle_pos[pin_pts]).query(fascia_pos[miss], k=1)
+            follow_cons[miss] = ploc
 
         log.info(f"fascia: {fascia_pos.shape[0]} verts, {self.NT} tets; "
                  f"glue mode={glue_mode}, glue pairs={len(glue_fascia)}; "
-                 f"anchors={len(anchor_fascia)}; rest_scale={self._rest_scale}")
+                 f"bone-follow all {fascia_pos.shape[0]} verts; rest_scale={self._rest_scale}")
 
         # Free the muscle verts the fascia glues to (+ dilated ring) from the pin
         # so the glue can pull them inward.
@@ -290,30 +322,53 @@ class Fascia(MuscleSim):
             dtype=wp.float32, device=device)
         self.glue_L = wp.zeros(max(self.n_glue, 1), dtype=wp.float32, device=device)
 
-        mass_np = self.mass.numpy()
-        finv = np.where(mass_np > 0.0, 1.0 / np.maximum(mass_np, 1e-30), 0.0).astype(np.float32)
-        self.fascia_invmass = wp.from_numpy(finv, dtype=wp.float32)
+        # Bone-follow arrays. prev_world seeds with the frame-start bone world
+        # (target_pos + rest_offset at each vert's cons); advect_bone() adds only
+        # the per-frame DELTA, so the fascia's own rest offset is preserved and
+        # never snapped to the muscle surface (would fight the shrink squeeze).
+        self.follow_cons = wp.array(follow_cons.astype(np.int32), dtype=wp.int32, device=device)
+        tgt0 = p.target_pos.numpy()
+        roff = p.rest_offset.numpy()
+        bone_rest = (tgt0[follow_cons] + roff[follow_cons]).astype(np.float32)  # per fascia vert
+        self.follow_prev = wp.from_numpy(bone_rest.copy(), dtype=wp.vec3, device=device)
 
-        self.n_anchor = int(len(anchor_fascia))
-        self.anchor_fascia = wp.array(anchor_fascia, dtype=wp.int32, device=device)
-        self.anchor_muscle = wp.array(anchor_muscle, dtype=wp.int32, device=device)
-        offset_np = ((fascia_pos[anchor_fascia] - rest_muscle_pos[anchor_muscle]).astype(np.float32)
-                     if self.n_anchor else np.zeros((0, 3), np.float32))
-        self.anchor_offset = wp.array(offset_np, dtype=wp.vec3, device=device)
+        # Dirichlet BC set for the relax: the fascia "rigid" group (or a uniform
+        # subsample as fallback) hard-snapped to bone each substep. anchor_offset
+        # holds fascia_rest - bone_rest so the snap preserves the shell's offset
+        # from the skeleton, not collapse onto the muscle surface.
+        if "rigid" in fg._groups:
+            rid = fg.point_group("rigid").astype(np.int64)
+        else:
+            step = max(1, fascia_pos.shape[0] // 256)
+            rid = np.arange(0, fascia_pos.shape[0], step, dtype=np.int64)
+        self.n_anchor = int(rid.shape[0])
+        self.anchor_local = wp.array(rid.astype(np.int32), dtype=wp.int32, device=device)
+        self.anchor_cons = wp.array(follow_cons[rid].astype(np.int32), dtype=wp.int32, device=device)
+        anchor_off = (fascia_pos[rid] - bone_rest[rid]).astype(np.float32)
+        self.anchor_offset = wp.array(anchor_off, dtype=wp.vec3, device=device)
+        log.info(f"fascia: {self.n_anchor} bone-anchor BCs "
+                 f"({'rigid group' if 'rigid' in fg._groups else 'subsample'})")
 
     def _pair_surface(self, fg, fascia_pos, mrest, rest_muscle_pos, glue_scale):
-        """Full-surface glue mode: pair EVERY muscle surface vert to its nearest
+        """Full-surface glue mode: pair each muscle surface vert to its nearest
         fascia vert (un-dilutes the global squeeze metric). Returns LOCAL fascia
-        ids + GLOBAL muscle ids + restlen + scaled stiffness."""
+        ids + GLOBAL muscle ids + restlen + scaled stiffness.
+
+        Rest length IS the rest distance — the glue is a plain attachment that
+        holds each fascia/muscle pair at the gap they start with. ALL squeeze
+        comes from the fascia ARAP shrink (``fascia_rest_scale``): the shell
+        contracts and drags the glued muscle in. The glue itself never pulls a
+        pair toward an absolute target, so it can't catapult a weakly-connected
+        fascia vert where the shell is sparse (the old ``min(want, d)`` slammed
+        every pair toward ~2mm regardless of gap and flung such verts ~1m)."""
         cfg = self.parent.cfg
         surf = mrest.point_group("surface_points")
         fascia_tree = cKDTree(fascia_pos)
         d, floc = fascia_tree.query(rest_muscle_pos[surf], k=1)
 
-        want = float(cfg.get("fascia_glue_target_distance", 0.01))
         glue_muscle = surf.astype(np.int32)
         glue_fascia = floc.astype(np.int32)
-        glue_restlen = np.minimum(want, d.astype(np.float32)).astype(np.float32)
+        glue_restlen = d.astype(np.float32)
 
         base_stiff = float(cfg.get(
             "fascia_glue_stiffness",
@@ -323,14 +378,27 @@ class Fascia(MuscleSim):
 
     # -- run --------------------------------------------------------------
 
+    def advect_bone(self):
+        """Ride the skeleton: add this frame's bone DELTA to every fascia vert.
+        Called ONCE per frame by the parent (target_pos is constant across a
+        frame's substeps), BEFORE the substep loop — lag-free gross motion."""
+        wp.launch(fascia_advect_bone_kernel, dim=self.NV,
+                  inputs=[self.follow_cons, self.parent.target_pos,
+                          self.parent.rest_offset, self.follow_prev, self.pos],
+                  device=self._device)
+
     def build_program(self):
         s = self
 
         def anchor_phase():
+            # Gross bone motion is applied per-FRAME in advect_bone(); each substep
+            # re-snaps the sparse bone-anchor BCs (stabilizes the stiff relax) then
+            # snapshots pprev for the quasi-static relax below.
             if s.n_anchor:
-                wp.launch(fascia_anchor_kernel, dim=s.n_anchor,
-                          inputs=[s.anchor_fascia, s.anchor_muscle, s.anchor_offset,
-                                  s.parent.pos, s.pos], device=s._device)
+                wp.launch(fascia_anchor_bone_kernel, dim=s.n_anchor,
+                          inputs=[s.anchor_local, s.anchor_cons, s.anchor_offset,
+                                  s.parent.target_pos, s.parent.rest_offset, s.pos],
+                          device=s._device)
             s.integrate()
 
         def relax_phase():
@@ -345,7 +413,7 @@ class Fascia(MuscleSim):
                     s.glue_L.zero_()
                     wp.launch(solve_glue_kernel, dim=s.n_glue,
                               inputs=[s.glue_fascia, s.glue_muscle, s.glue_restlen,
-                                      s.glue_compliance, s.fascia_invmass,
+                                      s.glue_compliance,
                                       s.parent.mass, s.parent.stopped, s.glue_L,
                                       s.dt, s.omega, s.pos, s.parent.pos],
                               device=s._device)
