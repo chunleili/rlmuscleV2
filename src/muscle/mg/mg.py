@@ -37,113 +37,6 @@ from muscle.util.util import _check_unzipped
 
 
 
-class _CoarseEngine(MuscleSim):
-    """SoA sub-solver on the multigrid coarse cage.
-
-    Reuses the full MuscleSim / XpbdEngine XPBD pipeline so the (optional, off by
-    default) coarse smoother runs the SAME dispatch as the fine level — ARAP-SVD
-    + optional volume + an optional per-vertex attach-to-projection anchor — with
-    no HPBD ``pos_mid`` path. Built only when ``coarse_iterations > 0``.
-
-    ``attach_compliance_np`` (per coarse vert) adds an ATTACH constraint anchoring
-    each vert toward a target set per substep via :meth:`set_anchor` (the bone-
-    following Galerkin projection); pass ``None`` for a free ARAP relax.
-    """
-
-    def __init__(self, pos_np, tet_np, total_mass, mu, dt, use_volume,
-                 volume_stiffness, attach_compliance_np=None, device=None):
-        self.cfg = {}
-        self.total_mass = float(total_mass)
-        self.mu = float(mu)
-        self.dt = float(dt)
-        self._device = device
-        self.use_jacobi = True
-        self.use_colored_gs = False
-        self.has_compressstiffness = False
-        self.fiber_stiffness_scale = 1.0
-        self.millard_stiffness_scale = 1.0
-        self.n_verts = int(pos_np.shape[0])
-        self.pos0_np = np.ascontiguousarray(pos_np, np.float32)
-        self.tet_np = np.asarray(tet_np, dtype=np.int64)
-        self.v_fiber_np = None
-        self.v_tendonmask_np = None
-        self._use_volume = bool(use_volume)
-        self._volume_stiffness = float(volume_stiffness)
-        self._attach_comp = (np.asarray(attach_compliance_np, np.float32)
-                             if attach_compliance_np is not None else None)
-        self._attach_offset = None
-
-        self._allocate_fields()
-        self._build_coarse_constraints()
-        self._init_fields()
-        self._precompute_rest()
-        self.pprev = wp.clone(self.pos)
-
-    def _rest_density(self):
-        _, vols, valid = self._batch_compute_tet_rest_matrices()
-        return self.total_mass / float(max(vols[valid].sum(), 1e-30))
-
-    def integrate(self):
-        wp.copy(self.pprev, self.pos)
-
-    def _build_coarse_constraints(self):
-        cons = self.create_tet_arap_constraints(
-            {'stiffness': self.mu}, ctype=ConstraintType.TETARAPSVD)
-        if self._use_volume:
-            cons += self.create_tet_volume_constraint(
-                {'stiffness': self._volume_stiffness})
-        if self._attach_comp is not None:
-            for v in range(self.n_verts):
-                k = 1.0 / float(max(self._attach_comp[v], 1e-30))
-                cons.append(dict(
-                    type=ConstraintType.ATTACH, pts=[v, -1, -1, -1],
-                    stiffness=k, compressionstiffness=-1.0, dampingratio=0.0,
-                    tetid=-1, L=[0.0, 0.0, 0.0], restlength=0.0,
-                    restvector=[0.0, 0.0, 0.0, 1.0], restdir=[0.0, 0.0, 0.0]))
-        # Finalize like MuscleSim.build_constraints: sort by type -> per-type
-        # ranges -> upload. Attach verts stay in vertex order within their range.
-        cons.sort(key=lambda c: c['type'])
-        self.n_cons = len(cons)
-        self.cons_ranges = {}
-        prev = None
-        start = 0
-        for i, c in enumerate(cons):
-            c['cidx'] = i
-            t = c['type']
-            if t != prev:
-                if prev is not None:
-                    self.cons_ranges[prev] = (start, i - start)
-                start = i
-                prev = t
-        if prev is not None:
-            self.cons_ranges[prev] = (start, self.n_cons - start)
-        self._upload_cons(cons)
-        self.reaction_accum = wp.zeros(max(self.n_cons, 1), dtype=wp.vec3)
-        if ConstraintType.ATTACH in self.cons_ranges:
-            self._attach_offset = self.cons_ranges[ConstraintType.ATTACH][0]
-
-    def set_anchor(self, target_wp):
-        """Point the attach constraints at the current projection target
-        (coarse_target): writes c_restvector[off:off+NV, :3]. Host roundtrip —
-        the coarse smoother is experimental / off by default."""
-        if self._attach_offset is None:
-            return
-        off = self._attach_offset
-        rv = self.c_restvector.numpy()
-        rv[off:off + self.n_verts, 0:3] = target_wp.numpy()
-        self.c_restvector.assign(rv)
-
-    def smooth(self, pos_wp, n_iters):
-        """Relax the cage from pos_wp for n_iters XPBD sweeps; write back to pos_wp."""
-        wp.copy(self.pos, pos_wp)
-        self.integrate()
-        for _ in range(int(n_iters)):
-            self.clear()
-            self.solve_constraints(run_extras=False)
-            self.apply_dP()
-        wp.copy(pos_wp, self.pos)
-
-
 class MultiGridSim(MuscleSim):
     """Per-frame ARAP-HPBD driver for the pin-to-target workflow.
 
@@ -186,30 +79,16 @@ class MultiGridSim(MuscleSim):
         self._device = device
 
         self.use_multigrid = bool(cfg.get("use_multigrid", False))
-        self.coarse_iters = int(cfg.get("coarse_iterations", 0))
-        # Accept either `coarse_rest_path` (preferred) or legacy
-        # `coarse_model_path` (matches realtimeMuscle scene JSONs).
-        self.coarse_rest_path = cfg.get("coarse_rest_path",
-                                        cfg.get("coarse_model_path", None))
-        if self.coarse_rest_path is not None:
-            self.coarse_rest_path = str(self.coarse_rest_path)
-        # Conforming per-muscle voxel cage baked by tools/gen_coarse_cage.py.
-        # When set it REPLACES coarse_rest_path: a true enclosing cage (every fine
-        # vert inside a same-muscle coarse tet, prolong weights in [0,1]) instead
-        # of the surface-fit lowres (61.8% of fine verts extrapolated -> spikes).
+        # Conforming per-muscle cage baked by tools/gen_coarse_cage.py: a true
+        # enclosing cage (every fine vert inside a same-muscle coarse tet, prolong
+        # weights in [0,1]). The ONLY multigrid coarse source — the legacy
+        # surface-fit lowres geo (61.8% of fine verts extrapolated -> spikes) is gone.
+        # Projection-only V-cycle: restrict the dense bone target onto the cage
+        # (Galerkin lsq) and prolong it back as the fine solve's start. No coarse
+        # ARAP relax — the cage is a pure bone-following scaffold.
         self.coarse_npz_path = cfg.get("coarse_npz_path", None)
         if self.coarse_npz_path is not None:
             self.coarse_npz_path = str(self.coarse_npz_path)
-        # Soft anchor strength for the coarse ARAP/volume smoother: each coarse
-        # iter pulls the cage a fraction back toward its bone-following projection,
-        # so the free smoother can't drift / blow up the stiff coarse volume term.
-        self.coarse_anchor = float(cfg.get("coarse_anchor", 0.0))
-        # Coarse attach compliances: stiff at tendons (bone anchor), soft at belly.
-        self.coarse_attach_tendon_compliance = float(
-            cfg.get("coarse_attach_tendon_compliance", 1.0e-7))
-        self.coarse_attach_belly_compliance = float(
-            cfg.get("coarse_attach_belly_compliance",
-                    cfg.get("pin_attach_compliance", 1.0e-1)))
         # Opt-in convergence probe: when true, the global volume-weighted ARAP
         # residual RMS is appended to self.residual_log after each fine iter
         # (and once at iter 0 = the post-pre_phase initial guess). Used to
@@ -389,28 +268,20 @@ class MultiGridSim(MuscleSim):
             # substep (restrict the dense fine target onto coarse, copy it in,
             # skip coarse ARAP). Coarse becomes a bone-driven scaffold; prolong
             # hands the belly a coarse-smoothed bone-following start, then the
-            # fine attach + collision deviate it. See _init_coarse / pre_phase.
+            # fine attach + collision deviate it. See _init_coarse_cage / pre_phase.
             print(f"[belly-attach] XPBD point attach for belly verts "
                   f"(compliance={self.pin_attach_compliance:g}); soft-blend off")
 
         if self.use_multigrid:
-            if self.coarse_npz_path is not None:
-                # The conforming voxel cage is built for the full-pin scaffold
-                # path (restrict via nearest-vert gather, no coarse ARAP). The
-                # free-ARAP path would need the tet barycentric c2f map, which
-                # the npz doesn't carry.
-                if not self.pin_belly_attach:
-                    raise ValueError(
-                        "coarse_npz_path requires pin_belly_attach=true "
-                        "(the cage feeds the full-pin scaffold path)")
-                self._init_coarse_cage()
-            elif self.coarse_rest_path is None:
+            # The conforming cage feeds the full-pin scaffold path (Galerkin
+            # restrict the dense bone target onto the cage, no coarse ARAP).
+            if self.coarse_npz_path is None:
+                raise ValueError("use_multigrid=true requires coarse_npz_path")
+            if not self.pin_belly_attach:
                 raise ValueError(
-                    "use_multigrid=true but no coarse_rest_path / "
-                    "coarse_model_path in config"
-                )
-            else:
-                self._init_coarse(rest.positions)
+                    "coarse_npz_path requires pin_belly_attach=true "
+                    "(the cage feeds the full-pin scaffold path)")
+            self._init_coarse_cage()
 
         # Fascia: a standalone shell sub-solver (its own MuscleSim: ARAP + volume)
         # coupled by anchor + two-way glue. It builds itself in __init__ (loads the
@@ -504,86 +375,15 @@ class MultiGridSim(MuscleSim):
 
     # ------------------------------------------------------------------
 
-    def _init_coarse(self, fine_rest_positions: np.ndarray) -> None:
-        """Load coarse mesh, allocate per-coarse fields, build f↔c barycentric map.
-
-        Both mappings are computed in rest pose: fine vert i → containing
-        coarse tet (cage_idx, uvw) for prolongation; coarse vert i →
-        containing fine tet (cage_idx_c2f, uvw_c2f) for restriction.
-        """
-        device = self._device
-        _check_unzipped(self.coarse_rest_path)
-        coarse = GeoFile(self.coarse_rest_path)
-        self.coarse_NV = int(coarse.positions.shape[0])
-        self.coarse_NT = int(coarse.tet_indices.shape[0])
-
-        self.coarse_pos     = wp.array(coarse.positions.copy(), dtype=wp.vec3, device=device)
-        self.coarse_tet_idx = wp.array(coarse.tet_indices, dtype=wp.vec4i, device=device)
-
-        # Coarse SoA smoother engine (free ARAP relax, no anchor) — only when the
-        # optional smoother is enabled. The default projection-only V-cycle
-        # (coarse_iters=0) needs none of the elastic fields.
-        self._coarse = None
-        if self.coarse_iters > 0:
-            self._coarse = _CoarseEngine(
-                coarse.positions, coarse.tet_indices, self.total_mass, self.mu,
-                self.dt, use_volume=False, volume_stiffness=self.volume_stiffness,
-                attach_compliance_np=None, device=device)
-
-        # Rest-pose barycentric maps (one-shot brute force).
-        fine_pos_rest = wp.array(fine_rest_positions.copy(), dtype=wp.vec3, device=device)
-
-        # fine → coarse: each fine vert i lives in some coarse tet
-        self.cage_idx = wp.zeros(self.NV, dtype=wp.int32, device=device)
-        self.uvw      = wp.zeros(self.NV, dtype=wp.vec3,  device=device)
-        wp.launch(
-            compute_barycentric_kernel,
-            dim=self.NV,
-            inputs=[fine_pos_rest, self.coarse_pos, self.coarse_tet_idx,
-                    self.cage_idx, self.uvw],
-            device=device,
-        )
-
-        # coarse → fine: each coarse vert i lives in some fine tet
-        self.cage_idx_c2f = wp.zeros(self.coarse_NV, dtype=wp.int32, device=device)
-        self.uvw_c2f      = wp.zeros(self.coarse_NV, dtype=wp.vec3,  device=device)
-        wp.launch(
-            compute_barycentric_kernel,
-            dim=self.coarse_NV,
-            inputs=[self.coarse_pos, fine_pos_rest, self.tet_indices,
-                    self.cage_idx_c2f, self.uvw_c2f],
-            device=device,
-        )
-        wp.synchronize()
-
-        # Capture the muscle fine vertex count for multigrid prolongation. self.NV
-        # is muscle-only throughout (fascia is a separate sub-solver, never merged),
-        # so mg_fine_nv == self.NV; kept as its own field for clarity at the prolong
-        # launch (the cage_idx/uvw maps cover exactly these verts).
-        self.mg_fine_nv = self.NV
-
-        # Coarse full-pin scaffold (only used when pin_belly_attach): the dense
-        # fine bone target restricted onto the coarse mesh each substep, copied
-        # straight into coarse_pos so coarse never drifts off the bone.
-        self.coarse_target = wp.zeros(self.coarse_NV, dtype=wp.vec3, device=device)
-        self.fine_target_dense = wp.zeros(self.mg_fine_nv, dtype=wp.vec3, device=device)
-
     def _init_coarse_cage(self) -> None:
         """Load the conforming per-muscle cage + baked transfer maps from the npz
         produced by tools/gen_coarse_cage.py (--method inflate, the default).
         Restrict is the Galerkin least-squares projection (P^T P)^-1 P^T; prolong
-        is the f->c barycentric. This projection-only path (coarse_iterations=0)
-        is the production default: it hands the fine solve a smooth bone-following
-        start with no measurable downside.
-
-        The coarse ARAP (+volume) elastic fields below are built UNCONDITIONALLY so
-        the optional coarse smoother (coarse_iterations>0, in pre_phase) can run,
-        but that smoother is OFF by default and currently a NET LOSS: relaxing the
-        cage pulls it off the clean Galerkin projection toward its own rest shape,
-        corrupting the prolonged start (measured: any coarse_iters>0 blows the fine
-        ARAP residual up ~100x; see docs/humanV2_cage_multigrid.md). The fields and
-        kernels are kept for a future fiber-aware coarse solve that may want to
-        relax the cage along the muscle fiber direction rather than just project."""
+        is the f->c barycentric. Projection-only V-cycle: it hands the fine solve a
+        smooth bone-following start with no measurable downside. No coarse ARAP
+        relax — a free coarse smooth dragged the cage off the clean projection
+        toward its rest shape and blew the fine residual up ~100x (removed; see
+        docs/humanV2_cage_multigrid.md)."""
         device = self._device
         # Auto-bake on first run: the cage npz is a gitignored asset, so a fresh
         # checkout won't have it. Rather than fail, invoke tools/gen_coarse_cage.py
@@ -615,22 +415,6 @@ class MultiGridSim(MuscleSim):
         self.coarse_pos = wp.array(d["coarse_pos"], dtype=wp.vec3, device=device)
         self.coarse_tet_idx = wp.array(d["coarse_tet"], dtype=wp.vec4i, device=device)
 
-        # Coarse SoA smoother engine (ARAP + optional volume + attach-to-projection)
-        # — only when the optional smoother is enabled. The default projection-only
-        # Galerkin V-cycle (coarse_iters=0) needs none of the elastic fields. The
-        # attach compliance geometrically blends stiff (tendon) to soft (belly) by
-        # the baked tendon fraction, mirroring the fine pin/attach split.
-        self._coarse = None
-        if self.coarse_iters > 0:
-            ct = (d["coarse_tendon"] if "coarse_tendon" in d
-                  else np.zeros(self.coarse_NV, np.float32)).astype(np.float64)
-            comp = np.exp((1.0 - ct) * np.log(self.coarse_attach_belly_compliance)
-                          + ct * np.log(self.coarse_attach_tendon_compliance))
-            self._coarse = _CoarseEngine(
-                d["coarse_pos"], d["coarse_tet"], self.total_mass, self.mu,
-                self.dt, use_volume=self.use_volume,
-                volume_stiffness=self.volume_stiffness,
-                attach_compliance_np=comp.astype(np.float32), device=device)
         # f->c prolongation (per fine muscle vert).
         self.cage_idx = wp.array(d["cage_idx"], dtype=wp.int32, device=device)
         self.uvw = wp.array(d["uvw"], dtype=wp.vec3, device=device)
@@ -647,9 +431,7 @@ class MultiGridSim(MuscleSim):
         self.fine_target_dense = wp.zeros(self.mg_fine_nv, dtype=wp.vec3, device=device)
         print(f"[coarse-cage] loaded {self.coarse_npz_path}: "
               f"coarse NV={self.coarse_NV} NT={self.coarse_NT}; "
-              f"Galerkin lsq restrict, coarse_iters={self.coarse_iters}"
-              f"{' (relax: experimental/off by default)' if self.coarse_iters > 0 else ''}"
-              f"{'+vol' if self.use_volume else ''}")
+              f"Galerkin lsq restrict (projection-only)")
 
     # ------------------------------------------------------------------
 
@@ -737,81 +519,41 @@ class MultiGridSim(MuscleSim):
                 device=self._device,
             )
 
-    # ─── Multigrid V-cycle: restrict → (coarse smooth, off) → prolong ────────
+    # ─── Multigrid V-cycle: restrict → prolong (projection-only) ─────────────
 
     def _restrict(self) -> None:
         """Fine → coarse transfer, writing ``coarse_pos``.
 
-        Two modes:
-          * belly-attach: coarse is a bone-driven scaffold. Scatter the dense
-            fine bone target, Galerkin least-squares restrict it onto the cage
-            (Cdef=(P^T P)^-1 P^T T — smoothest cage deformation reproducing the
-            target), copy straight in. No coarse ARAP, so it can't drift and
-            feed the unpinned belly a divergent start.
-          * direct V-cycle: restrict the current fine positions onto coarse for
-            the free ARAP relax that follows.
+        Coarse is a bone-driven scaffold (pin_belly_attach, enforced at build):
+        scatter the dense fine bone target, Galerkin least-squares restrict it
+        onto the cage (Cdef=(P^T P)^-1 P^T T — smoothest cage deformation
+        reproducing the target), copy straight in. No coarse ARAP, so it can't
+        drift and feed the unpinned belly a divergent start.
         """
         s = self
-        if s.pin_belly_attach:
-            wp.launch(
-                scatter_target_kernel,
-                dim=s.NCONS,
-                inputs=[s.pts, s.target_pos, s.rest_offset, s.fine_target_dense],
-                device=s._device,
-            )
-            if getattr(s, "minv_flat", None) is not None:
-                # b = P^T T (atomic scatter), then per-muscle block solve
-                # Cdef = Minv b. (Legacy lowres path used restrict_direct_kernel
-                # on the tet-barycentric c2f map — removed, ~6x more strain.)
-                s.coarse_b.zero_()
-                wp.launch(
-                    restrict_galerkin_scatter_kernel,
-                    dim=s.mg_fine_nv,
-                    inputs=[s.cage_idx, s.uvw, s.coarse_tet_idx,
-                            s.fine_target_dense, s.coarse_b],
-                    device=s._device,
-                )
-                wp.launch(
-                    block_solve_kernel,
-                    dim=s.coarse_NV,
-                    inputs=[s.minv_flat, s.blk_base, s.blk_dim,
-                            s.blk_matoff, s.coarse_b, s.coarse_target],
-                    device=s._device,
-                )
-            wp.copy(s.coarse_pos, s.coarse_target)
-        else:
-            wp.launch(
-                restrict_direct_kernel,
-                dim=s.coarse_NV,
-                inputs=[s.pos, s.tet_indices,
-                        s.cage_idx_c2f, s.uvw_c2f, s.coarse_pos],
-                device=s._device,
-            )
-
-    def _coarse_smooth(self) -> None:
-        """Optional coarse cage relax — OFF by default (coarse_iterations=0) and
-        currently a NET LOSS, kept for a future fiber-aware solve.
-
-        Runs the SAME XPBD dispatch as the fine level via the nested
-        ``_CoarseEngine`` (ARAP-SVD + optional volume; in belly-attach it also
-        anchors each iter back to the Galerkin projection ``coarse_target``).
-
-        Idea: relax incompressibility cheaply on the small cage, prolong the
-        correction to the belly. Measured reality: relaxing drags the cage off
-        the clean Galerkin projection toward its own (inflated) rest shape, so
-        any coarse_iters>0 corrupts the prolonged start and blows the fine ARAP
-        residual up ~100x. Do not enable without a fiber-direction-aware coarse
-        energy. See docs/humanV2_cage_multigrid.md.
-        """
-        s = self
-        if getattr(s, "_coarse", None) is None or s.coarse_iters <= 0:
-            return
-        if s.pin_belly_attach:
-            # Anchor target is the Galerkin projection; meaningless without it.
-            if getattr(s, "minv_flat", None) is None:
-                return
-            s._coarse.set_anchor(s.coarse_target)
-        s._coarse.smooth(s.coarse_pos, s.coarse_iters)
+        wp.launch(
+            scatter_target_kernel,
+            dim=s.NCONS,
+            inputs=[s.pts, s.target_pos, s.rest_offset, s.fine_target_dense],
+            device=s._device,
+        )
+        # b = P^T T (atomic scatter), then per-muscle block solve Cdef = Minv b.
+        s.coarse_b.zero_()
+        wp.launch(
+            restrict_galerkin_scatter_kernel,
+            dim=s.mg_fine_nv,
+            inputs=[s.cage_idx, s.uvw, s.coarse_tet_idx,
+                    s.fine_target_dense, s.coarse_b],
+            device=s._device,
+        )
+        wp.launch(
+            block_solve_kernel,
+            dim=s.coarse_NV,
+            inputs=[s.minv_flat, s.blk_base, s.blk_dim,
+                    s.blk_matoff, s.coarse_b, s.coarse_target],
+            device=s._device,
+        )
+        wp.copy(s.coarse_pos, s.coarse_target)
 
     def _prolong(self) -> None:
         """Coarse → fine transfer: blend each fine vert from its containing
@@ -829,10 +571,10 @@ class MultiGridSim(MuscleSim):
 
         def pre_phase():
             if s.use_multigrid:
-                # V-cycle: restrict fine→coarse, optionally relax the cage
-                # (off by default), prolong coarse→fine, then re-pin kinematically.
+                # V-cycle: restrict fine→coarse (Galerkin projection of the bone
+                # target onto the cage), prolong coarse→fine, then re-pin
+                # kinematically. Projection-only — no coarse relax.
                 s._restrict()
-                s._coarse_smooth()
                 s._prolong()
                 s.apply_pintotarget()
             elif s.pin_active is not None:

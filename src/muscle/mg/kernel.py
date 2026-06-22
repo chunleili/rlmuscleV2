@@ -4,67 +4,6 @@ import warp as wp
 
 
 @wp.kernel
-def compute_barycentric_kernel(
-    query_pos: wp.array(dtype=wp.vec3),
-    cage_pos: wp.array(dtype=wp.vec3),
-    cage_tet: wp.array(dtype=wp.vec4i),
-    out_cage_idx: wp.array(dtype=wp.int32),
-    out_bary: wp.array(dtype=wp.vec3),
-):
-    """For each query point, find a cage tet containing it (brute force).
-
-    Mirrors `compute_barycentric_kernel` in
-    realtimeMuscle/engine/compute_R_acc.py — falls back to nearest-vertex tet
-    if no container is found. Brute force is fine: this runs once at init.
-    """
-    i = wp.tid()
-    p = query_pos[i]
-    n_cage = cage_tet.shape[0]
-
-    found_idx = int(-1)
-    found_bary = wp.vec3(0.0, 0.0, 0.0)
-    min_dis = float(1.0e30)
-    nearest_tet = int(0)
-    nearest_bary = wp.vec3(0.0, 0.0, 0.0)
-
-    for t in range(n_cage):
-        idx = cage_tet[t]
-        p0 = cage_pos[idx[0]]
-        p1 = cage_pos[idx[1]]
-        p2 = cage_pos[idx[2]]
-        p3 = cage_pos[idx[3]]
-        Am = wp.mat33(
-            p1[0] - p0[0], p2[0] - p0[0], p3[0] - p0[0],
-            p1[1] - p0[1], p2[1] - p0[1], p3[1] - p0[1],
-            p1[2] - p0[2], p2[2] - p0[2], p3[2] - p0[2],
-        )
-        bv = p - p0
-        x = wp.inverse(Am) * bv
-        contained = (x[0] >= 0.0 and x[1] >= 0.0 and x[2] >= 0.0
-                     and (x[0] + x[1] + x[2] <= 1.0))
-        if contained and found_idx == -1:
-            found_idx = t
-            found_bary = x
-
-        d0 = wp.length(p0 - p)
-        d1 = wp.length(p1 - p)
-        d2 = wp.length(p2 - p)
-        d3 = wp.length(p3 - p)
-        dm = wp.min(wp.min(d0, d1), wp.min(d2, d3))
-        if dm < min_dis:
-            min_dis = dm
-            nearest_tet = t
-            nearest_bary = x
-
-    if found_idx >= 0:
-        out_cage_idx[i] = found_idx
-        out_bary[i] = found_bary
-    else:
-        out_cage_idx[i] = nearest_tet
-        out_bary[i] = nearest_bary
-
-        
-@wp.kernel
 def scatter_target_kernel(
     pts: wp.array(dtype=wp.int32),
     target_pos: wp.array(dtype=wp.vec3),
@@ -75,7 +14,7 @@ def scatter_target_kernel(
 
     ``dense_target[pts[i]] = target_pos[i] + rest_offset[i]``. For humanV2
     pts covers every muscle vertex, so dense_target is fully written; it
-    feeds restrict_direct_kernel to build the coarse full-pin target.
+    feeds the Galerkin restrict to build the coarse full-pin target.
     """
     i = wp.tid()
     dense_target[pts[i]] = target_pos[i] + rest_offset[i]
@@ -123,36 +62,6 @@ def block_solve_kernel(
     for j in range(d):
         acc = acc + minv[row + j] * b[bs + j]
     coarse_target[c] = acc
-
-
-
-    
-
-@wp.kernel
-def restrict_direct_kernel(
-    fine_pos: wp.array(dtype=wp.vec3),
-    fine_tet: wp.array(dtype=wp.vec4i),
-    cage_idx_c2f: wp.array(dtype=wp.int32),
-    uvw_c2f: wp.array(dtype=wp.vec3),
-    coarse_pos: wp.array(dtype=wp.vec3),
-):
-    """coarse.pos[i] = blend(fine.pos at containing fine tet).
-
-    Direct restriction. Stable V-cycle: coarse mirrors fine each substep,
-    relaxes elasticity, prolongs back, fine re-pins and refines. Replaces
-    the dp variant from arap_hpbd_nogui.py which is unstable under
-    quasi-static (fine_old_pos never updated → cumulative coarse strain).
-    """
-    i = wp.tid()
-    t = cage_idx_c2f[i]
-    idx = fine_tet[t]
-    uvw = uvw_c2f[i]
-    u = uvw[0]
-    v = uvw[1]
-    w = uvw[2]
-    a = 1.0 - u - v - w
-    coarse_pos[i] = (a * fine_pos[idx[0]] + u * fine_pos[idx[1]]
-                     + v * fine_pos[idx[2]] + w * fine_pos[idx[3]])
 
 
 @wp.kernel
