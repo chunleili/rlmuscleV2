@@ -454,8 +454,6 @@ def build_humanV2_sim_from_args(args):
         cfg["use_multigrid"] = False
     if getattr(args, "tendon_pin_threshold", None) is not None:
         cfg["tendon_pin_threshold"] = args.tendon_pin_threshold
-    if getattr(args, "pin_soft_stiffness", None) is not None:
-        cfg["pin_soft_stiffness"] = args.pin_soft_stiffness
     if getattr(args, "fiber", "none") not in ("none", None):
         cfg["use_fiber"] = True
         cfg["fiber_model"] = args.fiber

@@ -95,18 +95,6 @@ def prolong_kernel(
 # rather than in constraint/solve_kernels.py.
 
 @wp.kernel
-def pintotarget_overwrite_kernel(
-    pts: wp.array(dtype=wp.int32),
-    target_pos: wp.array(dtype=wp.vec3),
-    rest_offset: wp.array(dtype=wp.vec3),
-    pos: wp.array(dtype=wp.vec3),
-):
-    """Hard-overwrite ``pos[pts[i]] = target_pos[i] + rest_offset[i]``."""
-    i = wp.tid()
-    pos[pts[i]] = target_pos[i] + rest_offset[i]
-
-
-@wp.kernel
 def pintotarget_overwrite_masked_kernel(
     pts: wp.array(dtype=wp.int32),
     target_pos: wp.array(dtype=wp.vec3),
@@ -114,28 +102,10 @@ def pintotarget_overwrite_masked_kernel(
     active: wp.array(dtype=wp.int32),     # 1 = apply pin, 0 = skip (freed vert)
     pos: wp.array(dtype=wp.vec3),
 ):
-    """Like pintotarget_overwrite_kernel but skips verts whose pin is freed
-    (active==0) so the fascia two-way glue can pull them inward."""
+    """Hard-overwrite ``pos[pts[i]] = target_pos[i] + rest_offset[i]`` for pinned
+    tendon verts; skip freed verts (active==0) so the fascia two-way glue +
+    belly-attach can pull them inward."""
     i = wp.tid()
     if active[i] == 0:
         return
     pos[pts[i]] = target_pos[i] + rest_offset[i]
-
-
-@wp.kernel
-def pintotarget_soft_kernel(
-    pts: wp.array(dtype=wp.int32),
-    target_pos: wp.array(dtype=wp.vec3),
-    rest_offset: wp.array(dtype=wp.vec3),
-    active: wp.array(dtype=wp.int32),     # 0 = freed vert (gets soft pull), 1 = skip
-    stiffness: float,                     # in [0,1]: fraction toward bone target / substep
-    pos: wp.array(dtype=wp.vec3),
-):
-    """Soft pin for FREED verts: blend pos a fraction toward the bone target so
-    they track gross body motion while still yielding to the fascia squeeze."""
-    i = wp.tid()
-    if active[i] != 0:
-        return
-    pid = pts[i]
-    tgt = target_pos[i] + rest_offset[i]
-    pos[pid] = pos[pid] + stiffness * (tgt - pos[pid])

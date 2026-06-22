@@ -68,11 +68,6 @@ class MultiGridSim(MuscleSim):
             self.fascia_path = str(Path.cwd() / self.fascia_path)
         self.fascia_rest_scale = float(cfg.get("fascia_rest_scale", 0.95))
         self.fascia_glue_iters = int(cfg.get("fascia_glue_iterations", self.fine_iters))
-        # Soft-pin stiffness for FREED muscle verts (fraction toward bone target
-        # per substep). Keeps freed verts tracking gross body motion so they
-        # don't tear loose when the per-frame target jumps, while still letting
-        # the fascia glue pull them inward. 0 disables (pure free).
-        self.fascia_soft_pin = float(cfg.get("fascia_soft_pin", 0.5))
         self.dt = self.dt_frame / self.nsubsteps
         self.end_frame = int(cfg.get("end_frame", 90))
         self.start_frame = int(cfg.get("start_frame", 1))
@@ -228,59 +223,39 @@ class MultiGridSim(MuscleSim):
         self.rest_offset = wp.array(rest_offset_np, dtype=wp.vec3, device=device)
         self.target_pos = wp.array(cons0.target_pos.copy(), dtype=wp.vec3, device=device)
 
-        # Optional PARTIAL pinning. humanV2 is fully pinned (pts == all NV): every
-        # vert is hard-overwritten to a per-frame target each substep, and those
-        # targets self-overlap, so the belly is forced through neighbouring
-        # muscles and no collision push can hold. With tendon_pin_threshold set,
-        # only verts whose tendonmask exceeds it (the tendon attachment regions)
-        # stay HARD-pinned; the belly is freed to a soft pull toward target
-        # (pin_soft_stiffness) so it tracks gross body motion while yielding to
-        # collision. Reuses the fascia free/soft-pin path (mutually exclusive with
-        # fascia, which rebuilds pin_active from its own glue ring below).
+        # Partial pinning (REQUIRED). Fully hard-pinning every vert (pts == all NV,
+        # targets self-overlap) forces the belly through neighbouring muscles with
+        # no collision give. Instead: verts whose tendonmask exceeds
+        # tendon_pin_threshold (the tendon attachment regions) stay HARD-pinned; the
+        # belly is freed and driven by the compliant belly-attach below. Fascia
+        # rebuilds pin_active from its own glue ring later.
         self.tendon_pin_threshold = cfg.get("tendon_pin_threshold", None)
-        if self.tendon_pin_threshold is not None:
-            tmask = rest.point_attr("tendonmask").astype(np.float32)
-            active = (tmask[self._pin_pts_np]
-                      > float(self.tendon_pin_threshold)).astype(np.int32)
-            self.pin_active = wp.array(active, dtype=wp.int32, device=device)
-            self.fascia_soft_pin = float(
-                cfg.get("pin_soft_stiffness", self.fascia_soft_pin))
-            print(f"[partial-pin] tendonmask>{self.tendon_pin_threshold}: "
-                  f"{int(active.sum())}/{len(active)} hard pins, "
-                  f"rest soft (stiffness={self.fascia_soft_pin})")
+        if self.tendon_pin_threshold is None:
+            raise ValueError("tendon_pin_threshold is required (defines the hard "
+                             "tendon vs freed-belly split)")
+        tmask = rest.point_attr("tendonmask").astype(np.float32)
+        active = (tmask[self._pin_pts_np]
+                  > float(self.tendon_pin_threshold)).astype(np.int32)
+        self.pin_active = wp.array(active, dtype=wp.int32, device=device)
+        print(f"[partial-pin] tendonmask>{self.tendon_pin_threshold}: "
+              f"{int(active.sum())}/{len(active)} hard pins, rest belly-attach")
 
-        # Belly attach mode: tendons (pin_active==1) stay hard-pinned; the belly
-        # (pin_active==0) is tied to its bone target by a compliant XPBD point
-        # constraint solved in the iteration loop (attach_target_kernel) instead
-        # of the position-blend soft pin. Force-based, so collision/fascia can
-        # compete with it. Requires pin_active (set via tendon_pin_threshold).
-        self.pin_belly_attach = bool(cfg.get("pin_belly_attach", False))
+        # Belly attach: the freed belly (pin_active==0) is tied to its bone target
+        # by a compliant XPBD point constraint solved in the iteration loop
+        # (attach_target_kernel). Force-based, so collision / fascia compete with
+        # it (vs a position-blend pin they could not move). The fine attach is
+        # built after fascia (so pin_active reflects the glue-ring free).
         self.pin_attach_compliance = float(cfg.get("pin_attach_compliance", 1e-6))
         self.attach_L = None
-        if self.pin_belly_attach:
-            if self.pin_active is None:
-                raise ValueError("pin_belly_attach=true needs tendon_pin_threshold "
-                                 "(to define the hard tendon vs belly split)")
-            # MG + attach: free coarse ARAP would drift off the (unanchored)
-            # restricted tendon positions and the prolonged belly — which the
-            # fine level no longer hard-pins — accumulates that drift → NaN.
-            # Fix (pre_phase): coarse is FULL-pinned to the bone target each
-            # substep (restrict the dense fine target onto coarse, copy it in,
-            # skip coarse ARAP). Coarse becomes a bone-driven scaffold; prolong
-            # hands the belly a coarse-smoothed bone-following start, then the
-            # fine attach + collision deviate it. See _init_coarse_cage / pre_phase.
-            print(f"[belly-attach] XPBD point attach for belly verts "
-                  f"(compliance={self.pin_attach_compliance:g}); soft-blend off")
+        print(f"[belly-attach] XPBD point attach for belly verts "
+              f"(compliance={self.pin_attach_compliance:g})")
 
         if self.use_multigrid:
             # The conforming cage feeds the full-pin scaffold path (Galerkin
-            # restrict the dense bone target onto the cage, no coarse ARAP).
+            # restrict the dense bone target onto the cage, no coarse ARAP) — it
+            # hands the belly a smooth bone-following start before the fine attach.
             if self.coarse_npz_path is None:
                 raise ValueError("use_multigrid=true requires coarse_npz_path")
-            if not self.pin_belly_attach:
-                raise ValueError(
-                    "coarse_npz_path requires pin_belly_attach=true "
-                    "(the cage feeds the full-pin scaffold path)")
             self._init_coarse_cage()
 
         # Fascia: a standalone shell sub-solver (its own MuscleSim: ARAP + volume)
@@ -295,9 +270,8 @@ class MultiGridSim(MuscleSim):
         # Fine belly-attach (built last so pin_active reflects tendon_pin / fascia):
         # each freed belly vert gets a compliant ATTACH toward its per-frame bone
         # target, appended to the SoA constraint table + refreshed each frame.
-        if self.pin_belly_attach:
-            self._build_fine_belly_attach()
-            self._update_belly_attach_targets()
+        self._build_fine_belly_attach()
+        self._update_belly_attach_targets()
 
 
     # ------------------------------------------------------------------
@@ -490,42 +464,24 @@ class MultiGridSim(MuscleSim):
         self._update_belly_attach_targets()
 
     def apply_pintotarget(self) -> None:
-        if getattr(self, "pin_active", None) is not None:
-            wp.launch(
-                pintotarget_overwrite_masked_kernel,
-                dim=self.NCONS,
-                inputs=[self.pts, self.target_pos, self.rest_offset,
-                        self.pin_active, self.pos],
-                device=self._device,
-            )
-            # Soft-pull the freed verts toward their bone target so they track
-            # gross body motion (per-frame target jumps) while still yielding
-            # inward to the fascia squeeze. Skipped under belly-attach mode: the
-            # belly is handled by the compliant XPBD attach in the iter loop
-            # instead (a position blend here would double-pull + overwrite it).
-            if self.fascia_soft_pin > 0.0 and not self.pin_belly_attach:
-                wp.launch(
-                    pintotarget_soft_kernel,
-                    dim=self.NCONS,
-                    inputs=[self.pts, self.target_pos, self.rest_offset,
-                            self.pin_active, self.fascia_soft_pin, self.pos],
-                    device=self._device,
-                )
-        else:
-            wp.launch(
-                pintotarget_overwrite_kernel,
-                dim=self.NCONS,
-                inputs=[self.pts, self.target_pos, self.rest_offset, self.pos],
-                device=self._device,
-            )
+        # Hard-overwrite the pinned tendon verts (pin_active==1) to their per-frame
+        # bone target. Freed belly verts (pin_active==0) are skipped here and driven
+        # by the compliant belly-attach constraint in the iter loop instead.
+        wp.launch(
+            pintotarget_overwrite_masked_kernel,
+            dim=self.NCONS,
+            inputs=[self.pts, self.target_pos, self.rest_offset,
+                    self.pin_active, self.pos],
+            device=self._device,
+        )
 
     # ─── Multigrid V-cycle: restrict → prolong (projection-only) ─────────────
 
     def _restrict(self) -> None:
         """Fine → coarse transfer, writing ``coarse_pos``.
 
-        Coarse is a bone-driven scaffold (pin_belly_attach, enforced at build):
-        scatter the dense fine bone target, Galerkin least-squares restrict it
+        Coarse is a bone-driven scaffold: scatter the dense fine bone target,
+        Galerkin least-squares restrict it
         onto the cage (Cdef=(P^T P)^-1 P^T T — smoothest cage deformation
         reproducing the target), copy straight in. No coarse ARAP, so it can't
         drift and feed the unpinned belly a divergent start.
@@ -577,10 +533,10 @@ class MultiGridSim(MuscleSim):
                 s._restrict()
                 s._prolong()
                 s.apply_pintotarget()
-            elif s.pin_active is not None:
-                # Partial pin without multigrid: still re-apply pin every substep
-                # so the hard tendon anchors hold and freed belly verts get their
-                # soft pull (the multigrid branch above does this via prolong).
+            else:
+                # No multigrid: re-apply the hard tendon pin every substep (the
+                # MG branch above does this via prolong). Freed belly verts are
+                # driven by the compliant belly-attach in iter_phase.
                 s.apply_pintotarget()
             # Fascia anchor + glue run in post_phase (s.fascia.substep), AFTER the
             # muscle solve, so the shell tracks the just-updated muscle and the

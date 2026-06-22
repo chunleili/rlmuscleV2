@@ -227,34 +227,8 @@ class Fascia(MuscleSim):
         nvm = rest_muscle_pos.shape[0]
 
         glue_scale = float(cfg.get("fascia_glue_stiffness_scale", 0.001))
-        glue_mode = str(cfg.get("fascia_glue_mode", "groups"))
-        if glue_mode == "surface":
-            glue_fascia, glue_muscle, glue_restlen, glue_stiff = self._pair_surface(
-                fg, fascia_pos, mrest, rest_muscle_pos, glue_scale)
-        else:
-            surf = mrest.point_group("surface_points")
-            surf_tree = cKDTree(rest_muscle_pos[surf])
-
-            def pair(group_name, dist_attr, stiff_attr):
-                if group_name not in fg._groups:
-                    return (np.zeros(0, np.int32), np.zeros(0, np.int32),
-                            np.zeros(0, np.float32), np.zeros(0, np.float32))
-                fids = fg.point_group(group_name)
-                d, loc = surf_tree.query(fascia_pos[fids], k=1)
-                mids = surf[loc].astype(np.int32)
-                want = fg.point_attr(dist_attr)[fids].astype(np.float32)
-                restlen = np.minimum(want, d.astype(np.float32))
-                stiff = fg.point_attr(stiff_attr)[fids].astype(np.float32)
-                return fids.astype(np.int32), mids, restlen, stiff
-
-            gi_f, gi_m, gi_r, gi_s = pair("tissue_inner_points",
-                                          "tissuetomuscledistance", "tissuetomusclestiffness")
-            gb_f, gb_m, gb_r, gb_s = pair("tissue_bone_points",
-                                          "tissuetobonedistance", "tissuetobonestiffness")
-            glue_fascia = np.concatenate([gi_f, gb_f])
-            glue_muscle = np.concatenate([gi_m, gb_m])
-            glue_restlen = np.concatenate([gi_r, gb_r])
-            glue_stiff = np.concatenate([gi_s, gb_s]) * glue_scale
+        glue_fascia, glue_muscle, glue_restlen, glue_stiff = self._pair_surface(
+            fg, fascia_pos, mrest, rest_muscle_pos, glue_scale)
 
         # Bone follow: every fascia vert rides the SKELETON, not the muscle it
         # squeezes. The parent is fully pinned (pts == all NV), so target_pos is a
@@ -273,7 +247,7 @@ class Fascia(MuscleSim):
             follow_cons[miss] = ploc
 
         log.info(f"fascia: {fascia_pos.shape[0]} verts, {self.NT} tets; "
-                 f"glue mode={glue_mode}, glue pairs={len(glue_fascia)}; "
+                 f"surface glue pairs={len(glue_fascia)}; "
                  f"bone-follow all {fascia_pos.shape[0]} verts; rest_scale={self._rest_scale}")
 
         # Free the muscle verts the fascia glues to (+ dilated ring) from the pin
