@@ -10,6 +10,7 @@
     "use_multigrid":false,
     "omega":0.1,
     "mu":1e9,
+    "use_volume":false,
     "delta_t":0.04166,
     "damping_coeff":1.0,
     "gravity":[0.0, 0.0, 0.0],

@@ -218,11 +218,11 @@ class MultiGridSim(MuscleSim):
         self.residual_log = []
         self._resid_buf = None
 
-        # Optional explicit hydrostatic volume constraint (incompressibility).
-        # ARAP-SVD matches shape only; with use_volume the fine loop adds a
-        # det(F)=1 XPBD constraint at stiffness volume_stiffness. Off by default
-        # so existing configs reproduce the pure ARAP-HPBD behaviour exactly.
-        self.use_volume = bool(cfg.get("use_volume", False))
+        # Hydrostatic volume constraint (incompressibility). ARAP-SVD matches
+        # shape only; the fine loop adds a det(F)=1 XPBD constraint at stiffness
+        # volume_stiffness. ON by default — incompressibility is intrinsic to
+        # muscle/soft tissue; set "use_volume": false to recover pure ARAP-HPBD.
+        self.use_volume = bool(cfg.get("use_volume", True))
         self.volume_stiffness = float(cfg.get("volume_stiffness", 1.0e10))
 
         # Optional PASSIVE fiber constraint. The humanV2 asset (restpos.geo)
