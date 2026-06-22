@@ -647,6 +647,49 @@ def scatter_target_kernel(
 
 
 @wp.kernel
+def coarse_attach_kernel(
+    coarse_target: wp.array(dtype=wp.vec3),
+    compliance: wp.array(dtype=wp.float32),   # per coarse vert (stiff tendon / soft belly)
+    inv_mass: wp.array(dtype=wp.float32),
+    pos_mid: wp.array(dtype=wp.vec3),
+    L: wp.array(dtype=wp.float32),
+    dt: float,
+    omega: float,
+    pos: wp.array(dtype=wp.vec3),
+):
+    """XPBD point attach of each coarse vert to its bone-following projection
+    target, with per-vert compliance: stiff at tendons (bone anchor), soft at the
+    belly. This turns the free coarse ARAP/volume smoother into the same pinned
+    BVP as the fine level, so relaxing it no longer drifts back toward rest."""
+    c = wp.tid()
+    w = inv_mass[c]
+    if w <= 0.0:
+        return
+    d = pos_mid[c] - coarse_target[c]
+    C = wp.length(d)
+    if C < 1.0e-9:
+        return
+    n = d / C
+    at = compliance[c] / (dt * dt)
+    dl = -(C + at * L[c]) / (w + at)
+    L[c] = L[c] + dl
+    wp.atomic_add(pos, c, (omega * dl * w) * n)
+
+
+@wp.kernel
+def lerp_to_target_kernel(
+    target: wp.array(dtype=wp.vec3),
+    beta: float,
+    pos: wp.array(dtype=wp.vec3),
+):
+    """pos += beta*(target - pos): soft anchor pulling the relaxing coarse cage
+    back toward its bone-following projection, so the free coarse ARAP/volume
+    smoother can't drift off (rigid modes) or blow up the stiff volume term."""
+    i = wp.tid()
+    pos[i] = pos[i] + beta * (target[i] - pos[i])
+
+
+@wp.kernel
 def restrict_galerkin_scatter_kernel(
     cage_idx: wp.array(dtype=wp.int32),       # fine vert -> coarse tet (prolong P)
     uvw: wp.array(dtype=wp.vec3),
@@ -1157,6 +1200,16 @@ class OneWaySim(XpbdEngine):
         self.coarse_npz_path = cfg.get("coarse_npz_path", None)
         if self.coarse_npz_path is not None:
             self.coarse_npz_path = str(self.coarse_npz_path)
+        # Soft anchor strength for the coarse ARAP/volume smoother: each coarse
+        # iter pulls the cage a fraction back toward its bone-following projection,
+        # so the free smoother can't drift / blow up the stiff coarse volume term.
+        self.coarse_anchor = float(cfg.get("coarse_anchor", 0.0))
+        # Coarse attach compliances: stiff at tendons (bone anchor), soft at belly.
+        self.coarse_attach_tendon_compliance = float(
+            cfg.get("coarse_attach_tendon_compliance", 1.0e-7))
+        self.coarse_attach_belly_compliance = float(
+            cfg.get("coarse_attach_belly_compliance",
+                    cfg.get("pin_attach_compliance", 1.0e-1)))
         # Opt-in convergence probe: when true, the global volume-weighted ARAP
         # residual RMS is appended to self.residual_log after each fine iter
         # (and once at iter 0 = the post-pre_phase initial guess). Used to
@@ -1618,9 +1671,11 @@ class OneWaySim(XpbdEngine):
 
     def _init_coarse_cage(self) -> None:
         """Load the conforming per-muscle voxel cage + baked transfer maps from
-        the npz produced by tools/gen_coarse_cage.py. Only the full-pin scaffold
-        path uses it: prolong (f->c barycentric, weights in [0,1]) and restrict
-        (c->f nearest-vert gather). No coarse ARAP, so no rest/mass fields."""
+        the npz produced by tools/gen_coarse_cage.py. Restrict is the Galerkin
+        least-squares projection (P^T P)^-1 P^T; prolong is the f->c barycentric.
+        With coarse_iterations>0 the coarse cage also relaxes ARAP (+ volume) each
+        substep — the cheap place to converge the low-frequency incompressibility
+        that the fine det(F)=1 constraint struggles with."""
         device = self._device
         d = np.load(self.coarse_npz_path)
         npz_fine_nv = int(d["mg_fine_nv"])
@@ -1634,6 +1689,45 @@ class OneWaySim(XpbdEngine):
         self.coarse_pos = wp.array(d["coarse_pos"], dtype=wp.vec3, device=device)
         self.coarse_pos_mid = wp.clone(self.coarse_pos)
         self.coarse_tet_idx = wp.array(d["coarse_tet"], dtype=wp.vec4i, device=device)
+
+        # Coarse elastic fields (ARAP + optional volume) so the cage can relax,
+        # not just project. precompute_rest fills B / rest_volume / ARAP alpha.
+        self.coarse_B           = wp.zeros(self.coarse_NT, dtype=wp.mat33,   device=device)
+        self.coarse_rest_volume = wp.zeros(self.coarse_NT, dtype=wp.float32, device=device)
+        self.coarse_alpha       = wp.zeros(self.coarse_NT, dtype=wp.float32, device=device)
+        self.coarse_L           = wp.zeros(self.coarse_NT, dtype=wp.float32, device=device)
+        wp.launch(precompute_rest_kernel, dim=self.coarse_NT,
+                  inputs=[self.coarse_pos, self.coarse_tet_idx, self.coarse_B,
+                          self.coarse_rest_volume, self.coarse_alpha, self.mu],
+                  device=device)
+        V0c = self.coarse_rest_volume.numpy()
+        density_c = self.total_mass / float(max(V0c.sum(), 1e-30))
+        mass_c = np.zeros(self.coarse_NV, dtype=np.float32)
+        tetc = d["coarse_tet"]
+        for k in range(4):
+            np.add.at(mass_c, tetc[:, k], density_c * V0c / 4.0)
+        self.coarse_inv_mass = wp.array(
+            np.where(mass_c > 0, 1.0 / np.maximum(mass_c, 1e-30), 0.0).astype(np.float32),
+            dtype=wp.float32, device=device)
+        self.coarse_vol_alpha = None
+        if self.use_volume:
+            with np.errstate(divide="ignore"):
+                va = 1.0 / (self.volume_stiffness * V0c)
+            va[~np.isfinite(va)] = 1.0e30
+            va[V0c <= 0.0] = 1.0e30
+            self.coarse_vol_alpha = wp.array(va.astype(np.float32), dtype=wp.float32, device=device)
+            self.coarse_vol_L = wp.zeros(self.coarse_NT, dtype=wp.float32, device=device)
+        # Coarse attach: anchors the coarse smoother to its bone-following
+        # projection. Per-vert compliance geometrically blends stiff (tendon) to
+        # soft (belly) by the baked tendon fraction, mirroring the fine pin/attach
+        # split so the coarse solve is the same constrained problem.
+        ct = (d["coarse_tendon"] if "coarse_tendon" in d
+              else np.zeros(self.coarse_NV, np.float32)).astype(np.float64)
+        comp = np.exp((1.0 - ct) * np.log(self.coarse_attach_belly_compliance)
+                      + ct * np.log(self.coarse_attach_tendon_compliance))
+        self.coarse_attach_compliance = wp.array(comp.astype(np.float32),
+                                                 dtype=wp.float32, device=device)
+        self.coarse_attach_L = wp.zeros(self.coarse_NV, dtype=wp.float32, device=device)
         # f->c prolongation (per fine muscle vert).
         self.cage_idx = wp.array(d["cage_idx"], dtype=wp.int32, device=device)
         self.uvw = wp.array(d["uvw"], dtype=wp.vec3, device=device)
@@ -1650,7 +1744,9 @@ class OneWaySim(XpbdEngine):
         self.fine_target_dense = wp.zeros(self.mg_fine_nv, dtype=wp.vec3, device=device)
         print(f"[coarse-cage] loaded {self.coarse_npz_path}: "
               f"coarse NV={self.coarse_NV} NT={self.coarse_NT} "
-              f"(voxel={float(d['voxel']):.3f}m); Galerkin lsq restrict")
+              f"(voxel={float(d['voxel']):.3f}m); Galerkin lsq restrict, "
+              f"coarse_iters={self.coarse_iters}"
+              f"{'+vol' if self.use_volume else ''}")
 
     # ------------------------------------------------------------------
 
@@ -1777,6 +1873,42 @@ class OneWaySim(XpbdEngine):
                             device=s._device,
                         )
                     wp.copy(s.coarse_pos, s.coarse_target)
+                    # Coarse smoother: relax ARAP (+ volume) on the cage, starting
+                    # from the bone-following projection. The coarse mesh is small
+                    # and low-frequency, so the det(F)=1 incompressibility that the
+                    # fine solve barely moves converges here in a few iters; prolong
+                    # then carries that low-freq volume/shape correction to the belly.
+                    if getattr(s, "minv_flat", None) is not None and s.coarse_iters > 0:
+                        s.coarse_L.zero_()
+                        s.coarse_attach_L.zero_()
+                        if s.coarse_vol_alpha is not None:
+                            s.coarse_vol_L.zero_()
+                        for _ in range(s.coarse_iters):
+                            wp.copy(s.coarse_pos_mid, s.coarse_pos)
+                            wp.launch(
+                                arap_svd_kernel, dim=s.coarse_NT,
+                                inputs=[s.coarse_pos_mid, s.coarse_tet_idx,
+                                        s.coarse_B, s.coarse_inv_mass,
+                                        s.coarse_alpha, s.coarse_L,
+                                        s.dt, s.omega, s.coarse_pos],
+                                device=s._device)
+                            if s.coarse_vol_alpha is not None:
+                                wp.launch(
+                                    solve_volume_kernel, dim=s.coarse_NT,
+                                    inputs=[s.coarse_pos_mid, s.coarse_tet_idx,
+                                            s.coarse_B, s.coarse_inv_mass,
+                                            s.coarse_vol_alpha, s.coarse_vol_L,
+                                            s.dt, s.omega, s.coarse_pos],
+                                    device=s._device)
+                            # Anchor to the bone-following projection: stiff at
+                            # tendons, soft at belly. Same pos_mid snapshot.
+                            wp.launch(
+                                coarse_attach_kernel, dim=s.coarse_NV,
+                                inputs=[s.coarse_target, s.coarse_attach_compliance,
+                                        s.coarse_inv_mass, s.coarse_pos_mid,
+                                        s.coarse_attach_L, s.dt, s.omega,
+                                        s.coarse_pos],
+                                device=s._device)
                 else:
                     # Direct V-cycle: restrict fine→coarse, relax coarse,
                     # prolong back, re-apply pin (prolong overwrites pinned).

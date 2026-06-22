@@ -26,6 +26,7 @@ Both transfer operators are baked here (rest pose, once) so the solver just load
 """
 from __future__ import annotations
 import argparse
+import os
 import time
 
 import numpy as np
@@ -41,6 +42,51 @@ DEV = "cuda:0"
 # (b&1, (b>>1)&1, (b>>2)&1); these 6 tets tile the cube with no gaps/overlaps.
 CUBE = [(0, 1, 3, 7), (0, 3, 2, 7), (0, 2, 6, 7),
         (0, 6, 4, 7), (0, 4, 5, 7), (0, 5, 1, 7)]
+
+
+def _oriented_surface(P, tets_local):
+    """Boundary triangles of a tet mesh, oriented outward (normal away from the
+    opposite/interior vertex). Returns (surf_verts_global_to_P_idx, V, F_local)."""
+    f = np.concatenate([tets_local[:, [1, 2, 3]], tets_local[:, [0, 2, 3]],
+                        tets_local[:, [0, 1, 3]], tets_local[:, [0, 1, 2]]])
+    opp = np.concatenate([tets_local[:, 0], tets_local[:, 1],
+                          tets_local[:, 2], tets_local[:, 3]])
+    key = np.sort(f, 1)
+    _, inv, cnt = np.unique(key, axis=0, return_inverse=True, return_counts=True)
+    bnd = cnt[inv] == 1
+    f, opp = f[bnd], opp[bnd]
+    n = np.cross(P[f[:, 1]] - P[f[:, 0]], P[f[:, 2]] - P[f[:, 0]])
+    inward = np.einsum('ij,ij->i', n, P[opp] - P[f[:, 0]]) > 0
+    f[inward] = f[inward][:, [0, 2, 1]]
+    sv = np.unique(f)
+    rem = -np.ones(P.shape[0], np.int64); rem[sv] = np.arange(sv.size)
+    return P[sv], rem[f].astype(np.int32)
+
+
+def _muscle_cage_inflate(P, tets_local, inflate, edge_r, eps):
+    """Anatomy-conforming coarse cage: take the muscle's surface, push it OUT
+    along vertex normals by `inflate`*bbox-diag, then coarsen+tetrahedralize with
+    fTetWild. The result is shaped like the muscle (so coarse ARAP/volume relaxes
+    toward the right shape, not a voxel block) yet ENCLOSES the fine verts."""
+    import wildmeshing as wm
+    V, F = _oriented_surface(P, tets_local)
+    fn = np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]])
+    vn = np.zeros_like(V)
+    for k in range(3):
+        np.add.at(vn, F[:, k], fn)
+    vn /= np.maximum(np.linalg.norm(vn, axis=1, keepdims=True), 1e-12)
+    diag = np.linalg.norm(V.max(0) - V.min(0))
+    Vi = V + vn * (inflate * diag)
+    t = wm.Tetrahedralizer(edge_length_r=edge_r, epsilon=eps, coarsen=True)
+    t.set_log_level(6)
+    fd = os.open(os.devnull, os.O_WRONLY); old = os.dup(1); os.dup2(fd, 1)
+    try:
+        t.set_mesh(Vi, F)
+        t.tetrahedralize()
+        out = t.get_tet_mesh()
+    finally:
+        os.dup2(old, 1); os.close(fd); os.close(old)
+    return np.asarray(out[0]), np.asarray(out[1]).astype(np.int32)
 
 
 def _muscle_cage(P: np.ndarray, h: float):
@@ -88,8 +134,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rest", default="data/humanV2/model/muscle/restpos.geo")
     ap.add_argument("--out", default="data/humanV2/model/muscle/coarse_cage.npz")
+    ap.add_argument("--method", choices=["voxel", "inflate"], default="inflate",
+                    help="voxel = blocky cage (interp only); inflate = anatomy-"
+                         "conforming bounding cage (lets coarse ARAP/volume relax)")
     ap.add_argument("--voxel", type=float, default=0.045,
-                    help="cage voxel edge length (metres)")
+                    help="[voxel] cage voxel edge length (metres)")
+    ap.add_argument("--inflate", type=float, default=0.02,
+                    help="[inflate] outward push as fraction of muscle bbox diag")
+    ap.add_argument("--edge_r", type=float, default=0.15,
+                    help="[inflate] fTetWild ideal edge length / bbox diag")
+    ap.add_argument("--eps", type=float, default=0.01,
+                    help="[inflate] fTetWild envelope / bbox diag")
     a = ap.parse_args()
 
     g = GeoFile(a.rest)
@@ -98,7 +153,8 @@ def main():
     mid = g.prim_attr("muscle_id")
     muscles = np.unique(mid)
     NV = fp.shape[0]
-    print(f"fine: NV={NV} NT={ft.shape[0]} muscles={len(muscles)} voxel={a.voxel}")
+    print(f"fine: NV={NV} NT={ft.shape[0]} muscles={len(muscles)} "
+          f"method={a.method} ({'voxel=%.3f' % a.voxel if a.method=='voxel' else 'inflate=%.3f edge_r=%.2f' % (a.inflate, a.edge_r)})")
 
     # Global coarse mesh + baked transfer maps.
     coarse_pos = []                       # list of (nv_m,3) per muscle
@@ -114,6 +170,10 @@ def main():
     blk_base = []                         # per coarse vert: first coarse vert of its block
     blk_dim = []                          # per coarse vert: block size (cageV_m)
     blk_matoff = []                       # per coarse vert: offset into minv_flat
+    coarse_tendon = []                    # per coarse vert: tendon fraction [0,1]
+    tendonmask = (g.point_attr("tendonmask").astype(np.float64)
+                  if g.has_point_attr("tendonmask")
+                  else np.zeros(NV, np.float64))
 
     v_off = 0
     t_off = 0
@@ -124,8 +184,13 @@ def main():
         m_tets = ft[tmask]                         # (nt_m,4) global vert ids
         m_verts = np.unique(m_tets)                # global vert ids in muscle
         P = fp[m_verts]
+        remap = -np.ones(NV, np.int64); remap[m_verts] = np.arange(m_verts.size)
 
-        Vc, Tc_local = _muscle_cage(P, a.voxel)    # cage verts/tets (local idx)
+        if a.method == "inflate":
+            Vc, Tc_local = _muscle_cage_inflate(P, remap[m_tets], a.inflate,
+                                                a.edge_r, a.eps)
+        else:
+            Vc, Tc_local = _muscle_cage(P, a.voxel)
         nc = Vc.shape[0]
 
         # f->c: each fine vert of the muscle -> containing coarse tet (in [0,1]).
@@ -149,6 +214,12 @@ def main():
         blk_matoff.append(np.full(nc, mat_off, np.int32))
         mat_off += nc * nc
 
+        # Per coarse vert: tendon fraction of its nearest fine vert. Drives the
+        # coarse attach stiffness (stiff at tendons = bone anchor, soft at belly)
+        # so the coarse ARAP/volume smoother solves the SAME pinned BVP as fine.
+        near = ((Vc[:, None, :] - P[None, :, :]) ** 2).sum(2).argmin(1)
+        coarse_tendon.append(tendonmask[m_verts[near]].astype(np.float32))
+
         coarse_pos.append(Vc)
         coarse_tet.append(Tc_local + v_off)
         coarse_muscle.append(np.full(Tc_local.shape[0], m, np.int32))
@@ -158,6 +229,7 @@ def main():
     coarse_pos = np.concatenate(coarse_pos).astype(np.float32)
     coarse_tet = np.concatenate(coarse_tet).astype(np.int32)
     coarse_muscle = np.concatenate(coarse_muscle)
+    coarse_tendon = np.concatenate(coarse_tendon)
     minv_flat = np.concatenate(minv_flat)
     blk_base = np.concatenate(blk_base)
     blk_dim = np.concatenate(blk_dim)
@@ -177,7 +249,7 @@ def main():
 
     np.savez(a.out,
              coarse_pos=coarse_pos, coarse_tet=coarse_tet,
-             coarse_muscle=coarse_muscle,
+             coarse_muscle=coarse_muscle, coarse_tendon=coarse_tendon,
              cage_idx=cage_idx, uvw=uvw,
              minv_flat=minv_flat, blk_base=blk_base,
              blk_dim=blk_dim, blk_matoff=blk_matoff,
