@@ -17,7 +17,6 @@
     "gravity":[0.0, 0.0, 0.0],
     "total_mass":80.0,
     "mass_density":-1.0,
-    "coarse_iterations":5,
     "fine_iterations":1,
     "nsubsteps":10
 }

@@ -4,7 +4,6 @@
     "geo_dir": "data/humanV2/model",
     "cons_dir": "data/humanV2/model/cons",
     "rest_path": "data/humanV2/model/muscle/restpos.geo",
-    "coarse_rest_path": "data/humanV2/model/muscle/restpos_lowres.geo",
 
     "use_fascia": true,
     "fascia_path": "data/humanV2/model/fascia/fascia.geo",
@@ -15,18 +14,18 @@
     "fascia_glue_stiffness_scale": 0.5,
     "fascia_soft_pin": 0.7,
 
-    "use_pintotarget": true,
     "quasi_static": true,
-    "use_external_constraints": true,
-    "use_multigrid": false,
+    "use_multigrid": true,
+    "coarse_npz_path": "data/humanV2/model/muscle/coarse_cage.npz",
+    "pin_belly_attach": true,
+    "tendon_pin_threshold": 0.0,
+    "use_volume": false,
     "omega": 0.1,
     "mu": 1e9,
     "delta_t": 0.04166,
-    "damping_coeff": 1.0,
     "gravity": [0.0, 0.0, 0.0],
     "total_mass": 70.0,
     "mass_density": -1.0,
-    "coarse_iterations": 5,
     "fine_iterations": 2,
     "nsubsteps": 10,
 
@@ -41,7 +40,7 @@
         "collision": {
             "enabled": true,
             "static_bone": false,
-            "max_dist": 0.2,
+            "max_dist": 0.02,
             "contact_offset": 1e-5,
             "collide_eps": 1e-6,
             "max_push": -1.0
