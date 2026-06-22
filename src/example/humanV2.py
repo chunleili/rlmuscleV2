@@ -134,6 +134,67 @@ def _set_sum_is_collide(stage, prim_path, total, time,
     attr.Set(int(total), time)
 
 
+class CollisionMeter:
+    """Per-frame penetration metering instrument. Wraps the bone collider
+    (``inside_depth``) and an optional muscle-vs-muscle ``mm_meter`` callable.
+    ``measure()`` thresholds both at ``collide_eps`` and stashes the result on
+    ``self`` (length-``NV`` per-vertex depth + 0/1 flag arrays); ``write_primvars``
+    / ``summary`` then consume that last measurement. The arrays exist only to
+    feed three sinks — USD primvars, the .geo writer, the progress print — so the
+    write/format logic lives here next to the measurement.
+
+    Threshold at ``collide_eps``, not >0: after SDF projection verts sit ON the
+    surface (sub-micron inside per the signed test) — resolved, not a collision.
+    eps filters that touch-noise out of the count. The self meter spans muscle
+    verts only (length nvm); it is padded to ``NV`` so its slicing matches the
+    bone depth array. Bone and self are SEPARATE meters — never folded together."""
+
+    def __init__(self, collider, mm_meter, collide_eps, NV):
+        self.collider = collider
+        self.mm_meter = mm_meter
+        self.collide_eps = collide_eps
+        self.NV = NV
+        self.bone_depth = self.bone_flag = None   # metres>0 inside / int 0/1
+        self.self_depth = self.self_flag = None   # or None when no self meter
+
+    def measure(self) -> "CollisionMeter":
+        self.bone_depth = self.collider.inside_depth()         # >0 = inside bone
+        self.bone_flag = (self.bone_depth > self.collide_eps).astype(np.int32)
+        self.self_depth = self.self_flag = None
+        if self.mm_meter is not None:
+            dmm = self.mm_meter()
+            self.self_depth = np.zeros(self.NV, dtype=np.float32)
+            self.self_depth[:dmm.shape[0]] = dmm
+            self.self_flag = (self.self_depth > self.collide_eps).astype(np.int32)
+        return self
+
+    def write_primvars(self, stage, prim_path, used, time, *, per_vertex):
+        """Write the muscle prim's collision primvars for the last ``measure()``.
+        ``per_vertex`` writes the full 0/1 + depth arrays (sliced to ``used``);
+        the per-frame sums are ALWAYS written (cheap, and the headline metric)."""
+        if per_vertex:
+            _set_is_collide_primvar(stage, prim_path, self.bone_flag[used], time,
+                                    name="is_collide_muscle_bone")
+            _set_pen_depth_primvar(stage, prim_path, self.bone_depth[used], time,
+                                   name="pen_depth_muscle_bone")
+            if self.self_flag is not None:
+                _set_is_collide_primvar(stage, prim_path, self.self_flag[used], time,
+                                        name="is_collide_muscle_muscle")
+                _set_pen_depth_primvar(stage, prim_path, self.self_depth[used], time,
+                                       name="pen_depth_muscle_muscle")
+        _set_sum_is_collide(stage, prim_path, int(self.bone_flag.sum()), time,
+                            name="sum_is_collide_muscle_bone")
+        if self.self_flag is not None:
+            _set_sum_is_collide(stage, prim_path, int(self.self_flag.sum()), time,
+                                name="sum_is_collide_muscle_muscle")
+
+    def summary(self) -> str:
+        """One-line progress string: bone count(max depth) + optional self."""
+        mm = (f"mm={int(self.self_flag.sum())}({self.self_depth.max() * 1000:.1f}mm)"
+              if self.self_flag is not None else "")
+        return f"coll={int(self.bone_flag.sum())}({self.bone_depth.max() * 1000:.1f}mm) {mm}"
+
+
 def _bake_static_primvars(stage, prim_path, sim, used):
     """Write the time-INVARIANT per-vertex muscle attributes (materialW fiber
     direction, tendonmask, optional Cd, muscle_id name) as default-timecode USD
@@ -466,6 +527,8 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
         if fascia_flat is not None else (None, None))
     bone_used, bone_local = _compact(collider.tris_flat, collider.n_bone_verts)
 
+    meter = CollisionMeter(collider, mm_meter, collide_eps, sim.NV)
+
     t0 = time.perf_counter()
     for frame in range(sim.start_frame, sim.end_frame + 1):
         if not static_bone:
@@ -477,21 +540,7 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
             a = (frame - sim.start_frame) / span      # linear ramp 0 -> 1
             sim.set_fiber_activation(a * sim._activate_mask)
         sim.step_frame(frame)
-        depth = collider.inside_depth()             # >0 = inside bone
-        # Threshold at collide_eps, not >0: after SDF projection verts sit ON
-        # the surface (sub-micron inside per the signed test) — that is resolved,
-        # not a collision. eps filters that touch-noise out of the count.
-        is_collide = (depth > collide_eps).astype(np.int32)  # muscle-BONE 0/1
-        # Muscle-vs-muscle (self) penetration is a SEPARATE meter — never folded
-        # into the bone count above. Its depth array spans the muscle verts only
-        # (length nvm); pad to NV so the per-prim slicing below matches `depth`.
-        depth_mm = None
-        if mm_meter is not None:
-            dmm = mm_meter()
-            depth_mm = np.zeros(sim.NV, dtype=np.float32)
-            depth_mm[:dmm.shape[0]] = dmm
-        is_collide_mm = (depth_mm > collide_eps).astype(np.int32) \
-            if depth_mm is not None else None
+        meter.measure()
 
         if renderer is not None:
             pos_np = sim.positions_np()
@@ -507,26 +556,8 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
             muscle_path = inner.render_mesh(
                 name="muscle", points=pos_np[muscle_used], indices=muscle_local,
                 colors=(0.8, 0.3, 0.25) if first else None)
-            if not no_collide_primvars:
-                _set_is_collide_primvar(inner.stage, muscle_path,
-                                        is_collide[muscle_used], inner.time,
-                                        name="is_collide_muscle_bone")
-                _set_pen_depth_primvar(inner.stage, muscle_path,
-                                       depth[muscle_used], inner.time,
-                                       name="pen_depth_muscle_bone")
-                if is_collide_mm is not None:
-                    _set_is_collide_primvar(inner.stage, muscle_path,
-                                            is_collide_mm[muscle_used], inner.time,
-                                            name="is_collide_muscle_muscle")
-                    _set_pen_depth_primvar(inner.stage, muscle_path,
-                                           depth_mm[muscle_used], inner.time,
-                                           name="pen_depth_muscle_muscle")
-            _set_sum_is_collide(inner.stage, muscle_path, int(is_collide.sum()),
-                                inner.time, name="sum_is_collide_muscle_bone")
-            if is_collide_mm is not None:
-                _set_sum_is_collide(inner.stage, muscle_path,
-                                    int(is_collide_mm.sum()), inner.time,
-                                    name="sum_is_collide_muscle_muscle")
+            meter.write_primvars(inner.stage, muscle_path, muscle_used, inner.time,
+                                 per_vertex=not no_collide_primvars)
             if first:
                 _bake_static_primvars(inner.stage, muscle_path, sim, muscle_used)
             if fascia_flat is not None:
@@ -541,15 +572,10 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
 
             if geo_writer is not None:
                 geo_writer.write(str(Path(geo_out) / f"muscle_{frame}.geo"),
-                                 pos_np, is_collide, depth)
+                                 pos_np, meter.bone_flag, meter.bone_depth)
         if frame % 5 == 0 or frame == sim.end_frame:
             elapsed = time.perf_counter() - t0
-            mm = (f"mm={int(is_collide_mm.sum())}"
-                  f"({depth_mm.max()*1000:.1f}mm)" if is_collide_mm is not None
-                  else "")
-            print(f"  frame {frame:>3d}  {elapsed:6.1f}s  "
-                  f"coll={int(is_collide.sum())}"
-                  f"({depth.max()*1000:.1f}mm) {mm}")
+            print(f"  frame {frame:>3d}  {elapsed:6.1f}s  {meter.summary()}")
     if renderer is not None:
         renderer.save()
         print(f"USD saved -> {out}")
