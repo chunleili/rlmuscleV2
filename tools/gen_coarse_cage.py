@@ -90,7 +90,17 @@ def _muscle_cage_inflate(P, tets_local, inflate, edge_r, eps):
 
 
 def _muscle_cage(P: np.ndarray, h: float):
-    """Voxel cage for one muscle's fine verts P. Returns (coarse_V, coarse_T)."""
+    """DEPRECATED (kept for reference / fallback). Blocky voxel cage for one
+    muscle's fine verts P. Returns (coarse_V, coarse_T).
+
+    Superseded by ``_muscle_cage_inflate`` (--method inflate, the default): the
+    voxel cage is a box that encloses 100% of the fine verts but its rest shape
+    is a block, not the muscle. That is fine for the projection-only path
+    (Galerkin restrict), where it measured marginally better than inflate, but it
+    cannot host a coarse ARAP/volume relaxation — relaxing pulls the cage toward
+    its block rest shape and corrupts the prolonged start (measured ~100x worse
+    fine residual). The inflate cage is muscle-shaped, so it stays usable if a
+    future fiber-aware coarse solve wants to relax, not just project."""
     mn = P.min(0)
     ijk = np.floor((P - mn) / h).astype(np.int64)
     occ = np.unique(ijk, axis=0)
@@ -135,10 +145,11 @@ def main():
     ap.add_argument("--rest", default="data/humanV2/model/muscle/restpos.geo")
     ap.add_argument("--out", default="data/humanV2/model/muscle/coarse_cage.npz")
     ap.add_argument("--method", choices=["voxel", "inflate"], default="inflate",
-                    help="voxel = blocky cage (interp only); inflate = anatomy-"
-                         "conforming bounding cage (lets coarse ARAP/volume relax)")
+                    help="inflate (default) = anatomy-conforming bounding cage "
+                         "(muscle-shaped, projection + future relax). "
+                         "voxel = DEPRECATED blocky cage, projection-only fallback")
     ap.add_argument("--voxel", type=float, default=0.045,
-                    help="[voxel] cage voxel edge length (metres)")
+                    help="[voxel, DEPRECATED] cage voxel edge length (metres)")
     ap.add_argument("--inflate", type=float, default=0.02,
                     help="[inflate] outward push as fraction of muscle bbox diag")
     ap.add_argument("--edge_r", type=float, default=0.15,

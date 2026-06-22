@@ -5,10 +5,22 @@ per-muscle embedding cage, and **why the naive multigrid that ships in most PBD
 code makes things worse here**. This is a principle doc — the measured numbers
 are from the build that produced it.
 
+> **Update (default = inflate cage, projection-only).** The shipped default is now
+> the **inflate** cage (`tools/gen_coarse_cage.py --method inflate`, anatomy-
+> conforming, ~99.99% containment) with **`coarse_iterations: 0`** — pure Galerkin
+> projection, no coarse relaxation. The **voxel** cage is **deprecated** (code kept
+> as a projection-only fallback). Measured (inflate cage, fascia-off, 8 frames,
+> `fine_iterations=2`): projection-only fine ARAP residual ≈ 0.0026; turning on the
+> coarse ARAP/volume smoother (`coarse_iterations>0`) drags the cage off the clean
+> projection toward its own rest shape and **blows the fine residual up ~100×**
+> (0.0026 → 0.2–0.5). The smoother kernels are kept OFF-by-default for a possible
+> future fiber-direction-aware coarse energy. The cage npz is gitignored and
+> **auto-baked on first run** if missing (~90 s fTetWild).
+
 Assets / code:
 - `tools/gen_coarse_cage.py` — bakes the cage + transfer operators → `data/humanV2/model/muscle/coarse_cage.npz`
 - `src/muscle/coupleOneWayGmg/solver.py` — `_init_coarse_cage`, `restrict_galerkin_scatter_kernel`, `block_solve_kernel`, the `pre_phase` cage branch
-- enable via config: `use_multigrid: true`, `pin_belly_attach: true`, `coarse_npz_path: ".../coarse_cage.npz"`
+- enable via config: `use_multigrid: true`, `pin_belly_attach: true`, `coarse_npz_path: ".../coarse_cage.npz"`, `coarse_iterations: 0`
 
 ---
 

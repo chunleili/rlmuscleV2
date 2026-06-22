@@ -985,6 +985,8 @@ def prolong_kernel(
 # ─── Python-side class glue ────────────────────────────────────────────────
 
 import json
+import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1670,13 +1672,40 @@ class OneWaySim(XpbdEngine):
         self.fine_target_dense = wp.zeros(self.mg_fine_nv, dtype=wp.vec3, device=device)
 
     def _init_coarse_cage(self) -> None:
-        """Load the conforming per-muscle voxel cage + baked transfer maps from
-        the npz produced by tools/gen_coarse_cage.py. Restrict is the Galerkin
-        least-squares projection (P^T P)^-1 P^T; prolong is the f->c barycentric.
-        With coarse_iterations>0 the coarse cage also relaxes ARAP (+ volume) each
-        substep — the cheap place to converge the low-frequency incompressibility
-        that the fine det(F)=1 constraint struggles with."""
+        """Load the conforming per-muscle cage + baked transfer maps from the npz
+        produced by tools/gen_coarse_cage.py (--method inflate, the default).
+        Restrict is the Galerkin least-squares projection (P^T P)^-1 P^T; prolong
+        is the f->c barycentric. This projection-only path (coarse_iterations=0)
+        is the production default: it hands the fine solve a smooth bone-following
+        start with no measurable downside.
+
+        The coarse ARAP (+volume) elastic fields below are built UNCONDITIONALLY so
+        the optional coarse smoother (coarse_iterations>0, in pre_phase) can run,
+        but that smoother is OFF by default and currently a NET LOSS: relaxing the
+        cage pulls it off the clean Galerkin projection toward its own rest shape,
+        corrupting the prolonged start (measured: any coarse_iters>0 blows the fine
+        ARAP residual up ~100x; see docs/humanV2_cage_multigrid.md). The fields and
+        kernels are kept for a future fiber-aware coarse solve that may want to
+        relax the cage along the muscle fiber direction rather than just project."""
         device = self._device
+        # Auto-bake on first run: the cage npz is a gitignored asset, so a fresh
+        # checkout won't have it. Rather than fail, invoke tools/gen_coarse_cage.py
+        # once (inflate cage, ~90s fTetWild) against the SAME muscle restpos the
+        # sim loaded, then load the result. Subsequent runs hit the cached npz.
+        if not os.path.exists(self.coarse_npz_path):
+            import subprocess
+            script = Path(__file__).resolve().parents[3] / "tools" / "gen_coarse_cage.py"
+            print(f"[coarse-cage] {self.coarse_npz_path} missing — baking now "
+                  f"(inflate, ~90s fTetWild); cached after first run...")
+            os.makedirs(os.path.dirname(self.coarse_npz_path) or ".", exist_ok=True)
+            subprocess.run(
+                [sys.executable, str(script),
+                 "--out", self.coarse_npz_path, "--rest", self.rest_path],
+                check=True)
+            if not os.path.exists(self.coarse_npz_path):
+                raise RuntimeError(
+                    f"coarse cage bake reported success but {self.coarse_npz_path} "
+                    f"still missing; run {script} manually")
         d = np.load(self.coarse_npz_path)
         npz_fine_nv = int(d["mg_fine_nv"])
         if npz_fine_nv != self.NV:
@@ -1743,9 +1772,9 @@ class OneWaySim(XpbdEngine):
         self.coarse_target = wp.zeros(self.coarse_NV, dtype=wp.vec3, device=device)
         self.fine_target_dense = wp.zeros(self.mg_fine_nv, dtype=wp.vec3, device=device)
         print(f"[coarse-cage] loaded {self.coarse_npz_path}: "
-              f"coarse NV={self.coarse_NV} NT={self.coarse_NT} "
-              f"(voxel={float(d['voxel']):.3f}m); Galerkin lsq restrict, "
-              f"coarse_iters={self.coarse_iters}"
+              f"coarse NV={self.coarse_NV} NT={self.coarse_NT}; "
+              f"Galerkin lsq restrict, coarse_iters={self.coarse_iters}"
+              f"{' (relax: experimental/off by default)' if self.coarse_iters > 0 else ''}"
               f"{'+vol' if self.use_volume else ''}")
 
     # ------------------------------------------------------------------
@@ -1873,11 +1902,17 @@ class OneWaySim(XpbdEngine):
                             device=s._device,
                         )
                     wp.copy(s.coarse_pos, s.coarse_target)
-                    # Coarse smoother: relax ARAP (+ volume) on the cage, starting
-                    # from the bone-following projection. The coarse mesh is small
-                    # and low-frequency, so the det(F)=1 incompressibility that the
-                    # fine solve barely moves converges here in a few iters; prolong
-                    # then carries that low-freq volume/shape correction to the belly.
+                    # Optional coarse smoother — OFF by default (coarse_iterations=0)
+                    # and currently a NET LOSS, kept for a future fiber-aware solve.
+                    # Idea: relax ARAP (+volume) on the small cage from the
+                    # bone-following projection so low-frequency incompressibility
+                    # converges cheaply, then prolong carries the correction to the
+                    # belly. Measured reality: relaxing drags the cage off the clean
+                    # Galerkin projection toward its own (inflated) rest shape, so
+                    # any coarse_iters>0 corrupts the prolonged start and blows the
+                    # fine ARAP residual up ~100x vs projection-only. Do not enable
+                    # without a fiber-direction-aware coarse energy that relaxes the
+                    # cage the right way. See docs/humanV2_cage_multigrid.md.
                     if getattr(s, "minv_flat", None) is not None and s.coarse_iters > 0:
                         s.coarse_L.zero_()
                         s.coarse_attach_L.zero_()
