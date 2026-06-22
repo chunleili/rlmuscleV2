@@ -47,7 +47,7 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
-from muscle.coupleOneWayGmg.solver import OneWaySim, load_config
+from muscle.mg.mg import MultiGridSim, load_config
 from muscle.util.mesh_io import vectorized_surface_tris
 from muscle.collision.sdf.kernel import solve_mesh_contact_pos_kernel
 from muscle.util.geo_io import GeoFile, GeoWriter, read_geo_attr_cached
@@ -223,7 +223,7 @@ class AnimatedBoneMeshCollider:
     built once and only its ``points`` are refreshed + ``refit()`` each frame.
     """
 
-    def __init__(self, sim: OneWaySim, bone_dir: str,
+    def __init__(self, sim: MultiGridSim, bone_dir: str,
                  max_dist: float = 0.2, contact_offset: float = 0.0,
                  max_push: float = -1.0):     # <=0 = no deep-contact reject
         self.sim = sim
@@ -329,7 +329,7 @@ def build_humanV2_sim(cfg, demo):
     All knobs (fascia, multigrid, fiber, tendon pin) come from the json ``cfg``
     — ``OneWaySim`` reads them directly. ``demo`` only carries the run-level
     settings (device, activate)."""
-    sim = OneWaySim(cfg, device=demo.get("device", "cuda:0"))
+    sim = MultiGridSim(cfg, device=demo.get("device", "cuda:0"))
     if getattr(sim, "use_fiber", False):
         print(f"[fiber] model={sim.fiber_model} k_fib={sim.fiber_stiffness:g} "
               f"contraction_ratio={sim.contraction_ratio:g}")
@@ -353,9 +353,10 @@ def build_humanV2_sim(cfg, demo):
     print(f"[preload] {len(frames)} frames of targets "
           f"in {time.perf_counter() - t_load:.1f}s")
 
-    # When fascia is active (use_fascia) the tet set is muscle + an outer fascia
-    # shell. Split by vertex range so each renders as its own USD prim; nvm is
-    # the muscle vertex count (fascia verts are appended above it).
+    # Muscle surface tris. In the new mg solver the muscle table is muscle-ONLY
+    # (nvm == NV); fascia is a SEPARATE Fascia sub-solver with its own pos/tet
+    # arrays (handled below). The legacy path (nvm < NV) kept the fascia shell
+    # merged into the muscle table — split by vertex range there.
     tets = sim.tet_idx.numpy()
     nvm = getattr(sim, "nvm", sim.NV)
     if nvm < sim.NV:
@@ -363,11 +364,19 @@ def build_humanV2_sim(cfg, demo):
         fascia_tets = tets[(tets >= nvm).all(axis=1)]
         surf_flat = vectorized_surface_tris(muscle_tets).reshape(-1).astype(np.int32)
         fascia_flat = vectorized_surface_tris(fascia_tets).reshape(-1).astype(np.int32)
-        print(f"fascia: {muscle_tets.shape[0]} muscle tets, "
+        print(f"fascia (merged): {muscle_tets.shape[0]} muscle tets, "
               f"{fascia_tets.shape[0]} fascia tets ({sim.NV - nvm} fascia verts)")
     else:
         surf_flat = vectorized_surface_tris(tets).reshape(-1).astype(np.int32)
         fascia_flat = None
+
+    # Separate Fascia sub-solver: its surface tris index fascia.pos (0..fascia.NV),
+    # NOT the muscle pos array. The run loop renders it from sim.fascia.pos.
+    if getattr(sim, "fascia", None) is not None:
+        fascia_flat = vectorized_surface_tris(
+            np.asarray(sim.fascia.tet_np, dtype=np.int64)).reshape(-1).astype(np.int32)
+        print(f"fascia (separate sub-solver): {sim.fascia.NT} tets, "
+              f"{sim.fascia.NV} verts")
     return sim, surf_flat, fascia_flat
 
 
@@ -448,9 +457,13 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
         local = remap[tris_flat].astype(np.int32)
         return used, local
 
+    # Fascia tris index the separate Fascia sub-solver's pos array (0..fascia.NV)
+    # when sim.fascia is present; the legacy merged path indexes the muscle pos.
+    fascia_sep = getattr(sim, "fascia", None) is not None
     muscle_used, muscle_local = _compact(surf_flat, sim.NV)
-    fascia_used, fascia_local = (_compact(fascia_flat, sim.NV)
-                                 if fascia_flat is not None else (None, None))
+    fascia_used, fascia_local = (
+        _compact(fascia_flat, sim.fascia.NV if fascia_sep else sim.NV)
+        if fascia_flat is not None else (None, None))
     bone_used, bone_local = _compact(collider.tris_flat, collider.n_bone_verts)
 
     t0 = time.perf_counter()
@@ -517,7 +530,8 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
             if first:
                 _bake_static_primvars(inner.stage, muscle_path, sim, muscle_used)
             if fascia_flat is not None:
-                inner.render_mesh(name="fascia", points=pos_np[fascia_used],
+                fascia_pos = (sim.fascia.pos.numpy() if fascia_sep else pos_np)
+                inner.render_mesh(name="fascia", points=fascia_pos[fascia_used],
                                   indices=fascia_local,
                                   colors=(0.55, 0.75, 0.9) if first else None)
             inner.render_mesh(name="bones", points=collider._cur_verts[bone_used],

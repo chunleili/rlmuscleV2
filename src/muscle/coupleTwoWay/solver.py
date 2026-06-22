@@ -15,7 +15,7 @@ import warp as wp
 import newton
 from newton.solvers import SolverMuJoCo
 
-from muscle.engine import MuscleSim
+from muscle.musclesim import MuscleSim
 
 log = logging.getLogger("couple")
 

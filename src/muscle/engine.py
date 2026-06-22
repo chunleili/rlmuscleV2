@@ -1,4 +1,8 @@
-"""Muscle simulation core: constraint defs, Millard 2012 curves, Warp renderer, and MuscleSim."""
+"""XPBD muscle solver core: host helpers, non-solve Warp kernels, and the XpbdEngine base class.
+
+Constraint-solve kernels live in ``muscle.constraint.solve_kernels`` (imported via *).
+MuscleSim / MassSpringSim live in ``muscle.musclesim`` / ``muscle.massspringsim``.
+"""
 
 from __future__ import annotations
 
@@ -28,665 +32,9 @@ from muscle.fiber.millard import (
     millard_energy_eval_wp,
 )
 
-
-# ===========================================================================
-# Constraints (moved from constraints.py)
-# ===========================================================================
-
-PIN           =  157323
-ATTACH        =  1650556
-PINTOTARGET   =  771624311
-TETVOLUME     =  -215389979
-TETFIBERNORM  =  -303462111
-DISTANCELINE  =  1621136047
-TETARAP       =  -92199131
-TETARAPSVD    =  -92199132
-TETARAPNORM   =  -885573303
-TETFIBERDGF   =  -403562211
-TETSNH        =  -503462311
-TETFIBERMILLARD = -503662411
-DISTANCE      =  1621136100   # two-vertex edge spring (MassSpring)
-TETVOLUMEHARD =  -215389990   # hard det(F)=1 volume (MassSpring)
-TETINVERSION  =  -215389991   # inverted-tet untangle (MassSpring)
-
-# ARAP flags (from pbd_types.h)
-LINEARENERGY = 1 << 0
-NORMSTIFFNESS = 1 << 1
-
-
-class ConstraintBuilderMixin:
-    """Mixin providing constraint creation methods (backend-agnostic).
-
-    Requires self to have: pos0_np, tet_np, v_fiber_np, geo, cfg,
-    bone_pos, bone_muscle_ids, constraint_configs.
-    """
-
-    # -- rest matrix helpers (pure numpy) --
-
-    def _batch_compute_tet_rest_matrices(self):
-        """Batch compute rest matrices for all tets.
-        Returns cached (restmatrices, volumes, valid) tuple."""
-        if hasattr(self, '_cached_tet_rest'):
-            return self._cached_tet_rest
-        tet_pos = self.pos0_np[self.tet_np]
-        cols = tet_pos[:, :3, :] - tet_pos[:, 3:4, :]
-        M = np.transpose(cols, (0, 2, 1))
-        dets = np.linalg.det(M)
-        volumes = dets / 6.0
-        valid = np.abs(dets) > 1e-30
-        restmatrices = np.zeros_like(M)
-        if np.any(valid):
-            restmatrices[valid] = np.linalg.inv(M[valid])
-        self._cached_tet_rest = (restmatrices, volumes, valid)
-        return self._cached_tet_rest
-
-    def compute_tet_rest_matrix(self, pt0, pt1, pt2, pt3, scale=1.0):
-        p = self.pos0_np
-        M = scale * np.stack([p[pt0] - p[pt3], p[pt1] - p[pt3], p[pt2] - p[pt3]]).T
-        detM = np.linalg.det(M)
-        if detM == 0:
-            return None, 0.0
-        return np.linalg.inv(M), detM / 6.0
-
-    def compute_tet_fiber_rest_length(self, pt0, pt1, pt2, pt3):
-        restm, volume = self.compute_tet_rest_matrix(pt0, pt1, pt2, pt3, scale=1.0)
-        if restm is None:
-            return 0.0, np.array([0.0, 0.0, 1.0], dtype=np.float32)
-        materialW = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-        if self.v_fiber_np is not None:
-            w = self.v_fiber_np[pt0] + self.v_fiber_np[pt1] + self.v_fiber_np[pt2] + self.v_fiber_np[pt3]
-            norm = np.linalg.norm(w)
-            if norm > 1e-8:
-                materialW = w / norm
-        materialW = materialW @ restm.T
-        return volume, materialW
-
-    def map_pts2tets(self, tet):
-        pt2tet = {}
-        for i, tet_verts in enumerate(tet):
-            for v in tet_verts:
-                if v not in pt2tet:
-                    pt2tet[v] = []
-                pt2tet[v].append(i)
-        return pt2tet
-
-    def _normalize_group_names(self, value):
-        if value is None:
-            return None
-        if isinstance(value, (str, bytes)):
-            names = [str(value)]
-        else:
-            names = [str(item) for item in value]
-        names = [name for name in names if name]
-        return tuple(dict.fromkeys(names)) if names else None
-
-    def _get_bone_vertex_groups(self):
-        if hasattr(self, "_cached_bone_vertex_groups"):
-            return self._cached_bone_vertex_groups
-
-        group_names = np.full(self.bone_pos.shape[0], "", dtype=object)
-        for group_name, indices in getattr(self, "bone_muscle_ids", {}).items():
-            group_names[np.asarray(indices, dtype=np.int32)] = str(group_name)
-
-        self._cached_bone_vertex_groups = group_names
-        return group_names
-
-    def _resolve_target_indices(self, target_groups):
-        if target_groups is None:
-            return np.arange(self.bone_pos.shape[0], dtype=np.int32)
-
-        resolved = []
-        missing = []
-        for group_name in target_groups:
-            group_indices = getattr(self, "bone_muscle_ids", {}).get(group_name)
-            if group_indices is None:
-                missing.append(group_name)
-                continue
-            resolved.append(np.asarray(group_indices, dtype=np.int32))
-
-        if missing:
-            print(f"Warning: bone target groups not found: {missing}")
-        if not resolved:
-            return np.zeros(0, dtype=np.int32)
-
-        return np.unique(np.concatenate(resolved).astype(np.int32))
-
-    def _filter_sources_by_nearest_group(self, src_indices, src_positions, source_groups):
-        if source_groups is None or len(src_indices) == 0:
-            return src_indices, src_positions
-
-        bone_tree = cKDTree(self.bone_pos)
-        _, nearest_indices = bone_tree.query(src_positions, k=1)
-        group_lookup = self._get_bone_vertex_groups()
-        keep_mask = np.array(
-            [group_lookup[int(idx)] in source_groups for idx in nearest_indices],
-            dtype=bool,
-        )
-
-        return src_indices[keep_mask], src_positions[keep_mask]
-
-    def _query_bone_targets(self, src_indices, src_positions, params):
-        target_groups = self._normalize_group_names(params.get("target_group"))
-        source_groups = self._normalize_group_names(params.get("source_nearest_group"))
-        if params.get("source_filter_by_nearest_target_group", False) and source_groups is None:
-            source_groups = target_groups
-
-        src_indices, src_positions = self._filter_sources_by_nearest_group(
-            src_indices,
-            src_positions,
-            source_groups,
-        )
-        if len(src_indices) == 0:
-            return src_indices, src_positions, np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.int32)
-
-        target_indices = self._resolve_target_indices(target_groups)
-        if len(target_indices) == 0:
-            return np.zeros(0, dtype=np.int32), np.zeros((0, 3), dtype=np.float32), np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.int32)
-
-        target_tree = cKDTree(self.bone_pos[target_indices])
-        dists, local_target_indices = target_tree.query(src_positions, k=1)
-        tgt_indices = target_indices[np.asarray(local_target_indices, dtype=np.int32)]
-        return src_indices, src_positions, np.asarray(dists, dtype=np.float32), np.asarray(tgt_indices, dtype=np.int32)
-
-    # -- constraint creators (return list[dict] with plain lists, no ti/wp) --
-
-    def create_tet_volume_constraint(self, params):
-        stiffness = params.get('stiffness', 1e10)
-        dampingratio = params.get('dampingratio', 0.0)
-        restmatrices, volumes, valid = self._batch_compute_tet_rest_matrices()
-
-        valid_indices = np.where(valid)[0]
-        constraints = []
-        for i in valid_indices:
-            tet = self.tet_np[i]
-            c = dict(
-                type=TETVOLUME,
-                pts=[int(tet[0]), int(tet[1]), int(tet[2]), int(tet[3])],
-                stiffness=stiffness,
-                dampingratio=dampingratio,
-                compressionstiffness=-1.0,
-                tetid=int(i),
-                L=[0.0, 0.0, 0.0],
-                restlength=float(volumes[i]),
-                restvector=[0.0, 0.0, 0.0, 0.0],
-                restdir=[0.0, 0.0, 0.0],
-            )
-            constraints.append(c)
-        return constraints
-
-    def _compute_fiber_rest_data(self):
-        """Compute per-tet fiber directions transformed to material space.
-
-        Returns (materialW_transformed, volumes, valid, restmatrices) where:
-          materialW_transformed: (n_tet, 3) fiber dirs in material coords
-          volumes: (n_tet,) tet volumes
-          valid: (n_tet,) bool mask for non-degenerate tets
-          restmatrices: (n_tet, 3, 3) inverse rest matrices
-        """
-        restmatrices, volumes, valid = self._batch_compute_tet_rest_matrices()
-
-        n_tet = len(self.tet_np)
-        if self.v_fiber_np is not None:
-            fiber_verts = self.v_fiber_np[self.tet_np]
-            w = fiber_verts.sum(axis=1)
-            norms = np.linalg.norm(w, axis=1, keepdims=True)
-            default_w = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (n_tet, 1))
-            norm_ok = (norms > 1e-8).ravel()
-            materialW = default_w.copy()
-            materialW[norm_ok] = w[norm_ok] / norms[norm_ok]
-        else:
-            materialW = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (n_tet, 1))
-
-        materialW_transformed = np.einsum('nj,nkj->nk', materialW, restmatrices)
-        return materialW_transformed, volumes, valid, restmatrices
-
-    def create_tet_fiber_constraint(self, params):
-        stiffness = params.get('stiffness', 1.0)
-        dampingratio = params.get('dampingratio', 0.0)
-        materialW_transformed, volumes, valid, _ = self._compute_fiber_rest_data()
-
-        constraints = []
-        for i in range(len(self.tet_np)):
-            tet = self.tet_np[i]
-            if not valid[i]:
-                vol = 0.0
-                mw_t = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-            else:
-                vol = float(volumes[i])
-                mw_t = materialW_transformed[i]
-            c = dict(
-                type=TETFIBERNORM,
-                pts=[int(tet[0]), int(tet[1]), int(tet[2]), int(tet[3])],
-                stiffness=stiffness,
-                dampingratio=dampingratio,
-                tetid=i,
-                L=[0.0, 0.0, 0.0],
-                restlength=float(vol),
-                restvector=[float(mw_t[0]), float(mw_t[1]), float(mw_t[2]), 1.0],
-                restdir=[0.0, 0.0, 0.0],
-                compressionstiffness=-1.0
-            )
-            constraints.append(c)
-        return constraints
-
-    def create_tet_fiber_dgf_constraint(self, params):
-        """DGF fiber constraint: same geometry as TETFIBERNORM, but uses DGF curves.
-
-        Extra params stored in restdir:
-          restdir[0] = sigma0 (peak isometric stress, Pa)
-          restdir[1] = contraction_factor (from DGF curve, updated per-step)
-          restdir[2] = (reserved)
-        """
-        stiffness = params.get('stiffness', 1.0)
-        dampingratio = params.get('dampingratio', 0.0)
-        sigma0 = params.get('sigma0', 300000.0)
-        contraction_factor = params.get('contraction_factor', 0.4)
-        materialW_transformed, volumes, valid, _ = self._compute_fiber_rest_data()
-
-        constraints = []
-        for i in range(len(self.tet_np)):
-            tet = self.tet_np[i]
-            if not valid[i]:
-                vol = 0.0
-                mw_t = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-            else:
-                vol = float(volumes[i])
-                mw_t = materialW_transformed[i]
-            c = dict(
-                type=TETFIBERDGF,
-                pts=[int(tet[0]), int(tet[1]), int(tet[2]), int(tet[3])],
-                stiffness=stiffness,
-                dampingratio=dampingratio,
-                tetid=i,
-                L=[0.0, 0.0, 0.0],
-                restlength=float(vol),
-                restvector=[float(mw_t[0]), float(mw_t[1]), float(mw_t[2]), 1.0],
-                restdir=[float(sigma0), float(contraction_factor), 0.0],
-                compressionstiffness=-1.0
-            )
-            constraints.append(c)
-        return constraints
-
-    def create_tet_fiber_millard_constraint(self, params):
-        """Millard fiber constraint: same geometry as DGF, but uses Millard spline curves.
-
-        Extra params stored in restdir:
-          restdir[0] = sigma0 (peak isometric stress, Pa)
-          restdir[1] = contraction_factor (from Millard curve, updated per-step)
-          restdir[2] = (reserved)
-        """
-        stiffness = params.get('stiffness', 1.0)
-        dampingratio = params.get('dampingratio', 0.0)
-        sigma0 = params.get('sigma0', 300000.0)
-        contraction_factor = params.get('contraction_factor', 0.4)
-        materialW_transformed, volumes, valid, _ = self._compute_fiber_rest_data()
-
-        constraints = []
-        for i in range(len(self.tet_np)):
-            tet = self.tet_np[i]
-            if not valid[i]:
-                vol = 0.0
-                mw_t = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-            else:
-                vol = float(volumes[i])
-                mw_t = materialW_transformed[i]
-            c = dict(
-                type=TETFIBERMILLARD,
-                pts=[int(tet[0]), int(tet[1]), int(tet[2]), int(tet[3])],
-                stiffness=stiffness,
-                dampingratio=dampingratio,
-                tetid=i,
-                L=[0.0, 0.0, 0.0],
-                restlength=float(vol),
-                restvector=[float(mw_t[0]), float(mw_t[1]), float(mw_t[2]), 1.0],
-                restdir=[float(sigma0), float(contraction_factor), 0.0],
-                compressionstiffness=-1.0
-            )
-            constraints.append(c)
-        return constraints
-
-    def create_tet_snh_constraint(self, params):
-        """Stable Neo-Hookean constraint (coupled deviatoric + volumetric).
-
-        Uses Macklin's XPBD SNH formulation:
-          Deviatoric: C_D = ||F||_F - sqrt(3), compliance = 1/(mu*V*dt^2)
-          Volumetric: C_H = J - alpha,         compliance = 1/(lam*V*dt^2)
-        Solved with a coupled 2x2 linear system per tet.
-
-        params:
-            mu: shear modulus (deviatoric stiffness)
-            lam: bulk modulus (volumetric stiffness)
-            dampingratio: XPBD damping ratio
-        """
-        mu = params.get('mu', 1000.0)
-        lam = params.get('lam', 10000.0)
-        dampingratio = params.get('dampingratio', 0.0)
-        restmatrices, volumes, valid = self._batch_compute_tet_rest_matrices()
-
-        valid_indices = np.where(valid)[0]
-        constraints = []
-        for i in valid_indices:
-            tet = self.tet_np[i]
-            c = dict(
-                type=TETSNH,
-                pts=[int(tet[0]), int(tet[1]), int(tet[2]), int(tet[3])],
-                stiffness=mu,
-                dampingratio=dampingratio,
-                tetid=int(i),
-                L=[0.0, 0.0, 0.0],
-                restlength=float(volumes[i]),
-                restvector=[0.0, 0.0, 0.0, 1.0],  # rotation quaternion (warm start)
-                restdir=[float(lam), 0.0, 0.0],    # restdir[0] = lambda
-                compressionstiffness=-1.0,
-            )
-            constraints.append(c)
-        return constraints
-
-    def create_attach_constraints(self, params):
-        constraints = []
-        target_path = params.get('target_path')
-        mask_name = params.get('mask_name')
-        mask_threshold = params.get('mask_threshold', 0.75)
-        stiffness = params.get('stiffness', 1e10)
-        dampingratio = params.get('dampingratio', 0.0)
-
-        self.bone_geo, self.bone_pos = self.load_bone_geo(target_path)
-
-        mask = np.asarray(getattr(self.geo, mask_name), dtype=np.float32) if hasattr(self.geo, mask_name) else None
-        if mask is None:
-            warnings.warn(f"mask '{mask_name}' not found in geometry.")
-            return []
-
-        valid_src_indices = np.where(mask > mask_threshold)[0].astype(np.int32)
-        if len(valid_src_indices) == 0:
-            warnings.warn(f"No vertices with mask > {mask_threshold}")
-            return []
-
-        src_positions = self.pos0_np[valid_src_indices]
-        valid_src_indices, _, dists, tgt_indices = self._query_bone_targets(
-            valid_src_indices,
-            src_positions,
-            params,
-        )
-        if len(valid_src_indices) == 0:
-            print(f"Warning: No valid attach sources remain for mask '{mask_name}' after group filtering.")
-            return []
-
-        if not hasattr(self, 'pt2tet'):
-            self.pt2tet = self.map_pts2tets(self.tet_np)
-
-        for j, src_idx in enumerate(valid_src_indices):
-            tgt_idx = int(tgt_indices[j])
-            target_pos = self.bone_pos[tgt_idx]
-            tetid = self.pt2tet.get(src_idx, [-1])[0]
-            restlength = float(dists[j])
-            c = dict(
-                type=ATTACH,
-                pts=[int(src_idx), -1, int(tgt_idx), -1],
-                stiffness=stiffness,
-                dampingratio=dampingratio,
-                tetid=tetid,
-                L=[0.0, 0.0, 0.0],
-                restlength=restlength,
-                restvector=[float(target_pos[0]), float(target_pos[1]), float(target_pos[2]), 1.0],
-                restdir=[0.0, 0.0, 0.0],
-                compressionstiffness=-1.0,
-            )
-            constraints.append(c)
-        return constraints
-
-    def create_pintotarget_constraints(self, params):
-        """Hard pin: pos[src] = bone_pos[tgt] + rest_offset every iter.
-
-        No XPBD stiffness — direct overwrite (matches realtimeMuscle's
-        pintotarget_kernel). rest_offset = pos0[src] - bone_pos0[tgt] is
-        captured at build time and stored in restdir.
-
-        Tet-coherent boundary handling: a vert is hard-pinned only when ALL
-        tets containing it are "interior" (all 4 verts pass mask threshold).
-        Mask-passing verts that share at least one tet with a non-pinned vert
-        become FREE (no bone constraint) — they get carried by ARAP through
-        the interior pin tets, keeping the kinematic / elastic boundary on
-        tet faces (no shear inside any tet). Set
-        params['boundary_attach_stiffness'] > 0 to instead emit a soft ATTACH
-        on those boundary verts (legacy behavior).
-        """
-        constraints = []
-        target_path = params.get('target_path')
-        mask_name = params.get('mask_name')
-        mask_threshold = params.get('mask_threshold', 0.75)
-        boundary_stiffness = params.get('boundary_attach_stiffness', 0.0)
-        boundary_damping = params.get('boundary_attach_dampingratio', 0.1)
-
-        self.bone_geo, self.bone_pos = self.load_bone_geo(target_path)
-
-        mask = np.asarray(getattr(self.geo, mask_name), dtype=np.float32) if hasattr(self.geo, mask_name) else None
-        if mask is None:
-            print(f"Warning: mask '{mask_name}' not found in geometry.")
-            return []
-
-        candidate_indices = np.where(mask > mask_threshold)[0].astype(np.int32)
-        if len(candidate_indices) == 0:
-            print(f"Warning: No vertices with mask > {mask_threshold}")
-            return []
-
-        src_positions = self.pos0_np[candidate_indices]
-        candidate_indices, src_positions, dists, tgt_indices = self._query_bone_targets(
-            candidate_indices,
-            src_positions,
-            params,
-        )
-        if len(candidate_indices) == 0:
-            print(f"Warning: No valid pintotarget sources remain for mask '{mask_name}' after group filtering.")
-            return []
-
-        if not hasattr(self, 'pt2tet'):
-            self.pt2tet = self.map_pts2tets(self.tet_np)
-
-        # Tet-coherent split: interior verts (all containing tets fully
-        # pinned) → PINTOTARGET; boundary verts (share a tet with non-pinned
-        # vert) → ATTACH. Note: the in_pin set is the post-group-filter set,
-        # because pintotarget itself only applies inside that subset.
-        in_pin = np.zeros(self.pos0_np.shape[0], dtype=bool)
-        in_pin[candidate_indices] = True
-        tet_pin_count = in_pin[self.tet_np].sum(axis=1)        # (NT,)
-        interior_tet = (tet_pin_count == 4)                    # (NT,) bool
-
-        if not hasattr(self, 'vert_to_tets'):
-            from collections import defaultdict
-            v2t = defaultdict(list)
-            for t_idx, tet in enumerate(self.tet_np):
-                for v in tet:
-                    v2t[int(v)].append(t_idx)
-            self.vert_to_tets = v2t
-
-        is_interior_pin = np.zeros(self.pos0_np.shape[0], dtype=bool)
-        for v in candidate_indices:
-            v = int(v)
-            v_tets = self.vert_to_tets.get(v, [])
-            if v_tets and all(interior_tet[t] for t in v_tets):
-                is_interior_pin[v] = True
-
-        rest_offsets = src_positions - self.bone_pos[tgt_indices]
-        n_pin = 0
-        n_attach = 0
-        for j, src_idx in enumerate(candidate_indices):
-            src_idx = int(src_idx)
-            tgt_idx = int(tgt_indices[j])
-            target_pos = self.bone_pos[tgt_idx]
-            tetid = self.pt2tet.get(src_idx, [-1])[0]
-            if is_interior_pin[src_idx]:
-                offset = rest_offsets[j]
-                c = dict(
-                    type=PINTOTARGET,
-                    pts=[src_idx, -1, tgt_idx, -1],
-                    stiffness=1.0,  # unused — solver overwrites pos directly
-                    dampingratio=0.0,
-                    tetid=tetid,
-                    L=[0.0, 0.0, 0.0],
-                    restlength=0.0,
-                    restvector=[float(target_pos[0]), float(target_pos[1]), float(target_pos[2]), 1.0],
-                    restdir=[float(offset[0]), float(offset[1]), float(offset[2])],
-                    compressionstiffness=-1.0,
-                )
-                n_pin += 1
-                constraints.append(c)
-            elif boundary_stiffness > 0.0:
-                c = dict(
-                    type=ATTACH,
-                    pts=[src_idx, -1, tgt_idx, -1],
-                    stiffness=float(boundary_stiffness),
-                    dampingratio=float(boundary_damping),
-                    tetid=tetid,
-                    L=[0.0, 0.0, 0.0],
-                    restlength=float(dists[j]),
-                    restvector=[float(target_pos[0]), float(target_pos[1]), float(target_pos[2]), 1.0],
-                    restdir=[0.0, 0.0, 0.0],
-                    compressionstiffness=-1.0,
-                )
-                n_attach += 1
-                constraints.append(c)
-            else:
-                n_attach += 1  # counted as "skipped boundary"
-        n_int_tets = int(interior_tet.sum())
-        boundary_kind = "soft-attach" if boundary_stiffness > 0.0 else "free (ARAP-carried)"
-        import logging
-        logging.getLogger(__name__).info(
-            f"pintotarget tet-coherent split: {n_pin} hard-pin, "
-            f"{n_attach} boundary→{boundary_kind} (interior tets: {n_int_tets}/{self.tet_np.shape[0]})"
-        )
-        return constraints
-
-    def create_distance_line_constraints(self, params):
-        constraints = []
-        target_path = params.get('target_path')
-        mask_name = params.get('mask_name')
-        mask_threshold = params.get('mask_threshold', 0.75)
-        stiffness = params.get('stiffness', 1e10)
-        dampingratio = params.get('dampingratio', 0.0)
-
-        self.bone_geo, self.bone_pos = self.load_bone_geo(target_path)
-
-        mask = np.asarray(getattr(self.geo, mask_name), dtype=np.float32) if hasattr(self.geo, mask_name) else None
-        if mask is None:
-            warnings.warn(f"mask '{mask_name}' not found in geometry.")
-            return []
-
-        valid_src_indices = np.where(mask > mask_threshold)[0].astype(np.int32)
-        if len(valid_src_indices) == 0:
-            warnings.warn(f"No vertices with mask > {mask_threshold}")
-            return []
-
-        src_positions = self.pos0_np[valid_src_indices]
-        valid_src_indices, src_positions, dists, tgt_indices = self._query_bone_targets(
-            valid_src_indices,
-            src_positions,
-            params,
-        )
-        if len(valid_src_indices) == 0:
-            print(f"Warning: No valid distanceline sources remain for mask '{mask_name}' after group filtering.")
-            return []
-
-        target_positions = self.bone_pos[tgt_indices]
-        directions = target_positions - src_positions
-        norms = np.linalg.norm(directions, axis=1, keepdims=True)
-        if np.any(norms < 1e-9):
-            bad = np.where(norms.ravel() < 1e-9)[0]
-            raise ValueError(f"source and target points too close at indices: {valid_src_indices[bad]}")
-        directions = directions / norms
-
-        if not hasattr(self, 'pt2tet'):
-            self.pt2tet = self.map_pts2tets(self.tet_np)
-
-        for j, src_idx in enumerate(valid_src_indices):
-            tgt_idx = int(tgt_indices[j])
-            target_pos = target_positions[j]
-            direction = directions[j]
-            tetid = self.pt2tet.get(src_idx, [-1])[0]
-            c = dict(
-                type=DISTANCELINE,
-                pts=[int(src_idx), -1, int(tgt_idx), -1],
-                stiffness=stiffness,
-                dampingratio=dampingratio,
-                tetid=tetid,
-                L=[0.0, 0.0, 0.0],
-                restlength=0.0,
-                restvector=[float(target_pos[0]), float(target_pos[1]), float(target_pos[2]), 1.0],
-                restdir=[float(direction[0]), float(direction[1]), float(direction[2])],
-                compressionstiffness=-1.0,
-            )
-            constraints.append(c)
-        return constraints
-
-    def create_tet_arap_constraints(self, params, ctype=TETARAP):
-        """Build per-tet ARAP constraints. ``ctype`` selects polar (TETARAP,
-        default) vs SVD (TETARAPSVD) at solve time — same geometry, the type
-        tag steers `_dispatch_constraints` to the matching kernel."""
-        stiffness = params.get('stiffness', 1e6)
-        dampingratio = params.get('dampingratio', 0.0)
-        restmatrices, volumes, valid = self._batch_compute_tet_rest_matrices()
-
-        valid_indices = np.where(valid)[0]
-        constraints = []
-        for i in valid_indices:
-            tet = self.tet_np[i]
-            c = dict(
-                type=ctype,
-                pts=[int(tet[0]), int(tet[1]), int(tet[2]), int(tet[3])],
-                stiffness=stiffness,
-                dampingratio=dampingratio,
-                tetid=int(i),
-                L=[0.0, 0.0, 0.0],
-                restlength=float(volumes[i]),
-                restvector=[0.0, 0.0, 0.0, 1.0],
-                restdir=[0.0, 0.0, 0.0],
-                compressionstiffness=-1.0,
-            )
-            constraints.append(c)
-        return constraints
-
-    def _collect_raw_constraints(self):
-        """Dispatch constraint_configs -> create_* methods, return all_constraints list."""
-        self.attach_constraints = []
-        self.distanceline_constraints = []
-        self.pintotarget_constraints = []
-
-        all_constraints = []
-        _t_total = time.perf_counter()
-        for params in self.constraint_configs:
-            ctype = params['type'].lower()
-            new_constraints = []
-            if ctype == 'volume':
-                new_constraints = self.create_tet_volume_constraint(params)
-            elif ctype == 'fiber':
-                new_constraints = self.create_tet_fiber_constraint(params)
-            elif ctype == 'attach':
-                new_constraints = self.create_attach_constraints(params)
-                self.attach_constraints.extend(new_constraints)
-            elif ctype == 'pintotarget':
-                new_constraints = self.create_pintotarget_constraints(params)
-                self.pintotarget_constraints.extend(new_constraints)
-            elif ctype == 'distanceline':
-                new_constraints = self.create_distance_line_constraints(params)
-                self.distanceline_constraints.extend(new_constraints)
-            elif ctype == 'tetarap':
-                new_constraints = self.create_tet_arap_constraints(params)
-            elif ctype == 'tetarapsvd':
-                new_constraints = self.create_tet_arap_constraints(params, ctype=TETARAPSVD)
-            elif ctype == 'fiberdgf':
-                new_constraints = self.create_tet_fiber_dgf_constraint(params)
-            elif ctype == 'fibermillard':
-                new_constraints = self.create_tet_fiber_millard_constraint(params)
-            elif ctype == 'snh':
-                new_constraints = self.create_tet_snh_constraint(params)
-
-            if new_constraints:
-                all_constraints.extend(new_constraints)
-                print(f"  {params.get('name', ctype)} ({ctype}): {len(new_constraints)} constraints")
-
-        self.raw_constraints = all_constraints.copy()
-        _dt_total = time.perf_counter() - _t_total
-        return all_constraints, _dt_total
+from muscle.defs import ConstraintType, FemFlag
+from muscle.constraint.builder import ConstraintBuilderMixin
+from muscle.constraint.solve_kernels import *
 
 
 def build_constraint_color_groups(all_constraints):
@@ -828,35 +176,10 @@ def fill_vec3_kernel(arr: wp.array(dtype=wp.vec3), val: wp.vec3):
 # @wp.struct definitions
 # ---------------------------------------------------------------------------
 
-@wp.struct
-class SVDResult:
-    U: wp.mat33
-    sigma: wp.vec3
-    V: wp.mat33
-
-@wp.struct
-class PolarResult:
-    S: wp.mat33
-    R: wp.mat33
-
-@wp.struct
-class Constraint:
-    type: wp.int32
-    cidx: wp.int32
-    pts: wp.vec4i
-    stiffness: wp.float32
-    dampingratio: wp.float32
-    tetid: wp.int32
-    L: wp.vec3
-    restlength: wp.float32
-    restvector: wp.vec4f
-    restdir: wp.vec3
-    compressionstiffness: wp.float32
-
-
 @wp.kernel
 def update_cons_restdir1_kernel(
-    cons: wp.array(dtype=Constraint),
+    c_type: wp.array(dtype=wp.int32),
+    c_restdir: wp.array(dtype=wp.vec3),
     val: float,
     ctype_match: int,
     offset: int,
@@ -864,510 +187,13 @@ def update_cons_restdir1_kernel(
 ):
     """Update restdir[1] for constraints of a given type."""
     idx = offset + wp.tid()
-    if cons[idx].type == ctype_match:
-        rd = cons[idx].restdir
-        cons[idx].restdir = wp.vec3(rd[0], val, rd[2])
+    if c_type[idx] == ctype_match:
+        rd = c_restdir[idx]
+        c_restdir[idx] = wp.vec3(rd[0], val, rd[2])
 
 
 # ---------------------------------------------------------------------------
 # Utility @wp.func helpers
-# ---------------------------------------------------------------------------
-
-@wp.func
-def get_L_component(L: wp.vec3, loff: int) -> float:
-    return wp.where(loff == 0, L[0], wp.where(loff == 1, L[1], L[2]))
-
-@wp.func
-def set_L_component(L: wp.vec3, loff: int, val: float) -> wp.vec3:
-    return wp.vec3(
-        wp.where(loff == 0, val, L[0]),
-        wp.where(loff == 1, val, L[1]),
-        wp.where(loff == 2, val, L[2]))
-
-
-# ---------------------------------------------------------------------------
-# Math @wp.func
-# ---------------------------------------------------------------------------
-
-@wp.func
-def update_dP(dP: wp.array(dtype=wp.vec3), dPw: wp.array(dtype=wp.float32),
-              dp: wp.vec3, pt: int):
-    wp.atomic_add(dP, pt, dp)
-    wp.atomic_add(dPw, pt, 1.0)
-
-@wp.func
-def fem_flags_fn(ctype: int) -> int:
-    flags = 0
-    if ctype == TETARAP or ctype == TETARAPNORM:
-        flags = flags | LINEARENERGY
-    if ctype == TETARAPNORM or ctype == TETFIBERNORM or ctype == TETFIBERDGF:
-        flags = flags | NORMSTIFFNESS
-    return flags
-
-@wp.func
-def project_to_line_fn(p: wp.vec3, orig: wp.vec3, direction: wp.vec3) -> wp.vec3:
-    return orig + direction * wp.dot(p - orig, direction)
-
-@wp.func
-def get_inv_mass_fn(idx: int, mass: wp.array(dtype=wp.float32),
-                    stopped: wp.array(dtype=wp.int32)) -> float:
-    res = float(0.0)
-    if stopped[idx] != 0:
-        res = 0.0
-    else:
-        m = mass[idx]
-        res = wp.where(m > 0.0, 1.0 / m, 0.0)
-    return res
-
-
-
-
-@wp.func
-def ssvd_fn(F: wp.mat33) -> SVDResult:
-    U = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-    sigma = wp.vec3(0.0)
-    V = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-    wp.svd3(F, U, sigma, V)
-
-    detU = wp.determinant(U)
-    if detU < 0.0:
-        U = wp.mat33(
-            U[0, 0], U[0, 1], -U[0, 2],
-            U[1, 0], U[1, 1], -U[1, 2],
-            U[2, 0], U[2, 1], -U[2, 2])
-        sigma = wp.vec3(sigma[0], sigma[1], -sigma[2])
-
-    detV = wp.determinant(V)
-    if detV < 0.0:
-        V = wp.mat33(
-            V[0, 0], V[0, 1], -V[0, 2],
-            V[1, 0], V[1, 1], -V[1, 2],
-            V[2, 0], V[2, 1], -V[2, 2])
-        sigma = wp.vec3(sigma[0], sigma[1], -sigma[2])
-
-    result = SVDResult()
-    result.U = U
-    result.sigma = sigma
-    result.V = V
-    return result
-
-
-@wp.func
-def polar_decomposition_fn(F: wp.mat33) -> PolarResult:
-    svd = ssvd_fn(F)
-    U = svd.U
-    sigma_vec = svd.sigma
-    V = svd.V
-
-    R = U * wp.transpose(V)
-    sig_mat = wp.mat33(
-        sigma_vec[0], 0.0, 0.0,
-        0.0, sigma_vec[1], 0.0,
-        0.0, 0.0, sigma_vec[2])
-    S = V * sig_mat * wp.transpose(V)
-
-    result = PolarResult()
-    result.S = S
-    result.R = R
-    return result
-
-@wp.func
-def squared_norm3_fn(a: wp.mat33) -> float:
-    s = float(0.0)
-    for i in range(3):
-        for j in range(3):
-            s = s + a[i, j] * a[i, j]
-    return s
-
-@wp.func
-def mat3_to_quat_fn(m: wp.mat33) -> wp.vec4f:
-    trace = m[0, 0] + m[1, 1] + m[2, 2]
-    qw = float(0.0)
-    qx = float(0.0)
-    qy = float(0.0)
-    qz = float(0.0)
-    if trace > 0.0:
-        s = wp.sqrt(trace + 1.0) * 2.0
-        qw = 0.25 * s
-        qx = (m[2, 1] - m[1, 2]) / s
-        qy = (m[0, 2] - m[2, 0]) / s
-        qz = (m[1, 0] - m[0, 1]) / s
-    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
-        s = wp.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
-        qw = (m[2, 1] - m[1, 2]) / s
-        qx = 0.25 * s
-        qy = (m[0, 1] + m[1, 0]) / s
-        qz = (m[0, 2] + m[2, 0]) / s
-    elif m[1, 1] > m[2, 2]:
-        s = wp.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
-        qw = (m[0, 2] - m[2, 0]) / s
-        qx = (m[0, 1] + m[1, 0]) / s
-        qy = 0.25 * s
-        qz = (m[1, 2] + m[2, 1]) / s
-    else:
-        s = wp.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
-        qw = (m[1, 0] - m[0, 1]) / s
-        qx = (m[0, 2] + m[2, 0]) / s
-        qy = (m[1, 2] + m[2, 1]) / s
-        qz = 0.25 * s
-    return wp.vec4f(qx, qy, qz, qw)
-
-
-@wp.func
-def transfer_tension_fn(muscletension: float, tendonmask: float,
-                        minfiberscale: float, maxfiberscale: float) -> float:
-    fiberscale = minfiberscale + (1.0 - tendonmask) * muscletension * (maxfiberscale - minfiberscale)
-    return fiberscale
-
-
-# ---------------------------------------------------------------------------
-# Constraint solver @wp.func
-# ---------------------------------------------------------------------------
-
-@wp.func
-def tet_volume_update_xpbd_fn(
-    use_jacobi: int,
-    cidx: int,
-    cons: wp.array(dtype=Constraint),
-    pos: wp.array(dtype=wp.vec3),
-    pprev: wp.array(dtype=wp.vec3),
-    restlength: float,
-    dP: wp.array(dtype=wp.vec3),
-    dPw: wp.array(dtype=wp.float32),
-    tetid: int,
-    pts: wp.vec4i,
-    dt: float,
-    stiffness: float,
-    kstiffcompress: float,
-    kdampratio: float,
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    has_compress_stiffness: int,
-):
-    inv_mass0 = get_inv_mass_fn(pts[0], mass, stopped)
-    inv_mass1 = get_inv_mass_fn(pts[1], mass, stopped)
-    inv_mass2 = get_inv_mass_fn(pts[2], mass, stopped)
-    inv_mass3 = get_inv_mass_fn(pts[3], mass, stopped)
-
-    p0 = pos[pts[0]]
-    p1 = pos[pts[1]]
-    p2 = pos[pts[2]]
-    p3 = pos[pts[3]]
-
-    # pts[3] is the reference vertex (matches precompute_rest_kernel and
-    # the ARAP/fiber kernels). With d_k = p_k - p_3 for k=0,1,2,
-    # signed volume V = det[d_0 | d_1 | d_2] / 6, so the per-vertex gradients
-    # follow from d/dd_k det = (cross of the other two), and the reference
-    # vertex grad_3 = -(grad_0 + grad_1 + grad_2).
-    d0 = p0 - p3
-    d1 = p1 - p3
-    d2 = p2 - p3
-    grad0 = wp.cross(d1, d2) / 6.0
-    grad1 = wp.cross(d2, d0) / 6.0
-    grad2 = wp.cross(d0, d1) / 6.0
-    grad3 = -(grad0 + grad1 + grad2)
-
-    w_sum = (inv_mass0 * wp.length_sq(grad0) +
-             inv_mass1 * wp.length_sq(grad1) +
-             inv_mass2 * wp.length_sq(grad2) +
-             inv_mass3 * wp.length_sq(grad3))
-
-    if w_sum > 1e-9:
-        volume = wp.dot(wp.cross(d0, d1), d2) / 6.0
-
-        comp = 0
-        if has_compress_stiffness != 0:
-            if volume < restlength:
-                comp = 1
-        kstiff = wp.where(comp != 0, kstiffcompress, stiffness)
-        loff = wp.min(comp, 2)
-
-        if kstiff != 0.0:
-            l = get_L_component(cons[cidx].L, loff)
-
-            alpha = 1.0 / kstiff
-            alpha = alpha / (dt * dt)
-
-            C = volume - restlength
-
-            dsum = float(0.0)
-            gamma = float(1.0)
-            if kdampratio > 0.0:
-                prev0 = pprev[pts[0]]
-                prev1 = pprev[pts[1]]
-                prev2 = pprev[pts[2]]
-                prev3 = pprev[pts[3]]
-                beta = kstiff * kdampratio * dt * dt
-                gamma = alpha * beta / dt
-                dsum = (wp.dot(grad0, pos[pts[0]] - prev0) +
-                        wp.dot(grad1, pos[pts[1]] - prev1) +
-                        wp.dot(grad2, pos[pts[2]] - prev2) +
-                        wp.dot(grad3, pos[pts[3]] - prev3))
-                dsum = dsum * gamma
-                gamma = gamma + 1.0
-
-            dlambda = (-C - alpha * l - dsum) / (gamma * w_sum + alpha)
-
-            if use_jacobi != 0:
-                update_dP(dP, dPw, dlambda * inv_mass0 * grad0, pts[0])
-                update_dP(dP, dPw, dlambda * inv_mass1 * grad1, pts[1])
-                update_dP(dP, dPw, dlambda * inv_mass2 * grad2, pts[2])
-                update_dP(dP, dPw, dlambda * inv_mass3 * grad3, pts[3])
-            else:
-                pos[pts[0]] = pos[pts[0]] + dlambda * inv_mass0 * grad0
-                pos[pts[1]] = pos[pts[1]] + dlambda * inv_mass1 * grad1
-                pos[pts[2]] = pos[pts[2]] + dlambda * inv_mass2 * grad2
-                pos[pts[3]] = pos[pts[3]] + dlambda * inv_mass3 * grad3
-                cons[cidx].L = set_L_component(cons[cidx].L, loff, get_L_component(cons[cidx].L, loff) + dlambda)
-
-
-@wp.func
-def tet_fiber_update_xpbd_fn(
-    use_jacobi: int,
-    pos: wp.array(dtype=wp.vec3),
-    pprev: wp.array(dtype=wp.vec3),
-    dP: wp.array(dtype=wp.vec3),
-    dPw: wp.array(dtype=wp.float32),
-    cidx: int,
-    cons: wp.array(dtype=Constraint),
-    pts: wp.vec4i,
-    dt: float,
-    fiber: wp.vec3,
-    stiffness: float,
-    Dminv: wp.mat33,
-    kdampratio: float,
-    restlength: float,
-    restvector: wp.vec4f,
-    acti: float,
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    target_stretch: float,
-):
-    inv_mass0 = get_inv_mass_fn(pts[0], mass, stopped)
-    inv_mass1 = get_inv_mass_fn(pts[1], mass, stopped)
-    inv_mass2 = get_inv_mass_fn(pts[2], mass, stopped)
-    inv_mass3 = get_inv_mass_fn(pts[3], mass, stopped)
-
-    l = cons[cidx].L[0]
-    alpha = 1.0 / stiffness
-    alpha = alpha / restlength
-    alpha = alpha / (dt * dt)
-    grad_scale = float(1.0)
-    psi = float(0.0)
-
-    c0 = pos[pts[0]] - pos[pts[3]]
-    c1 = pos[pts[1]] - pos[pts[3]]
-    c2 = pos[pts[2]] - pos[pts[3]]
-    _Ds = wp.mat33(
-        c0[0], c1[0], c2[0],
-        c0[1], c1[1], c2[1],
-        c0[2], c1[2], c2[2])
-
-    wTDminvT = wp.vec3(restvector[0], restvector[1], restvector[2])
-    FwT = _Ds * wTDminvT
-    psi = 0.5 * wp.length_sq(FwT)
-
-    if psi > 1e-9:
-        psi_sqrt = wp.sqrt(2.0 * psi)
-        grad_scale = 1.0 / psi_sqrt
-        psi = psi_sqrt
-
-    Ht = wp.outer(wTDminvT, FwT)
-
-    grad0 = grad_scale * wp.vec3(Ht[0, 0], Ht[0, 1], Ht[0, 2])
-    grad1 = grad_scale * wp.vec3(Ht[1, 0], Ht[1, 1], Ht[1, 2])
-    grad2 = grad_scale * wp.vec3(Ht[2, 0], Ht[2, 1], Ht[2, 2])
-    grad3 = -grad0 - grad1 - grad2
-
-    w_sum = (inv_mass0 * wp.length_sq(grad0) +
-             inv_mass1 * wp.length_sq(grad1) +
-             inv_mass2 * wp.length_sq(grad2) +
-             inv_mass3 * wp.length_sq(grad3))
-
-    if w_sum > 1e-9:
-        dsum = float(0.0)
-        gamma = float(1.0)
-        if kdampratio > 0.0:
-            beta = stiffness * kdampratio * dt * dt
-            beta = beta * restlength
-            gamma = alpha * beta / dt
-
-            dsum = (wp.dot(grad0, pos[pts[0]] - pprev[pts[0]]) +
-                    wp.dot(grad1, pos[pts[1]] - pprev[pts[1]]) +
-                    wp.dot(grad2, pos[pts[2]] - pprev[pts[2]]) +
-                    wp.dot(grad3, pos[pts[3]] - pprev[pts[3]]))
-            dsum = dsum * gamma
-            gamma = gamma + 1.0
-
-        C = psi - target_stretch
-        dL = (-C - alpha * l - dsum) / (gamma * w_sum + alpha)
-        if use_jacobi != 0:
-            update_dP(dP, dPw, dL * inv_mass0 * grad0, pts[0])
-            update_dP(dP, dPw, dL * inv_mass1 * grad1, pts[1])
-            update_dP(dP, dPw, dL * inv_mass2 * grad2, pts[2])
-            update_dP(dP, dPw, dL * inv_mass3 * grad3, pts[3])
-        else:
-            pos[pts[0]] = pos[pts[0]] + dL * inv_mass0 * grad0
-            pos[pts[1]] = pos[pts[1]] + dL * inv_mass1 * grad1
-            pos[pts[2]] = pos[pts[2]] + dL * inv_mass2 * grad2
-            pos[pts[3]] = pos[pts[3]] + dL * inv_mass3 * grad3
-            cons[cidx].L = wp.vec3(cons[cidx].L[0] + dL, cons[cidx].L[1], cons[cidx].L[2])
-
-
-@wp.func
-def distance_pos_update_xpbd_fn(
-    use_jacobi: int,
-    cidx: int,
-    cons: wp.array(dtype=Constraint),
-    pt0: int,
-    pt1: int,
-    p0: wp.vec3,
-    p1: wp.vec3,
-    pos: wp.array(dtype=wp.vec3),
-    pprev: wp.array(dtype=wp.vec3),
-    dP: wp.array(dtype=wp.vec3),
-    dPw: wp.array(dtype=wp.float32),
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    restlength: float,
-    kstiff: float,
-    kdampratio: float,
-    kstiffcompress: float,
-    dt: float,
-    has_compress_stiffness: int,
-):
-    invmass0 = float(0.0)
-    invmass1 = get_inv_mass_fn(pt1, mass, stopped)
-
-    if pt0 >= 0:
-        invmass0 = get_inv_mass_fn(pt0, mass, stopped)
-
-    wsum = invmass0 + invmass1
-
-    if wsum != 0.0:
-        p1_current = pos[pt1]
-        p0_current = p0
-        if pt0 >= 0:
-            p0_current = pos[pt0]
-
-        n = p1_current - p0_current
-        d = wp.length(n)
-        if d >= 1e-6:
-            comp = 0
-            if has_compress_stiffness != 0:
-                if d < restlength:
-                    comp = 1
-            kstiff_val = wp.where(comp != 0, kstiffcompress, kstiff)
-            loff = wp.min(comp, 2)
-            if kstiff_val != 0.0:
-                l = get_L_component(cons[cidx].L, loff)
-
-                alpha = 1.0 / kstiff_val
-                alpha = alpha / (dt * dt)
-
-                C = d - restlength
-                n = n / d
-                gradC = n
-
-                dsum = float(0.0)
-                gamma = float(1.0)
-                if kdampratio > 0.0:
-                    if pt0 >= 0:
-                        prev0 = pprev[pt0]
-                        prev1 = pprev[pt1]
-                        beta = kstiff_val * kdampratio * dt * dt
-                        gamma = alpha * beta / dt
-                        dsum = gamma * (-wp.dot(gradC, p0_current - prev0) + wp.dot(gradC, p1_current - prev1))
-                    else:
-                        prev1 = pprev[pt1]
-                        beta = kstiff_val * kdampratio * dt * dt
-                        gamma = alpha * beta / dt
-                        dsum = gamma * wp.dot(gradC, p1_current - prev1)
-                    gamma = gamma + 1.0
-
-                dL = (-C - alpha * l - dsum) / (gamma * wsum + alpha)
-                dp = n * (-dL)
-
-                if use_jacobi != 0:
-                    if pt0 >= 0:
-                        update_dP(dP, dPw, invmass0 * dp, pt0)
-                    update_dP(dP, dPw, -invmass1 * dp, pt1)
-                else:
-                    if pt0 >= 0:
-                        pos[pt0] = pos[pt0] + invmass0 * dp
-                    pos[pt1] = pos[pt1] - invmass1 * dp
-                    cons[cidx].L = set_L_component(cons[cidx].L, loff, get_L_component(cons[cidx].L, loff) + dL)
-
-
-@wp.func
-def attach_bilateral_update_fn(
-    use_jacobi: int,
-    cidx: int,
-    cons: wp.array(dtype=Constraint),
-    pt1: int,
-    p0: wp.vec3,
-    pos: wp.array(dtype=wp.vec3),
-    pprev: wp.array(dtype=wp.vec3),
-    dP: wp.array(dtype=wp.vec3),
-    dPw: wp.array(dtype=wp.float32),
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    restlength: float,
-    kstiff: float,
-    kdampratio: float,
-    kstiffcompress: float,
-    dt: float,
-    has_compress_stiffness: int,
-    reaction_accum: wp.array(dtype=wp.vec3),
-):
-    invmass1 = get_inv_mass_fn(pt1, mass, stopped)
-    wsum = invmass1
-
-    if wsum != 0.0:
-        p1_current = pos[pt1]
-        p0_current = p0
-
-        n = p1_current - p0_current
-        d = wp.length(n)
-        if d >= 1e-6:
-            comp = 0
-            if has_compress_stiffness != 0:
-                if d < restlength:
-                    comp = 1
-            kstiff_val = wp.where(comp != 0, kstiffcompress, kstiff)
-            loff = wp.min(comp, 2)
-            if kstiff_val != 0.0:
-                l = get_L_component(cons[cidx].L, loff)
-
-                alpha = 1.0 / kstiff_val
-                alpha = alpha / (dt * dt)
-
-                C = d - restlength
-                n = n / d
-
-                dsum = float(0.0)
-                gamma = float(1.0)
-                if kdampratio > 0.0:
-                    prev1 = pprev[pt1]
-                    beta = kstiff_val * kdampratio * dt * dt
-                    gamma = alpha * beta / dt
-                    dsum = gamma * wp.dot(n, p1_current - prev1)
-                    gamma = gamma + 1.0
-
-                dL = (-C - alpha * l - dsum) / (gamma * wsum + alpha)
-                dp = n * (-dL)
-
-                if use_jacobi != 0:
-                    update_dP(dP, dPw, -invmass1 * dp, pt1)
-                else:
-                    pos[pt1] = pos[pt1] - invmass1 * dp
-                    cons[cidx].L = set_L_component(cons[cidx].L, loff, get_L_component(cons[cidx].L, loff) + dL)
-
-                wp.atomic_add(reaction_accum, cidx, C * n)
-
-
-# ---------------------------------------------------------------------------
-# Simulation @wp.kernel
 # ---------------------------------------------------------------------------
 
 @wp.kernel
@@ -1398,6 +224,52 @@ def precompute_rest_kernel(
     rest_matrix[c] = wp.inverse(Dm)
 
 
+
+@wp.kernel
+def precompute_rest_scaled_kernel(
+    pos_rest: wp.array(dtype=wp.vec3),
+    tet_indices: wp.array(dtype=wp.vec4i),
+    scale: wp.array(dtype=wp.float32),      # per-tet shrink factor (1.0 = no shrink)
+    stiffness: wp.array(dtype=wp.float32),  # per-tet ARAP stiffness (muscle: mu; fascia: solidshapestiffness)
+    B: wp.array(dtype=wp.mat33),
+    rest_volume: wp.array(dtype=wp.float32),
+    alpha: wp.array(dtype=wp.float32),
+):
+    """Like precompute_rest_kernel but per-tet: B = inv(scale*Dm),
+    rest_volume from UNSCALED Dm (physical mass), alpha = 1/(stiffness*V0)."""
+    t = wp.tid()
+    idx = tet_indices[t]
+    x0 = pos_rest[idx[0]]
+    x1 = pos_rest[idx[1]]
+    x2 = pos_rest[idx[2]]
+    x3 = pos_rest[idx[3]]
+    e1 = x1 - x0
+    e2 = x2 - x0
+    e3 = x3 - x0
+    Dm = wp.mat33(
+        e1[0], e2[0], e3[0],
+        e1[1], e2[1], e3[1],
+        e1[2], e2[2], e3[2],
+    )
+    det = wp.determinant(Dm)
+    V0 = wp.abs(det) / 6.0
+    k = stiffness[t]
+    if V0 < 1.0e-12:
+        # Degenerate tet: make it inert (identity rest, no volume, stiff-inert).
+        B[t] = wp.identity(n=3, dtype=wp.float32)
+        rest_volume[t] = 0.0
+        alpha[t] = 1.0e20
+        return
+    s = scale[t]
+    Dm_s = wp.mat33(
+        s * e1[0], s * e2[0], s * e3[0],
+        s * e1[1], s * e2[1], s * e3[1],
+        s * e1[2], s * e2[2], s * e3[2],
+    )
+    B[t] = wp.inverse(Dm_s)
+    rest_volume[t] = V0
+    alpha[t] = 1.0 / (k * V0)
+
 @wp.kernel
 def _clamp_force_by_accel_kernel(
     force: wp.array(dtype=wp.vec3),
@@ -1415,26 +287,6 @@ def _clamp_force_by_accel_kernel(
     f_limit = m * max_accel
     if f_mag > f_limit and f_mag > 1.0e-20:
         force[i] = f * (f_limit / f_mag)
-
-
-@wp.func
-def mat33_inverse_fn(M: wp.mat33) -> wp.mat33:
-    """Compute 3x3 matrix inverse via cofactor expansion."""
-    d = wp.determinant(M)
-    if wp.abs(d) < 1.0e-30:
-        return wp.identity(n=3, dtype=float)
-    inv_d = 1.0 / d
-    return wp.mat33(
-        (M[1, 1] * M[2, 2] - M[1, 2] * M[2, 1]) * inv_d,
-        (M[0, 2] * M[2, 1] - M[0, 1] * M[2, 2]) * inv_d,
-        (M[0, 1] * M[1, 2] - M[0, 2] * M[1, 1]) * inv_d,
-        (M[1, 2] * M[2, 0] - M[1, 0] * M[2, 2]) * inv_d,
-        (M[0, 0] * M[2, 2] - M[0, 2] * M[2, 0]) * inv_d,
-        (M[0, 2] * M[1, 0] - M[0, 0] * M[1, 2]) * inv_d,
-        (M[1, 0] * M[2, 1] - M[1, 1] * M[2, 0]) * inv_d,
-        (M[0, 1] * M[2, 0] - M[0, 0] * M[2, 1]) * inv_d,
-        (M[0, 0] * M[1, 1] - M[0, 1] * M[1, 0]) * inv_d,
-    )
 
 
 @wp.kernel
@@ -1791,10 +643,10 @@ def clear_dP_kernel(
 
 @wp.kernel
 def clear_cons_L_kernel(
-    cons: wp.array(dtype=Constraint),
+    c_L: wp.array(dtype=wp.vec3),
 ):
     i = wp.tid()
-    cons[i].L = wp.vec3(0.0)
+    c_L[i] = wp.vec3(0.0)
 
 
 @wp.kernel
@@ -1853,1058 +705,39 @@ def compute_cell_tendon_mask_kernel(
 
 @wp.kernel
 def update_attach_targets_kernel(
-    cons: wp.array(dtype=Constraint),
+    c_type: wp.array(dtype=wp.int32),
+    c_pts: wp.array(dtype=wp.vec4i),
+    c_restvector: wp.array(dtype=wp.vec4f),
     bone_pos_field: wp.array(dtype=wp.vec3),
     n_cons: int,
 ):
     c = wp.tid()
     if c >= n_cons:
         return
-    ctype = cons[c].type
-    if ctype == ATTACH:
-        tgt_idx = cons[c].pts[2]
+    ctype = c_type[c]
+    if ctype == ConstraintType.ATTACH:
+        tgt_idx = c_pts[c][2]
         if tgt_idx >= 0:
             target_pos = bone_pos_field[tgt_idx]
-            rv = cons[c].restvector
-            cons[c].restvector = wp.vec4f(target_pos[0], target_pos[1], target_pos[2], rv[3])
-    elif ctype == DISTANCELINE:
-        tgt_idx = cons[c].pts[2]  # pts layout: [src_idx, -1, tgt_idx, -1]
+            rv = c_restvector[c]
+            c_restvector[c] = wp.vec4f(target_pos[0], target_pos[1], target_pos[2], rv[3])
+    elif ctype == ConstraintType.DISTANCELINE:
+        tgt_idx = c_pts[c][2]  # pts layout: [src_idx, -1, tgt_idx, -1]
         if tgt_idx >= 0:
             target_pos = bone_pos_field[tgt_idx]
-            rv = cons[c].restvector
-            cons[c].restvector = wp.vec4f(target_pos[0], target_pos[1], target_pos[2], rv[3])
-    elif ctype == PINTOTARGET:
-        tgt_idx = cons[c].pts[2]
+            rv = c_restvector[c]
+            c_restvector[c] = wp.vec4f(target_pos[0], target_pos[1], target_pos[2], rv[3])
+    elif ctype == ConstraintType.PINTOTARGET:
+        tgt_idx = c_pts[c][2]
         if tgt_idx >= 0:
             target_pos = bone_pos_field[tgt_idx]
-            rv = cons[c].restvector
-            cons[c].restvector = wp.vec4f(target_pos[0], target_pos[1], target_pos[2], rv[3])
+            rv = c_restvector[c]
+            c_restvector[c] = wp.vec4f(target_pos[0], target_pos[1], target_pos[2], rv[3])
 
 
 # ---------------------------------------------------------------------------
 # Per-type constraint solver @wp.kernel
 # ---------------------------------------------------------------------------
-
-@wp.kernel
-def solve_tetvolume_kernel(
-    cons: wp.array(dtype=Constraint),
-    pos: wp.array(dtype=wp.vec3),
-    pprev: wp.array(dtype=wp.vec3),
-    dP: wp.array(dtype=wp.vec3),
-    dPw: wp.array(dtype=wp.float32),
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    dt: float,
-    use_jacobi: int,
-    has_compress_stiffness: int,
-    offset: int,
-):
-    c = offset + wp.tid()
-    cstiffness = cons[c].stiffness
-    if cstiffness <= 0.0:
-        return
-    kstiffcompress = cons[c].compressionstiffness
-    kstiffcompress = wp.where(kstiffcompress >= 0.0, kstiffcompress, cstiffness)
-    pts = cons[c].pts
-    tetid = cons[c].tetid
-    tet_volume_update_xpbd_fn(
-        use_jacobi, c, cons, pos, pprev,
-        cons[c].restlength, dP, dPw, tetid, pts,
-        dt, cstiffness, kstiffcompress, cons[c].dampingratio,
-        mass, stopped, has_compress_stiffness)
-
-
-@wp.kernel
-def solve_tetfibernorm_kernel(
-    cons: wp.array(dtype=Constraint),
-    pos: wp.array(dtype=wp.vec3),
-    pprev: wp.array(dtype=wp.vec3),
-    dP: wp.array(dtype=wp.vec3),
-    dPw: wp.array(dtype=wp.float32),
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    rest_matrix: wp.array(dtype=wp.mat33),
-    v_fiber_dir: wp.array(dtype=wp.vec3),
-    activation: wp.array(dtype=wp.float32),
-    tendonmask: wp.array(dtype=wp.float32),
-    dt: float,
-    use_jacobi: int,
-    contraction_ratio: float,
-    fiber_stiffness_scale: float,
-    offset: int,
-):
-    c = offset + wp.tid()
-    cstiffness = cons[c].stiffness
-    if cstiffness <= 0.0:
-        return
-    pts = cons[c].pts
-    tetid = cons[c].tetid
-    fiber_dir = (v_fiber_dir[pts[0]] + v_fiber_dir[pts[1]] +
-                 v_fiber_dir[pts[2]] + v_fiber_dir[pts[3]]) / 4.0
-    Dminv = rest_matrix[tetid]
-    acti = activation[tetid]
-    _tendonmask = tendonmask[tetid]
-    belly_factor = 1.0 - _tendonmask
-
-    fiberscale = transfer_tension_fn(acti, _tendonmask, 0.0, 10.0)
-    stiffness_val = cstiffness * fiberscale * fiber_stiffness_scale
-    if stiffness_val > 0.0:
-        target_stretch = 1.0 - belly_factor * acti * contraction_ratio
-
-        tet_fiber_update_xpbd_fn(
-            use_jacobi, pos, pprev, dP, dPw,
-            c, cons, pts, dt, fiber_dir, stiffness_val, Dminv,
-            cons[c].dampingratio, cons[c].restlength, cons[c].restvector,
-            acti, mass, stopped, target_stretch)
-
-
-@wp.kernel
-def solve_tetfiberdgf_kernel(
-    cons: wp.array(dtype=Constraint),
-    pos: wp.array(dtype=wp.vec3),
-    pprev: wp.array(dtype=wp.vec3),
-    dP: wp.array(dtype=wp.vec3),
-    dPw: wp.array(dtype=wp.float32),
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    rest_matrix: wp.array(dtype=wp.mat33),
-    v_fiber_dir: wp.array(dtype=wp.vec3),
-    activation: wp.array(dtype=wp.float32),
-    tendonmask: wp.array(dtype=wp.float32),
-    dt: float,
-    use_jacobi: int,
-    fiber_stiffness_scale: float,
-    offset: int,
-):
-    """XPBD fiber constraint with DGF force-length curves (quasi-static).
-
-    Uses DGF active f_L(lm_tilde) and passive f_PE(lm_tilde) to modulate
-    constraint stiffness. target_stretch = 0 so equilibrium is naturally
-    determined by where DGF contractile force equals external load.
-    No force-velocity curve (quasi-static assumption).
-    """
-    c = offset + wp.tid()
-    cstiffness = cons[c].stiffness
-    if cstiffness <= 0.0:
-        return
-    pts = cons[c].pts
-    tetid = cons[c].tetid
-    fiber_dir = (v_fiber_dir[pts[0]] + v_fiber_dir[pts[1]] +
-                 v_fiber_dir[pts[2]] + v_fiber_dir[pts[3]]) / 4.0
-    Dminv = rest_matrix[tetid]
-    acti = activation[tetid]
-
-    # Compute current fiber stretch from deformation gradient
-    c0 = pos[pts[0]] - pos[pts[3]]
-    c1 = pos[pts[1]] - pos[pts[3]]
-    c2 = pos[pts[2]] - pos[pts[3]]
-    _Ds = wp.mat33(
-        c0[0], c1[0], c2[0],
-        c0[1], c1[1], c2[1],
-        c0[2], c1[2], c2[2])
-    wTDminvT = wp.vec3(cons[c].restvector[0], cons[c].restvector[1], cons[c].restvector[2])
-    FwT = _Ds * wTDminvT
-    lm_tilde = wp.sqrt(wp.max(wp.length_sq(FwT), 1.0e-12))
-
-    # DGF force-length: stiffness modulated by f_L(lm) for correct force profile.
-    # restdir[0] = sigma0 (peak isometric stress)
-    # restdir[1] = contraction_factor (from DGF curve inversion, set per-step)
-    sigma0 = cons[c].restdir[0]
-    contraction_factor = cons[c].restdir[1]
-    f_L_val = dgf_active_force_length_wp(lm_tilde)
-    f_PE_val = dgf_passive_force_length_wp(lm_tilde)
-    f_total = acti * f_L_val + f_PE_val
-    # Stiffness follows DGF curve; fiber_stiffness_scale calibrates magnitude
-    fiberscale = wp.max(f_total, 0.01)
-    stiffness_val = cstiffness * fiberscale * fiber_stiffness_scale
-
-    if stiffness_val > 0.0:
-        # Target from DGF equilibrium: lm_eq ≈ 1 - a * contraction_factor
-        target_stretch = 1.0 - acti * contraction_factor
-
-        tet_fiber_update_xpbd_fn(
-            use_jacobi, pos, pprev, dP, dPw,
-            c, cons, pts, dt, fiber_dir, stiffness_val, Dminv,
-            cons[c].dampingratio, cons[c].restlength, cons[c].restvector,
-            acti, mass, stopped, target_stretch)
-
-
-@wp.kernel
-def solve_tetfibermillard_kernel(
-    cons: wp.array(dtype=Constraint),
-    pos: wp.array(dtype=wp.vec3),
-    pprev: wp.array(dtype=wp.vec3),
-    dP: wp.array(dtype=wp.vec3),
-    dPw: wp.array(dtype=wp.float32),
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    rest_matrix: wp.array(dtype=wp.mat33),
-    v_fiber_dir: wp.array(dtype=wp.vec3),
-    activation: wp.array(dtype=wp.float32),
-    tendonmask: wp.array(dtype=wp.float32),
-    dt: float,
-    use_jacobi: int,
-    millard_stiffness_scale: float,
-    offset: int,
-    # Millard active f_L curve data (force)
-    fl_x_coeffs: wp.array(dtype=wp.float32),
-    fl_y_coeffs: wp.array(dtype=wp.float32),
-    fl_seg_bounds: wp.array(dtype=wp.float32),
-    fl_n_segments: int,
-    fl_x_lo: float, fl_x_hi: float,
-    fl_y_lo: float, fl_y_hi: float,
-    fl_dydx_lo: float, fl_dydx_hi: float,
-    # Millard active f_L curve data (energy)
-    fl_F_coeffs: wp.array(dtype=wp.float32),
-    fl_energy_offset: float,
-    # Millard passive f_PE curve data (unused for now, kept for API compat)
-    fpe_x_coeffs: wp.array(dtype=wp.float32),
-    fpe_y_coeffs: wp.array(dtype=wp.float32),
-    fpe_seg_bounds: wp.array(dtype=wp.float32),
-    fpe_n_segments: int,
-    fpe_x_lo: float, fpe_x_hi: float,
-    fpe_y_lo: float, fpe_y_hi: float,
-    fpe_dydx_lo: float, fpe_dydx_hi: float,
-    fiber_skip_detF: float,
-):
-    """XPBD fiber constraint with energy-based Millard 2012 formulation.
-
-    C = sqrt(2 * sigma0 * a * Psi_L(lm))
-    gradC_i = (dC/dlm) * (dlm/dx_i)
-    where dC/dlm = sigma0 * a * f_L / C
-    """
-    c = offset + wp.tid()
-    cstiffness = cons[c].stiffness
-    if cstiffness <= 0.0:
-        return
-    pts = cons[c].pts
-    tetid = cons[c].tetid
-    acti = activation[tetid]
-    sigma0 = cons[c].restdir[0]
-
-    # Active force only in the muscle belly: scale by belly_factor = 1 - tendonmask
-    # (matches solve_tetfibernorm_kernel). Without this, tendon-end tets get full
-    # active stress and over-contract against the rigid end attach -> distortion.
-    acti = acti * (1.0 - tendonmask[tetid])
-
-    # Skip if no activation (no energy → C=0)
-    if acti < 1.0e-6:
-        return
-
-    # ── Deformation gradient: lm and dlm/dx_i ──
-    c0 = pos[pts[0]] - pos[pts[3]]
-    c1 = pos[pts[1]] - pos[pts[3]]
-    c2 = pos[pts[2]] - pos[pts[3]]
-    _Ds = wp.mat33(
-        c0[0], c1[0], c2[0],
-        c0[1], c1[1], c2[1],
-        c0[2], c1[2], c2[2])
-
-    # Skip fiber solve for near-inverted tets to prevent further distortion
-    if fiber_skip_detF > 0.0:
-        F_full = _Ds * rest_matrix[tetid]
-        J = wp.determinant(F_full)
-        if J < fiber_skip_detF:
-            return
-
-    wTDminvT = wp.vec3(cons[c].restvector[0], cons[c].restvector[1], cons[c].restvector[2])
-    FwT = _Ds * wTDminvT  # = F * w (fiber direction in deformed space)
-    lm_sq = wp.length_sq(FwT)
-    if lm_sq < 1.0e-12:
-        return
-    lm = wp.sqrt(lm_sq)
-
-    # ── Evaluate Millard energy and force ──
-    psi_L = millard_energy_eval_wp(lm,
-        fl_x_coeffs, fl_F_coeffs, fl_seg_bounds, fl_n_segments,
-        fl_x_lo, fl_x_hi, fl_y_lo, fl_y_hi, fl_dydx_lo, fl_dydx_hi)
-    psi_L = psi_L + fl_energy_offset  # shift so Psi > 0 for all physical lm
-
-    f_L_val = millard_eval_wp(lm,
-        fl_x_coeffs, fl_y_coeffs, fl_seg_bounds, fl_n_segments,
-        fl_x_lo, fl_x_hi, fl_y_lo, fl_y_hi, fl_dydx_lo, fl_dydx_hi)
-
-    # ── Energy constraint: C = sqrt(2 * sigma0 * a * (Psi_L + offset)) ──
-    C_energy = wp.sqrt(2.0 * sigma0 * acti * wp.max(psi_L, 1.0e-20))
-    dC_dlm = sigma0 * acti * f_L_val / C_energy
-
-    # ── Geometric gradients: dlm/dx_i ──
-    # Ht = wTDminvT ⊗ FwT, grad_lm_i = (1/lm) * row_i(Ht)
-    inv_lm = 1.0 / lm
-    Ht = wp.outer(wTDminvT, FwT)
-    grad_lm0 = inv_lm * wp.vec3(Ht[0, 0], Ht[0, 1], Ht[0, 2])
-    grad_lm1 = inv_lm * wp.vec3(Ht[1, 0], Ht[1, 1], Ht[1, 2])
-    grad_lm2 = inv_lm * wp.vec3(Ht[2, 0], Ht[2, 1], Ht[2, 2])
-    grad_lm3 = -grad_lm0 - grad_lm1 - grad_lm2
-
-    # ── Chain rule: gradC_i = dC/dlm * dlm/dx_i ──
-    grad0 = dC_dlm * grad_lm0
-    grad1 = dC_dlm * grad_lm1
-    grad2 = dC_dlm * grad_lm2
-    grad3 = dC_dlm * grad_lm3
-
-    # ── XPBD update ──
-    inv_mass0 = get_inv_mass_fn(pts[0], mass, stopped)
-    inv_mass1 = get_inv_mass_fn(pts[1], mass, stopped)
-    inv_mass2 = get_inv_mass_fn(pts[2], mass, stopped)
-    inv_mass3 = get_inv_mass_fn(pts[3], mass, stopped)
-
-    w_sum = (inv_mass0 * wp.length_sq(grad0) +
-             inv_mass1 * wp.length_sq(grad1) +
-             inv_mass2 * wp.length_sq(grad2) +
-             inv_mass3 * wp.length_sq(grad3))
-
-    if w_sum < 1.0e-9:
-        return
-
-    # Compliance: alpha = 1/(k * V0 * dt^2)
-    # Uniform stiffness (no tendonmask scaling): softening tendon-junction tets made
-    # them floppy and over-distort, so keep full stiffness everywhere. Active FORCE is
-    # already belly-only via acti *= (1 - tendonmask) above.
-    stiffness_val = cstiffness * millard_stiffness_scale
-    restlength = cons[c].restlength  # V0 (tet volume)
-    alpha = 1.0 / stiffness_val
-    alpha = alpha / restlength
-    alpha = alpha / (dt * dt)
-
-    l = cons[c].L[0]  # accumulated Lagrange multiplier
-    kdampratio = cons[c].dampingratio
-
-    # Damping
-    dsum = float(0.0)
-    gamma = float(1.0)
-    if kdampratio > 0.0:
-        beta = stiffness_val * kdampratio * dt * dt
-        beta = beta * restlength
-        gamma = alpha * beta / dt
-        dsum = (wp.dot(grad0, pos[pts[0]] - pprev[pts[0]]) +
-                wp.dot(grad1, pos[pts[1]] - pprev[pts[1]]) +
-                wp.dot(grad2, pos[pts[2]] - pprev[pts[2]]) +
-                wp.dot(grad3, pos[pts[3]] - pprev[pts[3]]))
-        dsum = dsum * gamma
-        gamma = gamma + 1.0
-
-    dL = (-C_energy - alpha * l - dsum) / (gamma * w_sum + alpha)
-    if use_jacobi != 0:
-        update_dP(dP, dPw, dL * inv_mass0 * grad0, pts[0])
-        update_dP(dP, dPw, dL * inv_mass1 * grad1, pts[1])
-        update_dP(dP, dPw, dL * inv_mass2 * grad2, pts[2])
-        update_dP(dP, dPw, dL * inv_mass3 * grad3, pts[3])
-    else:
-        pos[pts[0]] = pos[pts[0]] + dL * inv_mass0 * grad0
-        pos[pts[1]] = pos[pts[1]] + dL * inv_mass1 * grad1
-        pos[pts[2]] = pos[pts[2]] + dL * inv_mass2 * grad2
-        pos[pts[3]] = pos[pts[3]] + dL * inv_mass3 * grad3
-        cons[c].L = wp.vec3(cons[c].L[0] + dL, cons[c].L[1], cons[c].L[2])
-
-
-@wp.kernel
-def solve_attach_kernel(
-    cons: wp.array(dtype=Constraint),
-    pos: wp.array(dtype=wp.vec3),
-    pprev: wp.array(dtype=wp.vec3),
-    dP: wp.array(dtype=wp.vec3),
-    dPw: wp.array(dtype=wp.float32),
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    reaction_accum: wp.array(dtype=wp.vec3),
-    dt: float,
-    use_jacobi: int,
-    has_compress_stiffness: int,
-    offset: int,
-):
-    c = offset + wp.tid()
-    cstiffness = cons[c].stiffness
-    if cstiffness <= 0.0:
-        return
-    kstiffcompress = cons[c].compressionstiffness
-    kstiffcompress = wp.where(kstiffcompress >= 0.0, kstiffcompress, cstiffness)
-    pts = cons[c].pts
-    pt_src = pts[0]
-    rv = cons[c].restvector
-    p0_target = wp.vec3(rv[0], rv[1], rv[2])
-    attach_bilateral_update_fn(
-        use_jacobi, c, cons, pt_src, p0_target,
-        pos, pprev, dP, dPw, mass, stopped,
-        cons[c].restlength, cstiffness, cons[c].dampingratio,
-        kstiffcompress, dt, has_compress_stiffness, reaction_accum)
-
-
-@wp.kernel
-def solve_pin_kernel(
-    cons: wp.array(dtype=Constraint),
-    pos: wp.array(dtype=wp.vec3),
-    pprev: wp.array(dtype=wp.vec3),
-    dP: wp.array(dtype=wp.vec3),
-    dPw: wp.array(dtype=wp.float32),
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    dt: float,
-    use_jacobi: int,
-    has_compress_stiffness: int,
-    offset: int,
-):
-    c = offset + wp.tid()
-    cstiffness = cons[c].stiffness
-    if cstiffness <= 0.0:
-        return
-    kstiffcompress = cons[c].compressionstiffness
-    kstiffcompress = wp.where(kstiffcompress >= 0.0, kstiffcompress, cstiffness)
-    pts = cons[c].pts
-    pt_src = pts[0]
-    rv = cons[c].restvector
-    p0_target = wp.vec3(rv[0], rv[1], rv[2])
-    p1_src = pos[pt_src]
-    distance_pos_update_xpbd_fn(
-        use_jacobi, c, cons, -1, pt_src,
-        p0_target, p1_src,
-        pos, pprev, dP, dPw, mass, stopped,
-        cons[c].restlength, cstiffness, cons[c].dampingratio,
-        kstiffcompress, dt, has_compress_stiffness)
-
-
-@wp.kernel
-def solve_pintotarget_kernel(
-    cons: wp.array(dtype=Constraint),
-    pos: wp.array(dtype=wp.vec3),
-    offset: int,
-):
-    """Hard pin: pos[src] = bone_target + rest_offset (no XPBD, direct overwrite).
-
-    restvector = live bone_pos[tgt] (refreshed by update_attach_targets_kernel).
-    restdir    = rest_offset = pos0[src] - bone_pos0[tgt] (captured at build).
-    Each src appears in at most one pintotarget constraint, so the parallel
-    overwrites do not race.
-    """
-    c = offset + wp.tid()
-    pts = cons[c].pts
-    pt_src = pts[0]
-    if pt_src < 0:
-        return
-    rv = cons[c].restvector
-    rd = cons[c].restdir
-    pos[pt_src] = wp.vec3(rv[0] + rd[0], rv[1] + rd[1], rv[2] + rd[2])
-
-
-@wp.kernel
-def solve_distanceline_kernel(
-    cons: wp.array(dtype=Constraint),
-    pos: wp.array(dtype=wp.vec3),
-    pprev: wp.array(dtype=wp.vec3),
-    dP: wp.array(dtype=wp.vec3),
-    dPw: wp.array(dtype=wp.float32),
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    dt: float,
-    use_jacobi: int,
-    has_compress_stiffness: int,
-    offset: int,
-):
-    c = offset + wp.tid()
-    cstiffness = cons[c].stiffness
-    if cstiffness <= 0.0:
-        return
-    kstiffcompress = cons[c].compressionstiffness
-    kstiffcompress = wp.where(kstiffcompress >= 0.0, kstiffcompress, cstiffness)
-    pts = cons[c].pts
-    pt_src = pts[0]
-    p_src = pos[pt_src]
-    rv = cons[c].restvector
-    line_origin = wp.vec3(rv[0], rv[1], rv[2])
-    line_dir = cons[c].restdir
-
-    p_projected = project_to_line_fn(p_src, line_origin, line_dir)
-
-    distance_pos_update_xpbd_fn(
-        use_jacobi, c, cons, -1, pt_src,
-        p_projected, p_src,
-        pos, pprev, dP, dPw, mass, stopped,
-        cons[c].restlength, cstiffness, cons[c].dampingratio,
-        kstiffcompress, dt, has_compress_stiffness)
-
-
-# Polar-decomposition ARAP (RLMuscle parity).
-# C = ||F - R||_F where R = polar(F).rotation. With LINEARENERGY flag (set
-# for TETARAP via fem_flags_fn), C is the linear norm and gradscale = 1/psi.
-# Only penalises non-rotational deformation, so fiber contraction stays free
-# (unlike the SVD form which also locks volume + isotropy).
-@wp.func
-def tet_arap_update_xpbd_fn(
-    use_jacobi: int,
-    cidx: int,
-    cons: wp.array(dtype=Constraint),
-    pts: wp.vec4i,
-    dt: float,
-    pos: wp.array(dtype=wp.vec3),
-    pprev: wp.array(dtype=wp.vec3),
-    dP: wp.array(dtype=wp.vec3),
-    dPw: wp.array(dtype=wp.float32),
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    restlength: float,
-    restmatrix: wp.mat33,
-    kstiff: float,
-    kdampratio: float,
-    flags: int,
-):
-    pt0 = pts[0]
-    pt1 = pts[1]
-    pt2 = pts[2]
-    pt3 = pts[3]
-    p0 = pos[pt0]
-    p1 = pos[pt1]
-    p2 = pos[pt2]
-    p3 = pos[pt3]
-
-    invmass0 = get_inv_mass_fn(pt0, mass, stopped)
-    invmass1 = get_inv_mass_fn(pt1, mass, stopped)
-    invmass2 = get_inv_mass_fn(pt2, mass, stopped)
-    invmass3 = get_inv_mass_fn(pt3, mass, stopped)
-
-    c0 = p0 - p3
-    c1 = p1 - p3
-    c2 = p2 - p3
-    Ds = wp.mat33(
-        c0[0], c1[0], c2[0],
-        c0[1], c1[1], c2[1],
-        c0[2], c1[2], c2[2])
-
-    F = Ds * restmatrix
-
-    polar = polar_decomposition_fn(F)
-    R = polar.R
-    d = F - R
-
-    cons[cidx].restvector = mat3_to_quat_fn(R)
-
-    psi = squared_norm3_fn(d)
-    gradscale = float(2.0)
-    if (flags & (LINEARENERGY | NORMSTIFFNESS)) != 0:
-        psi = wp.sqrt(psi)
-        gradscale = 1.0 / psi
-
-    if psi >= 1e-6:
-        Ht = restmatrix * wp.transpose(d)
-        grad0 = gradscale * wp.vec3(Ht[0, 0], Ht[0, 1], Ht[0, 2])
-        grad1 = gradscale * wp.vec3(Ht[1, 0], Ht[1, 1], Ht[1, 2])
-        grad2 = gradscale * wp.vec3(Ht[2, 0], Ht[2, 1], Ht[2, 2])
-        grad3 = -grad0 - grad1 - grad2
-
-        wsum = (invmass0 * wp.dot(grad0, grad0) +
-                invmass1 * wp.dot(grad1, grad1) +
-                invmass2 * wp.dot(grad2, grad2) +
-                invmass3 * wp.dot(grad3, grad3))
-
-        if wsum != 0.0:
-            alpha = 1.0 / kstiff
-            if (flags & NORMSTIFFNESS) != 0:
-                alpha = alpha / restlength
-            alpha = alpha / (dt * dt)
-
-            dsum = float(0.0)
-            gamma = float(1.0)
-            if kdampratio > 0.0:
-                prev0 = pprev[pt0]
-                prev1 = pprev[pt1]
-                prev2 = pprev[pt2]
-                prev3 = pprev[pt3]
-                beta = kstiff * kdampratio * dt * dt
-                if (flags & NORMSTIFFNESS) != 0:
-                    beta = beta * restlength
-                gamma = alpha * beta / dt
-                dsum = (wp.dot(grad0, p0 - prev0) +
-                        wp.dot(grad1, p1 - prev1) +
-                        wp.dot(grad2, p2 - prev2) +
-                        wp.dot(grad3, p3 - prev3))
-                dsum = dsum * gamma
-                gamma = gamma + 1.0
-
-            C = psi
-            dL = (-C - alpha * cons[cidx].L[0] - dsum) / (gamma * wsum + alpha)
-            if use_jacobi != 0:
-                update_dP(dP, dPw, dL * invmass0 * grad0, pt0)
-                update_dP(dP, dPw, dL * invmass1 * grad1, pt1)
-                update_dP(dP, dPw, dL * invmass2 * grad2, pt2)
-                update_dP(dP, dPw, dL * invmass3 * grad3, pt3)
-            else:
-                pos[pt0] = pos[pt0] + dL * invmass0 * grad0
-                pos[pt1] = pos[pt1] + dL * invmass1 * grad1
-                pos[pt2] = pos[pt2] + dL * invmass2 * grad2
-                pos[pt3] = pos[pt3] + dL * invmass3 * grad3
-                cons[cidx].L = wp.vec3(cons[cidx].L[0] + dL, cons[cidx].L[1], cons[cidx].L[2])
-
-
-@wp.kernel
-def solve_tetarap_kernel(
-    cons: wp.array(dtype=Constraint),
-    pos: wp.array(dtype=wp.vec3),
-    pprev: wp.array(dtype=wp.vec3),
-    dP: wp.array(dtype=wp.vec3),
-    dPw: wp.array(dtype=wp.float32),
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    rest_matrix: wp.array(dtype=wp.mat33),
-    dt: float,
-    use_jacobi: int,
-    offset: int,
-):
-    c = offset + wp.tid()
-    cstiffness = cons[c].stiffness
-    if cstiffness <= 0.0:
-        return
-    pts = cons[c].pts
-    tetid = cons[c].tetid
-    ctype = cons[c].type
-    flags = fem_flags_fn(ctype)
-    tet_arap_update_xpbd_fn(
-        use_jacobi, c, cons, pts, dt, pos, pprev, dP, dPw,
-        mass, stopped, cons[c].restlength, rest_matrix[tetid],
-        cstiffness, cons[c].dampingratio, flags)
-
-
-# SVD-based ARAP (canonical PBD-XPBD form, ported from
-# realtimeMuscle/engine/arap_hpbd.py:project_constraints).
-# C = ||S - I||_F where F = D_s · B and B = restmatrix.
-# Gradient: dC/dF = sum_k dC/dS_k · U[:,k] · V[:,k]^T. Sign-fixed SVD via
-# ssvd_fn keeps the gradient pointing back to det F > 0 even when F is
-# inverted, which the polar-form variant could not do.
-# NOTE: penalises ALL singular-value deviation (volume + isotropy + shear),
-# which over-stiffens fiber contraction. Kept for reference; dispatch uses
-# the polar form above.
-@wp.kernel
-def solve_tetarap_svd_kernel(
-    cons: wp.array(dtype=Constraint),
-    pos: wp.array(dtype=wp.vec3),
-    pprev: wp.array(dtype=wp.vec3),
-    dP: wp.array(dtype=wp.vec3),
-    dPw: wp.array(dtype=wp.float32),
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    rest_matrix: wp.array(dtype=wp.mat33),
-    dt: float,
-    use_jacobi: int,
-    offset: int,
-):
-    c = offset + wp.tid()
-    cstiffness = cons[c].stiffness
-    if cstiffness <= 0.0:
-        return
-    pts = cons[c].pts
-    tetid = cons[c].tetid
-    pt0 = pts[0]
-    pt1 = pts[1]
-    pt2 = pts[2]
-    pt3 = pts[3]
-    p0 = pos[pt0]
-    p1 = pos[pt1]
-    p2 = pos[pt2]
-    p3 = pos[pt3]
-
-    invmass0 = get_inv_mass_fn(pt0, mass, stopped)
-    invmass1 = get_inv_mass_fn(pt1, mass, stopped)
-    invmass2 = get_inv_mass_fn(pt2, mass, stopped)
-    invmass3 = get_inv_mass_fn(pt3, mass, stopped)
-
-    # V2 convention: pt3 is the reference (= x0 in realtimeMuscle).
-    c0 = p0 - p3
-    c1 = p1 - p3
-    c2 = p2 - p3
-    Ds = wp.mat33(
-        c0[0], c1[0], c2[0],
-        c0[1], c1[1], c2[1],
-        c0[2], c1[2], c2[2])
-    B = rest_matrix[tetid]
-    F = Ds * B
-
-    svd = ssvd_fn(F)
-    U = svd.U
-    sigma = svd.sigma
-    V = svd.V
-
-    s_minus_1 = wp.vec3(sigma[0] - 1.0, sigma[1] - 1.0, sigma[2] - 1.0)
-    sum_sq = (s_minus_1[0] * s_minus_1[0]
-              + s_minus_1[1] * s_minus_1[1]
-              + s_minus_1[2] * s_minus_1[2])
-    if sum_sq < 1.0e-12:
-        return
-    Cval = wp.sqrt(sum_sq)
-    inv_C = 1.0 / Cval
-    dCdS0 = inv_C * s_minus_1[0]
-    dCdS1 = inv_C * s_minus_1[1]
-    dCdS2 = inv_C * s_minus_1[2]
-
-    # dCdF[i,j] = sum_k dCdS[k] * U[i,k] * V[j,k]
-    dCdF00 = U[0, 0] * V[0, 0] * dCdS0 + U[0, 1] * V[0, 1] * dCdS1 + U[0, 2] * V[0, 2] * dCdS2
-    dCdF01 = U[0, 0] * V[1, 0] * dCdS0 + U[0, 1] * V[1, 1] * dCdS1 + U[0, 2] * V[1, 2] * dCdS2
-    dCdF02 = U[0, 0] * V[2, 0] * dCdS0 + U[0, 1] * V[2, 1] * dCdS1 + U[0, 2] * V[2, 2] * dCdS2
-    dCdF10 = U[1, 0] * V[0, 0] * dCdS0 + U[1, 1] * V[0, 1] * dCdS1 + U[1, 2] * V[0, 2] * dCdS2
-    dCdF11 = U[1, 0] * V[1, 0] * dCdS0 + U[1, 1] * V[1, 1] * dCdS1 + U[1, 2] * V[1, 2] * dCdS2
-    dCdF12 = U[1, 0] * V[2, 0] * dCdS0 + U[1, 1] * V[2, 1] * dCdS1 + U[1, 2] * V[2, 2] * dCdS2
-    dCdF20 = U[2, 0] * V[0, 0] * dCdS0 + U[2, 1] * V[0, 1] * dCdS1 + U[2, 2] * V[0, 2] * dCdS2
-    dCdF21 = U[2, 0] * V[1, 0] * dCdS0 + U[2, 1] * V[1, 1] * dCdS1 + U[2, 2] * V[1, 2] * dCdS2
-    dCdF22 = U[2, 0] * V[2, 0] * dCdS0 + U[2, 1] * V[2, 1] * dCdS1 + U[2, 2] * V[2, 2] * dCdS2
-
-    # grad_ptk[a] = sum_j dCdF[a,j] * B[k,j]   (k=0,1,2 for non-reference verts)
-    grad0 = wp.vec3(
-        dCdF00 * B[0, 0] + dCdF01 * B[0, 1] + dCdF02 * B[0, 2],
-        dCdF10 * B[0, 0] + dCdF11 * B[0, 1] + dCdF12 * B[0, 2],
-        dCdF20 * B[0, 0] + dCdF21 * B[0, 1] + dCdF22 * B[0, 2])
-    grad1 = wp.vec3(
-        dCdF00 * B[1, 0] + dCdF01 * B[1, 1] + dCdF02 * B[1, 2],
-        dCdF10 * B[1, 0] + dCdF11 * B[1, 1] + dCdF12 * B[1, 2],
-        dCdF20 * B[1, 0] + dCdF21 * B[1, 1] + dCdF22 * B[1, 2])
-    grad2 = wp.vec3(
-        dCdF00 * B[2, 0] + dCdF01 * B[2, 1] + dCdF02 * B[2, 2],
-        dCdF10 * B[2, 0] + dCdF11 * B[2, 1] + dCdF12 * B[2, 2],
-        dCdF20 * B[2, 0] + dCdF21 * B[2, 1] + dCdF22 * B[2, 2])
-    grad3 = -grad0 - grad1 - grad2
-
-    wsum = (invmass0 * wp.dot(grad0, grad0)
-            + invmass1 * wp.dot(grad1, grad1)
-            + invmass2 * wp.dot(grad2, grad2)
-            + invmass3 * wp.dot(grad3, grad3))
-    if wsum == 0.0:
-        return
-
-    alpha = 1.0 / cstiffness
-    alpha_tilde = alpha / (dt * dt)
-    L0 = cons[c].L[0]
-    dL = -(Cval + alpha_tilde * L0) / (wsum + alpha_tilde)
-
-    if use_jacobi != 0:
-        update_dP(dP, dPw, dL * invmass0 * grad0, pt0)
-        update_dP(dP, dPw, dL * invmass1 * grad1, pt1)
-        update_dP(dP, dPw, dL * invmass2 * grad2, pt2)
-        update_dP(dP, dPw, dL * invmass3 * grad3, pt3)
-    else:
-        pos[pt0] = pos[pt0] + dL * invmass0 * grad0
-        pos[pt1] = pos[pt1] + dL * invmass1 * grad1
-        pos[pt2] = pos[pt2] + dL * invmass2 * grad2
-        pos[pt3] = pos[pt3] + dL * invmass3 * grad3
-        cons[c].L = wp.vec3(L0 + dL, cons[c].L[1], cons[c].L[2])
-
-
-@wp.func
-def tet_snh_update_xpbd_fn(
-    use_jacobi: int,
-    cidx: int,
-    cons: wp.array(dtype=Constraint),
-    pts: wp.vec4i,
-    dt: float,
-    pos: wp.array(dtype=wp.vec3),
-    pprev: wp.array(dtype=wp.vec3),
-    dP: wp.array(dtype=wp.vec3),
-    dPw: wp.array(dtype=wp.float32),
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    restvolume: float,
-    restmatrix: wp.mat33,
-    mu: float,
-    lam: float,
-    kdampratio: float,
-):
-    """Stable Neo-Hookean XPBD constraint (coupled deviatoric + volumetric).
-
-    Deviatoric: C_D = ||F||_F - sqrt(3)
-    Volumetric: C_H = J - alpha  where alpha = 1 + mu/lam
-    Coupled 2x2 solve for both Lagrange multipliers.
-    Reference: Macklin "A Constraint-based Formulation of Stable Neo-Hookean Materials"
-    """
-    pt0 = pts[0]
-    pt1 = pts[1]
-    pt2 = pts[2]
-    pt3 = pts[3]
-    p0 = pos[pt0]
-    p1 = pos[pt1]
-    p2 = pos[pt2]
-    p3 = pos[pt3]
-
-    invmass0 = get_inv_mass_fn(pt0, mass, stopped)
-    invmass1 = get_inv_mass_fn(pt1, mass, stopped)
-    invmass2 = get_inv_mass_fn(pt2, mass, stopped)
-    invmass3 = get_inv_mass_fn(pt3, mass, stopped)
-
-    # Deformation gradient F = Ds * Dm^-1
-    c0 = p0 - p3
-    c1 = p1 - p3
-    c2 = p2 - p3
-    Ds = wp.mat33(
-        c0[0], c1[0], c2[0],
-        c0[1], c1[1], c2[1],
-        c0[2], c1[2], c2[2])
-    F = Ds * restmatrix
-
-    # --- Deviatoric constraint: C_D = ||F||_F - sqrt(3) ---
-    Ic = (F[0, 0] * F[0, 0] + F[0, 1] * F[0, 1] + F[0, 2] * F[0, 2] +
-          F[1, 0] * F[1, 0] + F[1, 1] * F[1, 1] + F[1, 2] * F[1, 2] +
-          F[2, 0] * F[2, 0] + F[2, 1] * F[2, 1] + F[2, 2] * F[2, 2])
-    r_s = wp.sqrt(wp.max(Ic, 1.0e-12))
-    dC = r_s - 1.7320508075688772  # sqrt(3)
-
-    if r_s < 1.0e-6:
-        return
-
-    # Deviatoric gradient: dC_D/dF = F/||F||, projected to position space
-    inv_rs = 1.0 / r_s
-    Fnorm = F * inv_rs
-    Ht = restmatrix * wp.transpose(Fnorm)
-    dgrad0 = wp.vec3(Ht[0, 0], Ht[0, 1], Ht[0, 2])
-    dgrad1 = wp.vec3(Ht[1, 0], Ht[1, 1], Ht[1, 2])
-    dgrad2 = wp.vec3(Ht[2, 0], Ht[2, 1], Ht[2, 2])
-    dgrad3 = -dgrad0 - dgrad1 - dgrad2
-
-    dsum_w = (invmass0 * wp.dot(dgrad0, dgrad0) +
-              invmass1 * wp.dot(dgrad1, dgrad1) +
-              invmass2 * wp.dot(dgrad2, dgrad2) +
-              invmass3 * wp.dot(dgrad3, dgrad3))
-    if dsum_w == 0.0:
-        return
-
-    # --- Volumetric constraint: C_H = J - alpha ---
-    # Clamped: only resist volume expansion (J > alpha)
-    alpha_snh = 1.0 + mu / lam
-    J = wp.determinant(F)
-    hC = J - alpha_snh
-
-    # Volume gradients: dJ/dx_i via cross products of edge vectors
-    inv_detDm = 1.0 / wp.max(wp.abs(restvolume) * 6.0, 1.0e-20)
-    hgrad0 = wp.cross(c1, c2) * inv_detDm
-    hgrad1 = wp.cross(c2, c0) * inv_detDm
-    hgrad2 = wp.cross(c0, c1) * inv_detDm
-    hgrad3 = -hgrad0 - hgrad1 - hgrad2
-
-    hsum_w = (invmass0 * wp.dot(hgrad0, hgrad0) +
-              invmass1 * wp.dot(hgrad1, hgrad1) +
-              invmass2 * wp.dot(hgrad2, hgrad2) +
-              invmass3 * wp.dot(hgrad3, hgrad3))
-    if hsum_w == 0.0:
-        return
-
-    # Coupled cross-term
-    dhsum = (invmass0 * wp.dot(dgrad0, hgrad0) +
-             invmass1 * wp.dot(dgrad1, hgrad1) +
-             invmass2 * wp.dot(dgrad2, hgrad2) +
-             invmass3 * wp.dot(dgrad3, hgrad3))
-
-    # XPBD compliances: alpha = 1/(stiffness * volume * dt^2)
-    abs_vol = wp.max(wp.abs(restvolume), 1.0e-20)
-    dalpha = 1.0 / (mu * abs_vol * dt * dt)
-    halpha = 1.0 / (lam * abs_vol * dt * dt)
-
-    # Damping
-    ddamp = float(0.0)
-    dgamma = float(1.0)
-    hdamp = float(0.0)
-    hgamma = float(1.0)
-    if kdampratio > 0.0:
-        prev0 = pprev[pt0]
-        prev1 = pprev[pt1]
-        prev2 = pprev[pt2]
-        prev3 = pprev[pt3]
-        dbeta = mu * abs_vol * kdampratio * dt * dt
-        hbeta = lam * abs_vol * kdampratio * dt * dt
-        dgamma = dalpha * dbeta / dt
-        hgamma = halpha * hbeta / dt
-        ddamp = (wp.dot(dgrad0, p0 - prev0) + wp.dot(dgrad1, p1 - prev1) +
-                 wp.dot(dgrad2, p2 - prev2) + wp.dot(dgrad3, p3 - prev3))
-        hdamp = (wp.dot(hgrad0, p0 - prev0) + wp.dot(hgrad1, p1 - prev1) +
-                 wp.dot(hgrad2, p2 - prev2) + wp.dot(hgrad3, p3 - prev3))
-        ddamp = ddamp * dgamma
-        hdamp = hdamp * hgamma
-        dgamma = dgamma + 1.0
-        hgamma = hgamma + 1.0
-
-    dL = cons[cidx].L[0]
-    hL = cons[cidx].L[2]
-
-    # Coupled 2x2 linear solve for both Lagrange multipliers
-    Axx = dgamma * dsum_w + dalpha
-    Ayy = hgamma * hsum_w + halpha
-    det_A = Axx * Ayy - dhsum * dhsum
-    if det_A < 1.0e-8:
-        return
-    inv_det = 1.0 / det_A
-    db = -dC - dalpha * dL - ddamp
-    hb = -hC - halpha * hL - hdamp
-    ddL = inv_det * (Ayy * db - dhsum * hb)
-    hdL = inv_det * (Axx * hb - dhsum * db)
-
-    if use_jacobi != 0:
-        update_dP(dP, dPw, invmass0 * (ddL * dgrad0 + hdL * hgrad0), pt0)
-        update_dP(dP, dPw, invmass1 * (ddL * dgrad1 + hdL * hgrad1), pt1)
-        update_dP(dP, dPw, invmass2 * (ddL * dgrad2 + hdL * hgrad2), pt2)
-        update_dP(dP, dPw, invmass3 * (ddL * dgrad3 + hdL * hgrad3), pt3)
-    else:
-        pos[pt0] = p0 + invmass0 * (ddL * dgrad0 + hdL * hgrad0)
-        pos[pt1] = p1 + invmass1 * (ddL * dgrad1 + hdL * hgrad1)
-        pos[pt2] = p2 + invmass2 * (ddL * dgrad2 + hdL * hgrad2)
-        pos[pt3] = p3 + invmass3 * (ddL * dgrad3 + hdL * hgrad3)
-        cons[cidx].L = wp.vec3(dL + ddL, cons[cidx].L[1], hL + hdL)
-
-
-@wp.kernel
-def solve_tetsnh_kernel(
-    cons: wp.array(dtype=Constraint),
-    pos: wp.array(dtype=wp.vec3),
-    pprev: wp.array(dtype=wp.vec3),
-    dP: wp.array(dtype=wp.vec3),
-    dPw: wp.array(dtype=wp.float32),
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    rest_matrix: wp.array(dtype=wp.mat33),
-    dt: float,
-    use_jacobi: int,
-    offset: int,
-):
-    c = offset + wp.tid()
-    mu = cons[c].stiffness
-    if mu <= 0.0:
-        return
-    pts = cons[c].pts
-    tetid = cons[c].tetid
-    lam = cons[c].restdir[0]
-    tet_snh_update_xpbd_fn(
-        use_jacobi, c, cons, pts, dt, pos, pprev, dP, dPw,
-        mass, stopped, cons[c].restlength, rest_matrix[tetid],
-        mu, lam, cons[c].dampingratio)
-
-
-# ---------------------------------------------------------------------------
-# MassSpring constraint solvers (Gaia S01 U-drop material)
-# ---------------------------------------------------------------------------
-
-@wp.kernel
-def solve_distance_kernel(
-    cons: wp.array(dtype=Constraint),
-    pos: wp.array(dtype=wp.vec3),
-    pprev: wp.array(dtype=wp.vec3),
-    dP: wp.array(dtype=wp.vec3),
-    dPw: wp.array(dtype=wp.float32),
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    dt: float,
-    use_jacobi: int,
-    has_compress_stiffness: int,
-    offset: int,
-):
-    """Two-vertex XPBD edge spring.  Reuses ``distance_pos_update_xpbd_fn``
-    (the engine distance constraint math) with both endpoints dynamic — the
-    counterpart of MassSpring's spring_kernel."""
-    c = offset + wp.tid()
-    cstiffness = cons[c].stiffness
-    if cstiffness <= 0.0:
-        return
-    kstiffcompress = cons[c].compressionstiffness
-    kstiffcompress = wp.where(kstiffcompress >= 0.0, kstiffcompress, cstiffness)
-    pts = cons[c].pts
-    pt0 = pts[0]
-    pt1 = pts[1]
-    distance_pos_update_xpbd_fn(
-        use_jacobi, c, cons, pt0, pt1,
-        pos[pt0], pos[pt1],
-        pos, pprev, dP, dPw, mass, stopped,
-        cons[c].restlength, cstiffness, cons[c].dampingratio,
-        kstiffcompress, dt, has_compress_stiffness)
-
-
-@wp.kernel
-def solve_tetvolumehard_kernel(
-    cons: wp.array(dtype=Constraint),
-    pos: wp.array(dtype=wp.vec3),
-    dm_inv: wp.array(dtype=wp.mat33),
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    offset: int,
-):
-    """Hard PBD volume preservation C=det(F)-1, dlambda=-C/w (no compliance).
-    Migrated from MassSpring volume_kernel; Gauss-Seidel direct write.
-    ``dm_inv`` is the rest DmInv with vertex 0 as reference."""
-    c = offset + wp.tid()
-    pts = cons[c].pts
-    i0 = pts[0]
-    i1 = pts[1]
-    i2 = pts[2]
-    i3 = pts[3]
-    w0 = get_inv_mass_fn(i0, mass, stopped)
-    w1 = get_inv_mass_fn(i1, mass, stopped)
-    w2 = get_inv_mass_fn(i2, mass, stopped)
-    w3 = get_inv_mass_fn(i3, mass, stopped)
-    v0 = pos[i0]
-    P = wp.matrix_from_cols(pos[i1] - v0, pos[i2] - v0, pos[i3] - v0)
-    iDS = dm_inv[cons[c].tetid]
-    F = P * iDS
-    f0 = wp.vec3(F[0, 0], F[1, 0], F[2, 0])
-    f1 = wp.vec3(F[0, 1], F[1, 1], F[2, 1])
-    f2 = wp.vec3(F[0, 2], F[1, 2], F[2, 2])
-    dF0 = wp.cross(f1, f2)
-    dF1 = wp.cross(f2, f0)
-    dF2 = wp.cross(f0, f1)
-    g1 = dF0 * iDS[0, 0] + dF1 * iDS[0, 1] + dF2 * iDS[0, 2]
-    g2 = dF0 * iDS[1, 0] + dF1 * iDS[1, 1] + dF2 * iDS[1, 2]
-    g3 = dF0 * iDS[2, 0] + dF1 * iDS[2, 1] + dF2 * iDS[2, 2]
-    g0 = -g1 - g2 - g3
-    C = wp.determinant(F) - 1.0
-    if C == 0.0:
-        return
-    w = (wp.dot(g0, g0) * w0 + wp.dot(g1, g1) * w1
-         + wp.dot(g2, g2) * w2 + wp.dot(g3, g3) * w3)
-    if w == 0.0:
-        return
-    dlam = -C / w
-    pos[i0] = pos[i0] + g0 * (dlam * w0)
-    pos[i1] = pos[i1] + g1 * (dlam * w1)
-    pos[i2] = pos[i2] + g2 * (dlam * w2)
-    pos[i3] = pos[i3] + g3 * (dlam * w3)
-
-
-@wp.kernel
-def solve_tetinversion_kernel(
-    cons: wp.array(dtype=Constraint),
-    pos: wp.array(dtype=wp.vec3),
-    rest_vol: wp.array(dtype=wp.float32),
-    mass: wp.array(dtype=wp.float32),
-    stopped: wp.array(dtype=wp.int32),
-    multiplier: float,
-    offset: int,
-):
-    """Untangle inverted tets (signed vol<=0).  Migrated directly from
-    MassSpring inversion_kernel (no engine counterpart); GS direct write."""
-    c = offset + wp.tid()
-    pts = cons[c].pts
-    i0 = pts[0]
-    i1 = pts[1]
-    i2 = pts[2]
-    i3 = pts[3]
-    e1 = pos[i1] - pos[i0]
-    e2 = pos[i2] - pos[i0]
-    e3 = pos[i3] - pos[i0]
-    vol = wp.dot(e1, wp.cross(e2, e3)) / 6.0
-    if vol > 0.0:
-        return
-    w0 = get_inv_mass_fn(i0, mass, stopped)
-    w1 = get_inv_mass_fn(i1, mass, stopped)
-    w2 = get_inv_mass_fn(i2, mass, stopped)
-    w3 = get_inv_mass_fn(i3, mass, stopped)
-    gr0 = wp.cross(e3 - e1, e2 - e1)
-    gr1 = wp.cross(e2, e3)
-    gr2 = wp.cross(e3, e1)
-    gr3 = wp.cross(e1, e2)
-    C = 6.0 * (vol - rest_vol[cons[c].tetid] * multiplier)
-    if C == 0.0:
-        return
-    a0 = gr0 * w0
-    a1 = gr1 * w1
-    a2 = gr2 * w2
-    a3 = gr3 * w3
-    w = wp.dot(a0, a0) + wp.dot(a1, a1) + wp.dot(a2, a2) + wp.dot(a3, a3)
-    if w == 0.0:
-        return
-    dlam = -C / w
-    pos[i0] = pos[i0] + gr0 * (dlam * w0)
-    pos[i1] = pos[i1] + gr1 * (dlam * w1)
-    pos[i2] = pos[i2] + gr2 * (dlam * w2)
-    pos[i3] = pos[i3] + gr3 * (dlam * w3)
-
 
 def build_unique_edges(tets: np.ndarray) -> np.ndarray:
     """All unique tet edges (the MassSpring spring set)."""
@@ -2917,9 +750,8 @@ def build_unique_edges(tets: np.ndarray) -> np.ndarray:
     return np.asarray(sorted(es), dtype=np.int32)
 
 
-# ---------------------------------------------------------------------------
-# MuscleSim (Warp backend)
-# ---------------------------------------------------------------------------
+
+
 
 class XpbdEngine(ConstraintBuilderMixin):
     """Shared XPBD substep engine for the muscle/oneway/massspring sims.
@@ -2992,7 +824,7 @@ class XpbdEngine(ConstraintBuilderMixin):
                   inputs=[self.dP, self.dPw])
         if self.n_cons > 0:
             wp.launch(clear_cons_L_kernel, dim=self.n_cons,
-                      inputs=[self.cons])
+                      inputs=[self.c_L])
 
     def apply_dP(self):
         wp.launch(apply_dP_kernel, dim=self.n_verts,
@@ -3006,7 +838,7 @@ class XpbdEngine(ConstraintBuilderMixin):
         """
         if not getattr(self, "pintotarget_constraints", None):
             return
-        rng = self.cons_ranges.get(PINTOTARGET) if hasattr(self, "cons_ranges") else None
+        rng = self.cons_ranges.get(ConstraintType.PINTOTARGET) if hasattr(self, "cons_ranges") else None
         if rng is None:
             return
         offset, count = rng
@@ -3016,86 +848,117 @@ class XpbdEngine(ConstraintBuilderMixin):
             self._mark_pintotarget_stopped()
             self._pintotarget_stopped_marked = True
         wp.launch(solve_pintotarget_kernel, dim=count,
-                  inputs=[self.cons, self.pos, offset])
+                  inputs=[self.c_pts, self.c_restvector, self.c_restdir,
+                          self.pos, offset])
 
     def _dispatch_constraints(self, type_ranges):
         """Dispatch constraint solver kernels for a given {type: (offset, count)} mapping."""
         has_compress = 1 if self.has_compressstiffness else 0
         use_jacobi_int = 1 if self.use_jacobi else 0
         for ctype, (offset, count) in type_ranges.items():
-            if ctype == TETVOLUME:
+            if ctype == ConstraintType.TETVOLUME:
                 wp.launch(solve_tetvolume_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
+                    self.c_stiffness, self.c_compressionstiffness, self.c_pts,
+                    self.c_tetid, self.c_restlength, self.c_dampingratio, self.c_L,
+                    self.pos, self.pprev,
                     self.dP, self.dPw, self.mass, self.stopped,
                     self.dt, use_jacobi_int, has_compress, offset])
-            elif ctype == TETFIBERNORM:
+            elif ctype == ConstraintType.TETFIBERNORM:
                 wp.launch(solve_tetfibernorm_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
+                    self.c_stiffness, self.c_pts, self.c_tetid,
+                    self.c_dampingratio, self.c_restlength, self.c_restvector, self.c_L,
+                    self.pos, self.pprev,
                     self.dP, self.dPw, self.mass, self.stopped,
                     self.rest_matrix, self.v_fiber_dir,
                     self.activation, self.tendonmask,
                     self.dt, use_jacobi_int,
                     self.contraction_ratio, self.fiber_stiffness_scale,
                     offset])
-            elif ctype == ATTACH:
+            elif ctype == ConstraintType.ATTACH:
                 wp.launch(solve_attach_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
+                    self.c_stiffness, self.c_compressionstiffness, self.c_pts,
+                    self.c_restlength, self.c_restvector, self.c_dampingratio, self.c_L,
+                    self.pos, self.pprev,
                     self.dP, self.dPw, self.mass, self.stopped,
                     self.reaction_accum,
                     self.dt, use_jacobi_int, has_compress, offset])
-            elif ctype == PIN:
+            elif ctype == ConstraintType.PIN:
                 wp.launch(solve_pin_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
+                    self.c_stiffness, self.c_compressionstiffness, self.c_pts,
+                    self.c_restlength, self.c_restvector, self.c_dampingratio, self.c_L,
+                    self.pos, self.pprev,
                     self.dP, self.dPw, self.mass, self.stopped,
                     self.dt, use_jacobi_int, has_compress, offset])
-            elif ctype == PINTOTARGET:
+            elif ctype == ConstraintType.PINTOTARGET:
                 # Skipped here — pintotarget is a kinematic post-pass run by
                 # apply_pintotarget() AFTER apply_dP, so Jacobi accumulation
                 # cannot undo the snap.
                 continue
-            elif ctype == DISTANCELINE:
+            elif ctype == ConstraintType.DISTANCELINE:
                 wp.launch(solve_distanceline_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
+                    self.c_stiffness, self.c_compressionstiffness, self.c_pts,
+                    self.c_restlength, self.c_restvector, self.c_restdir,
+                    self.c_dampingratio, self.c_L,
+                    self.pos, self.pprev,
                     self.dP, self.dPw, self.mass, self.stopped,
                     self.dt, use_jacobi_int, has_compress, offset])
-            elif ctype == DISTANCE:
+            elif ctype == ConstraintType.DISTANCE:
                 wp.launch(solve_distance_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
+                    self.c_stiffness, self.c_compressionstiffness, self.c_pts,
+                    self.c_restlength, self.c_dampingratio, self.c_L,
+                    self.pos, self.pprev,
                     self.dP, self.dPw, self.mass, self.stopped,
                     self.dt, use_jacobi_int, has_compress, offset])
-            elif ctype == TETVOLUMEHARD:
+            elif ctype == ConstraintType.TETVOLUMEHARD:
                 wp.launch(solve_tetvolumehard_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.ms_dm_inv,
+                    self.c_pts, self.c_tetid, self.pos, self.ms_dm_inv,
                     self.mass, self.stopped, offset])
-            elif ctype == TETINVERSION:
+            elif ctype == ConstraintType.TETINVERSION:
                 wp.launch(solve_tetinversion_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.ms_rest_vol,
+                    self.c_pts, self.c_tetid, self.pos, self.ms_rest_vol,
                     self.mass, self.stopped,
                     wp.float32(self.ms_inversion_mult), offset])
-            elif ctype == TETARAP:
+            elif ctype == ConstraintType.TETARAP:
                 wp.launch(solve_tetarap_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
+                    self.c_stiffness, self.c_pts, self.c_tetid, self.c_type,
+                    self.c_restlength, self.c_dampingratio, self.c_restvector, self.c_L,
+                    self.pos, self.pprev,
                     self.dP, self.dPw, self.mass, self.stopped,
                     self.rest_matrix,
                     self.dt, use_jacobi_int, offset])
-            elif ctype == TETARAPSVD:
+            elif ctype == ConstraintType.TETARAPSVD:
                 wp.launch(solve_tetarap_svd_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
+                    self.c_stiffness, self.c_pts, self.c_tetid, self.c_L,
+                    self.pos, self.pprev,
                     self.dP, self.dPw, self.mass, self.stopped,
                     self.rest_matrix,
                     self.dt, use_jacobi_int, offset])
-            elif ctype == TETFIBERDGF:
+            elif ctype == ConstraintType.TETARAPANISO:
+                wp.launch(solve_tet_aniso_arap_kernel, dim=count, inputs=[
+                    self.c_stiffness, self.c_pts, self.c_tetid, self.c_L,
+                    self.pos, self.pprev,
+                    self.dP, self.dPw, self.mass, self.stopped,
+                    self.rest_matrix, self.v_fiber_dir,
+                    self.activation, self.tendonmask,
+                    self.dt, use_jacobi_int,
+                    self.contraction_ratio, self.fiber_stiffness_scale,
+                    offset])
+            elif ctype == ConstraintType.TETFIBERDGF:
                 wp.launch(solve_tetfiberdgf_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
+                    self.c_stiffness, self.c_pts, self.c_tetid, self.c_restlength,
+                    self.c_restvector, self.c_restdir, self.c_dampingratio, self.c_L,
+                    self.pos, self.pprev,
                     self.dP, self.dPw, self.mass, self.stopped,
                     self.rest_matrix, self.v_fiber_dir,
                     self.activation, self.tendonmask,
                     self.dt, use_jacobi_int,
                     self.fiber_stiffness_scale,
                     offset])
-            elif ctype == TETFIBERMILLARD:
+            elif ctype == ConstraintType.TETFIBERMILLARD:
                 wp.launch(solve_tetfibermillard_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
+                    self.c_stiffness, self.c_pts, self.c_tetid, self.c_restlength,
+                    self.c_restvector, self.c_restdir, self.c_dampingratio, self.c_L,
+                    self.pos, self.pprev,
                     self.dP, self.dPw, self.mass, self.stopped,
                     self.rest_matrix, self.v_fiber_dir,
                     self.activation, self.tendonmask,
@@ -3118,9 +981,11 @@ class XpbdEngine(ConstraintBuilderMixin):
                     self._millard_fpe_dydx_lo, self._millard_fpe_dydx_hi,
                     float(getattr(self.cfg, 'fiber_skip_detF', 0.0)),
                     ])
-            elif ctype == TETSNH:
+            elif ctype == ConstraintType.TETSNH:
                 wp.launch(solve_tetsnh_kernel, dim=count, inputs=[
-                    self.cons, self.pos, self.pprev,
+                    self.c_stiffness, self.c_pts, self.c_tetid, self.c_restdir,
+                    self.c_restlength, self.c_dampingratio, self.c_L,
+                    self.pos, self.pprev,
                     self.dP, self.dPw, self.mass, self.stopped,
                     self.rest_matrix,
                     self.dt, use_jacobi_int, offset])
@@ -3166,7 +1031,7 @@ class XpbdEngine(ConstraintBuilderMixin):
             self.apply_dP()
 
     # Fiber constraint types to exclude during post-smoothing
-    _FIBER_TYPES = frozenset([TETFIBERNORM, TETFIBERDGF, TETFIBERMILLARD])
+    _FIBER_TYPES = frozenset([ConstraintType.TETFIBERNORM, ConstraintType.TETFIBERDGF, ConstraintType.TETFIBERMILLARD])
 
     def post_smooth(self):
         """Jacobi post-smoothing pass: solve only non-fiber constraints
@@ -3273,976 +1138,46 @@ class XpbdEngine(ConstraintBuilderMixin):
         for i, c in enumerate(reordered):
             c['cidx'] = i
 
-        cons_np = np.zeros(n_cons, dtype=Constraint.numpy_dtype())
-        cons_np['type'] = np.array([c['type'] for c in reordered], dtype=np.int32)
-        cons_np['cidx'] = np.arange(n_cons, dtype=np.int32)
-        cons_np['pts'] = np.array([c['pts'] for c in reordered], dtype=np.int32)
-        cons_np['stiffness'] = np.array([c['stiffness'] for c in reordered], dtype=np.float32)
-        cons_np['dampingratio'] = np.array([c['dampingratio'] for c in reordered], dtype=np.float32)
-        cons_np['tetid'] = np.array([c['tetid'] for c in reordered], dtype=np.int32)
-        cons_np['L'] = np.array([c['L'] for c in reordered], dtype=np.float32)
-        cons_np['restlength'] = np.array([c['restlength'] for c in reordered], dtype=np.float32)
-        cons_np['restvector'] = np.array([c['restvector'] for c in reordered], dtype=np.float32)
-        cons_np['restdir'] = np.array([c['restdir'] for c in reordered], dtype=np.float32)
-        cons_np['compressionstiffness'] = np.array([c['compressionstiffness'] for c in reordered], dtype=np.float32)
-        self.cons = wp.array(cons_np, dtype=Constraint)
+        self._upload_cons(reordered)
 
+    def _upload_cons(self, cons_list):
+        """Upload constraint dicts as struct-of-arrays Warp buffers.
 
-class MuscleSim(XpbdEngine):
-    """Warp-backed muscle simulator.
-
-    Holds init + a hook-free step loop alongside all Warp kernels.
-    Bone-coupled scenarios (LBS predictor → constraint corrector) compose
-    their own per-substep loop using the public methods (integrate,
-    solve_constraints, …) — see coupleOneWayGmg/example.py.
-    """
-
-    def __init__(self, cfg: SimConfig):
-        self.cfg = cfg
-        self._init_backend()
-
-        self.constraint_configs = self.cfg.constraints if self.cfg.constraints else []
-
-        print("Loading mesh from:", cfg.geo_path)
-        mesh_data = load_mesh(
-            cfg.geo_path,
-            prim_path=getattr(cfg, "geo_prim_path", None),
-            prim_root=getattr(cfg, "geo_prim_root", None),
-        )
-        self.pos0_np, self.tet_np, self.v_fiber_np, self.v_tendonmask_np, self.geo = mesh_data
-        self.n_verts = self.pos0_np.shape[0]
-        print(f"Loaded mesh: {self.n_verts} vertices, {self.tet_np.shape[0]} tetrahedra.")
-
-        print("Loading bone mesh:", cfg.bone_geo_path)
-        self._load_bone(cfg.bone_geo_path)
-
-        print("Allocating&initializing fields...")
-        self._allocate_fields()
-        self._init_fields()
-        self._precompute_rest()
-        self._build_surface_tris()
-        # GPU parallelism: auto-enable Jacobi to avoid race conditions on CUDA
-        is_gpu = self.pos.device.is_cuda
-        self.use_jacobi = getattr(self.cfg, 'use_jacobi', is_gpu)
-        self.use_colored_gs = getattr(self.cfg, 'use_colored_gs', False)
-        self.build_constraints()
-        self.contraction_ratio = getattr(self.cfg, 'contraction_ratio', 0.4)
-        self.fiber_stiffness_scale = getattr(self.cfg, 'fiber_stiffness_scale', 10000.0)
-        # Millard fiber constraint uses its OWN stiffness scale (separate from the shared
-        # fiber_stiffness_scale used by fibernorm/dgf). Default smaller to reduce belly distortion.
-        self.millard_stiffness_scale = getattr(self.cfg, 'millard_stiffness_scale', 1.0)
-        self.has_compressstiffness = getattr(self.cfg, 'HAS_compressstiffness', False)
-        self.dt = self.cfg.dt / self.cfg.num_substeps
-        self.step_cnt = 0
-
-        self._init_renderer()
-        print("All initialization done.")
-
-    def _load_bone(self, target_path):
-        """Load bone mesh data and create GPU fields."""
-        if Path(target_path).exists():
-            bone_root = getattr(self.cfg, "bone_root", "/character/bone")
-            self.bone_geo, self.bone_pos, self.bone_indices_np, self.bone_muscle_ids = \
-                load_bone_mesh(target_path, bone_root=bone_root)
-            self._create_bone_fields()
-        else:
-            self.bone_geo = None
-            self.bone_pos = np.zeros((0, 3), dtype=np.float32)
-            self.bone_indices_np = np.zeros(0, dtype=np.int32)
-            self.bone_muscle_ids = {}
-
-    def load_bone_geo(self, target_path):
-        """Return (bone_geo, bone_pos). Loads once, then returns cached data."""
-        if not hasattr(self, 'bone_pos'):
-            self._load_bone(target_path)
-        return self.bone_geo, self.bone_pos
-
-    def build_program(self):
-        """Default program: reproduces the standalone substep order exactly
-        (see git history of step()). Phases are closures over self."""
-        s = self
-        def integrate_phase():
-            s.clear_forces()
-            s.accumulate_active_fiber_force()
-            s.integrate()
-            if hasattr(s, "apply_pintotarget"):
-                s.apply_pintotarget()
-            s.clear()
-        def solve_phase():
-            s.solve_constraints(run_extras=False)
-            if s.use_jacobi:
-                s.apply_dP()
-            s.solve_extras()
-        def finalize_phase():
-            s.post_smooth()
-            s.freeze_near_inverted()
-            s.repair_inverted_tets()
-            if hasattr(s, "apply_pintotarget"):
-                s.apply_pintotarget()
-            s.update_velocities()
-        self.program = [integrate_phase, solve_phase, finalize_phase]
-        if bool(getattr(self.cfg, "debug_per_substep", False)):
-            def debug_phase():
-                s._debug_check_substep(s._program_sub, s.cfg.num_substeps)
-            self.program.append(debug_phase)
-
-    def step(self):
-        """Run one frame. Standalone (no bone coupling) substep loop, driven
-        by the phase program built in build_program()."""
-        self.update_attach_targets()
-        if not hasattr(self, "program"):
-            self.build_program()
-        self.run_program()
-
-    def _debug_check_substep(self, sub_i, n_sub):
-        """Per-substep mesh-quality + state logging. cfg.debug_per_substep."""
-        import logging
-        from muscle.util.mesh_utils import (
-            check_mesh_quality, MeshDistortionError,
-        )
-        log = logging.getLogger(__name__)
-        pos_np = self.pos.numpy()
-        # rest_matrix was built against tet_np[:, [3,0,1,2]] ordering — reuse
-        # so det(F) here matches the solver's internal F.
-        tet_idx = self.tet_np[:, [3, 0, 1, 2]]
-        tet_poses = self.rest_matrix.numpy()
-        step_id = getattr(self, "step_cnt", -1)
-        tag = f"step={step_id} sub={sub_i + 1}/{n_sub}"
-        try:
-            detF = check_mesh_quality(pos_np, tet_idx, tet_poses, step=None)
-            detF_lo = float(detF.min())
-            detF_hi = float(detF.max())
-        except MeshDistortionError as exc:
-            log.error(f"{tag} MeshDistortionError: {exc}")
-            return
-        centroid = pos_np.mean(axis=0)
-        try:
-            vol_err = float(self.calc_vol_error())
-        except Exception:
-            vol_err = float("nan")
-        log.info(
-            f"{tag}  centroid=({centroid[0]:+.4f},{centroid[1]:+.4f},{centroid[2]:+.4f})  "
-            f"vol_err={vol_err:+.4f}  detF=[{detF_lo:.4f},{detF_hi:.4f}]"
-        )
-
-    def get_fps(self):
-        if not hasattr(self, 'step_start_time') or not hasattr(self, 'step_end_time'):
-            return 0.0
-        dur = self.step_end_time - self.step_start_time
-        return 1.0 / dur if dur != 0 else 0.0
-
-    @classmethod
-    def from_procedural(cls, vertices, tets, fiber_dirs_per_tet,
-                        bone_targets=None, *, constraint_configs,
-                        dts, num_substeps=1, device="cpu",
-                        density=1060.0, veldamping=0.02, gravity=0.0,
-                        sigma0=0.0, lambda_opt=1.0,
-                        contraction_ratio=0.0, fiber_stiffness_scale=1.0,
-                        v_max_norm=0.0, d_damp=0.0):
-        """Create a MuscleSim from procedural mesh data (no file loading).
-
-        Args:
-            vertices: Vertex positions (N, 3) float.
-            tets: Tet connectivity (M, 4) int.
-            fiber_dirs_per_tet: Per-tet fiber directions (M, 3) float.
-            bone_targets: Optional attachment target positions (K, 3) float.
-            constraint_configs: List of constraint config dicts, e.g.
-                [{"type": "volume", "stiffness": 1e6, "dampingratio": 0.1}, ...].
-            dts: Frame timestep [s] (substep dt = dts / num_substeps).
-            num_substeps: Number of substeps per frame.
-            device: Warp device string ("cpu" or "cuda:0").
-            density: Material density [kg/m^3].
-            veldamping: Velocity damping coefficient.
-            gravity: Gravity magnitude [m/s^2].
-            sigma0: Peak isometric stress [Pa] for explicit active fiber force.
-            lambda_opt: Optimal fiber stretch ratio (l_opt / L_ref).
-            contraction_ratio: Initial contraction ratio.
-            fiber_stiffness_scale: Scaling factor for fiber constraint stiffness.
-            v_max_norm: Normalizer for fiber velocity (V_max * lambda_opt).
-            d_damp: Linear damping coefficient for fiber velocity term.
-
-        Returns:
-            Initialized MuscleSim instance.
+        Replaces the old array-of-``Constraint``-structs layout: each kernel
+        now takes only the per-field arrays it actually reads/writes.
         """
-        from types import SimpleNamespace
-
-        vertices = np.asarray(vertices, dtype=np.float32)
-        tets = np.asarray(tets, dtype=np.int32)
-        n_v = len(vertices)
-
-        # Average per-tet fiber dirs to per-vertex
-        fiber_dirs_per_tet = np.asarray(fiber_dirs_per_tet, dtype=np.float32)
-        vf = np.zeros((n_v, 3), dtype=np.float32)
-        vc = np.zeros(n_v, dtype=np.float32)
-        for e, t in enumerate(tets):
-            for vi in t:
-                vf[vi] += fiber_dirs_per_tet[e]; vc[vi] += 1.0
-        vc = np.maximum(vc, 1.0)
-        vf /= vc[:, None]
-        vf /= np.maximum(np.linalg.norm(vf, axis=1, keepdims=True), 1e-8)
-
-        cfg = SimpleNamespace(
-            geo_path="<procedural>", bone_geo_path="<none>",
-            gui=False, render_mode="none",
-            constraints=list(constraint_configs),
-            dt=dts, num_substeps=num_substeps,
-            gravity=gravity, density=density, veldamping=veldamping,
-            contraction_ratio=contraction_ratio,
-            fiber_stiffness_scale=fiber_stiffness_scale,
-            HAS_compressstiffness=False, arch=device,
-            save_image=False, pause=False, reset=False,
-            show_wireframe=False,
-            render_fps=24, color_bones=False, color_muscles="tendonmask",
-            activation=0.0, nsteps=1,
-            sigma0=sigma0, lambda_opt=lambda_opt,
-            v_max_norm=v_max_norm, d_damp=d_damp,
-        )
-
-        wp.set_device(device)
-        sim = object.__new__(cls)
-        sim.cfg = cfg
-        sim.constraint_configs = cfg.constraints
-
-        sim.pos0_np = vertices
-        sim.tet_np = tets
-        sim.v_fiber_np = vf
-        sim.v_tendonmask_np = None
-        sim.geo = SimpleNamespace()
-        sim.n_verts = n_v
-
-        if bone_targets is not None:
-            sim.bone_pos = np.asarray(bone_targets, dtype=np.float32)
-        else:
-            sim.bone_pos = np.zeros((0, 3), dtype=np.float32)
-        sim.bone_geo = None
-        sim.bone_indices_np = np.zeros(0, dtype=np.int32)
-        sim.bone_muscle_ids = {}
-
-        wp.init()
-        sim._init_backend()
-        sim._allocate_fields()
-        sim._init_fields()
-        sim._precompute_rest()
-        sim._build_surface_tris()
-        sim._create_bone_fields()
-
-        is_gpu = not device.startswith("cpu")
-        sim.use_jacobi = is_gpu
-        sim.use_colored_gs = False
-        sim.contraction_ratio = contraction_ratio
-        sim.fiber_stiffness_scale = fiber_stiffness_scale
-        sim.has_compressstiffness = False
-        sim.dt = dts / num_substeps
-        sim.step_cnt = 0
-        sim.renderer = None
-
-        sim.build_constraints()
-        return sim
-
-    def rebuild_constraints(self, extra_constraints=None):
-        """Rebuild constraint arrays, optionally appending extra constraints.
-
-        Useful for adding ATTACH constraints after initial build.
-
-        Args:
-            extra_constraints: Optional list of constraint dicts to append.
-        """
-        all_cons = list(self.raw_constraints)
-        if extra_constraints:
-            all_cons.extend(extra_constraints)
-
-        all_cons.sort(key=lambda c: c["type"])
-        n = len(all_cons)
-        self.n_cons = n
-        self.cons_ranges = {}
+        n = len(cons_list)
         if n == 0:
-            self.cons = wp.zeros(0, dtype=Constraint)
-            self.reaction_accum = wp.zeros(1, dtype=wp.vec3)
+            self.c_type = wp.zeros(0, dtype=wp.int32)
+            self.c_pts = wp.zeros(0, dtype=wp.vec4i)
+            self.c_stiffness = wp.zeros(0, dtype=wp.float32)
+            self.c_compressionstiffness = wp.zeros(0, dtype=wp.float32)
+            self.c_dampingratio = wp.zeros(0, dtype=wp.float32)
+            self.c_tetid = wp.zeros(0, dtype=wp.int32)
+            self.c_L = wp.zeros(0, dtype=wp.vec3)
+            self.c_restlength = wp.zeros(0, dtype=wp.float32)
+            self.c_restvector = wp.zeros(0, dtype=wp.vec4f)
+            self.c_restdir = wp.zeros(0, dtype=wp.vec3)
             return
 
-        prev, start = None, 0
-        for i, c in enumerate(all_cons):
-            c["cidx"] = i
-            t = c["type"]
-            if t != prev:
-                if prev is not None:
-                    self.cons_ranges[prev] = (start, i - start)
-                start, prev = i, t
-        self.cons_ranges[prev] = (start, n - start)
-
-        dt_np = Constraint.numpy_dtype()
-        arr = np.zeros(n, dtype=dt_np)
-        for key in ("type", "pts", "stiffness", "dampingratio", "tetid",
-                    "L", "restlength", "restvector", "restdir",
-                    "compressionstiffness"):
-            arr[key] = np.array([c[key] for c in all_cons])
-        arr["cidx"] = np.arange(n, dtype=np.int32)
-        self.cons = wp.array(arr, dtype=Constraint)
-        self.reaction_accum = wp.zeros(max(n, 1), dtype=wp.vec3)
-
-    def _init_backend(self):
-        wp.init()
-
-    def _build_surface_tris(self):
-        self.surface_tris = build_surface_tris(self.tet_np)
-        self.n_tris = self.surface_tris.shape[0]
-        self.surface_tris_flat = self.surface_tris.reshape(-1).astype(np.int32)
-
-    def _allocate_fields(self):
-        n_v = self.n_verts
-        n_tet = self.tet_np.shape[0]
-
-        self.pos = wp.zeros(n_v, dtype=wp.vec3)
-        self.pprev = wp.zeros(n_v, dtype=wp.vec3)
-        self.pos0 = wp.zeros(n_v, dtype=wp.vec3)
-        self.vel = wp.zeros(n_v, dtype=wp.vec3)
-        self.force = wp.zeros(n_v, dtype=wp.vec3)
-        self.mass = wp.zeros(n_v, dtype=wp.float32)
-        self.stopped = wp.zeros(n_v, dtype=wp.int32)
-        self.v_fiber_dir = wp.zeros(n_v, dtype=wp.vec3)
-        self.dP = wp.zeros(n_v, dtype=wp.vec3)
-        self.dPw = wp.zeros(n_v, dtype=wp.float32)
-        self.tet_indices = wp.zeros(n_tet, dtype=wp.vec4i)
-
-        self.rest_volume = wp.zeros(n_tet, dtype=wp.float32)
-        self.rest_matrix = wp.zeros(n_tet, dtype=wp.mat33)
-        self.activation = wp.zeros(n_tet, dtype=wp.float32)
-
-        # LBS optional: filled by LBSDriver via set_lbs_T_rel / apply_lbs.
-        self._lbs_T_rel_field = None
-
-    def _create_bone_fields(self):
-        if self.bone_pos.shape[0] > 0:
-            self.bone_pos_field = wp.from_numpy(self.bone_pos.astype(np.float32), dtype=wp.vec3)
-            if self.bone_indices_np.shape[0] > 0:
-                self.bone_indices_field = wp.from_numpy(self.bone_indices_np.astype(np.int32), dtype=wp.int32)
-            else:
-                self.bone_indices_field = None
-        else:
-            self.bone_pos_field = None
-            self.bone_indices_field = None
-
-    def build_constraints(self):
-        print("Building constraints...")
-        all_constraints, _dt_collect = self._collect_raw_constraints()
-
-        # Sort by type for per-type kernel dispatch
-        all_constraints.sort(key=lambda c: c['type'])
-
-        n_cons = len(all_constraints)
-        self.n_cons = n_cons
-        self.cons_ranges = {}
-        if n_cons > 0:
-            prev_type = None
-            start_idx = 0
-            for i, c in enumerate(all_constraints):
-                c['cidx'] = i
-                ctype = c['type']
-                if ctype != prev_type:
-                    if prev_type is not None:
-                        self.cons_ranges[prev_type] = (start_idx, i - start_idx)
-                    start_idx = i
-                    prev_type = ctype
-            if prev_type is not None:
-                self.cons_ranges[prev_type] = (start_idx, n_cons - start_idx)
-
-            type_arr = np.array([c['type'] for c in all_constraints], dtype=np.int32)
-            cidx_arr = np.arange(n_cons, dtype=np.int32)
-            pts_arr = np.array([c['pts'] for c in all_constraints], dtype=np.int32)
-            stiffness_arr = np.array([c['stiffness'] for c in all_constraints], dtype=np.float32)
-            dampingratio_arr = np.array([c['dampingratio'] for c in all_constraints], dtype=np.float32)
-            tetid_arr = np.array([c['tetid'] for c in all_constraints], dtype=np.int32)
-            L_arr = np.array([c['L'] for c in all_constraints], dtype=np.float32)
-            restlength_arr = np.array([c['restlength'] for c in all_constraints], dtype=np.float32)
-            restvector_arr = np.array([c['restvector'] for c in all_constraints], dtype=np.float32)
-            restdir_arr = np.array([c['restdir'] for c in all_constraints], dtype=np.float32)
-            compressionstiffness_arr = np.array([c['compressionstiffness'] for c in all_constraints], dtype=np.float32)
-
-            cons_np = np.zeros(n_cons, dtype=Constraint.numpy_dtype())
-            cons_np['type'] = type_arr
-            cons_np['cidx'] = cidx_arr
-            cons_np['pts'] = pts_arr
-            cons_np['stiffness'] = stiffness_arr
-            cons_np['dampingratio'] = dampingratio_arr
-            cons_np['tetid'] = tetid_arr
-            cons_np['L'] = L_arr
-            cons_np['restlength'] = restlength_arr
-            cons_np['restvector'] = restvector_arr
-            cons_np['restdir'] = restdir_arr
-            cons_np['compressionstiffness'] = compressionstiffness_arr
-
-            self.cons = wp.array(cons_np, dtype=Constraint)
-        else:
-            self.cons = wp.zeros(0, dtype=Constraint)
-            self.raw_constraints = []
-
-        print(f"Built {n_cons} constraints total. [{_dt_collect*1000:.0f}ms]")
-
-        self.reaction_accum = wp.zeros(max(n_cons, 1), dtype=wp.vec3)
-
-        # Initialize Millard curve arrays if needed (for constraints or active force)
-        needs_millard = (TETFIBERMILLARD in self.cons_ranges
-                         or getattr(self.cfg, 'sigma0', 0.0) > 0)
-        if needs_millard:
-            self._init_millard_curves()
-
-        # Initialize explicit active fiber force if sigma0 is configured
-        sigma0 = getattr(self.cfg, 'sigma0', 0.0)
-        if sigma0 > 0:
-            self.sigma0 = sigma0
-            self.lambda_opt = getattr(self.cfg, 'lambda_opt', 1.0)
-            self.v_max_norm = getattr(self.cfg, 'v_max_norm', 0.0)
-            self.d_damp = getattr(self.cfg, 'd_damp', 0.0)
-            self._has_active_fiber_force = True
-            print(f"  Active fiber force: sigma0={sigma0:.0f} Pa, "
-                  f"lambda_opt={self.lambda_opt:.3f}, "
-                  f"v_max_norm={self.v_max_norm:.3f}, d_damp={self.d_damp:.2f}")
-        else:
-            self.v_max_norm = 0.0
-            self.d_damp = 0.0
-            self._has_active_fiber_force = False
-
-        # Build colored constraint groups for parallel Gauss-Seidel
-        if self.use_colored_gs and n_cons > 0:
-            self._build_colored_gs(all_constraints)
-
-    def _init_millard_curves(self):
-        """Initialize Millard 2012 curve coefficient arrays for GPU evaluation."""
-
-        mc = MillardCurves()
-        self._millard_curves = mc  # keep reference for CPU-side equilibrium solve
-
-        def _upload_curve(curve):
-            """Upload MillardCurve data to Warp arrays."""
-            n_seg = len(curve.segments)
-            x_coeffs = np.zeros((n_seg, 6), dtype=np.float32)
-            y_coeffs = np.zeros((n_seg, 6), dtype=np.float32)
-            F_coeffs = np.zeros((n_seg, 11), dtype=np.float32)
-            seg_bounds = np.zeros(n_seg + 1, dtype=np.float32)
-
-            for i, seg in enumerate(curve.segments):
-                x_coeffs[i] = seg.x_coeffs.astype(np.float32)
-                y_coeffs[i] = seg.y_coeffs.astype(np.float32)
-                F_coeffs[i] = seg.F_coeffs.astype(np.float32)
-                seg_bounds[i] = np.float32(seg.x_start)
-            seg_bounds[n_seg] = np.float32(curve.segments[-1].x_end)
-
-            return {
-                'x_coeffs': wp.from_numpy(x_coeffs.flatten(), dtype=wp.float32),
-                'y_coeffs': wp.from_numpy(y_coeffs.flatten(), dtype=wp.float32),
-                'F_coeffs': wp.from_numpy(F_coeffs.flatten(), dtype=wp.float32),
-                'seg_bounds': wp.from_numpy(seg_bounds, dtype=wp.float32),
-                'n_segments': n_seg,
-                'x_lo': curve.x_lo,
-                'x_hi': curve.x_hi,
-                'y_lo': curve.y_lo,
-                'y_hi': curve.y_hi,
-                'dydx_lo': curve.dydx_lo,
-                'dydx_hi': curve.dydx_hi,
-            }
-
-        fl = _upload_curve(mc.fl)
-        self._millard_fl_x_coeffs = fl['x_coeffs']
-        self._millard_fl_y_coeffs = fl['y_coeffs']
-        self._millard_fl_F_coeffs = fl['F_coeffs']
-        # Energy offset: -eval_integral(0) so that Psi(lm) + offset > 0 for all lm > 0
-        self._millard_fl_energy_offset = float(-mc.fl.eval_integral(0.0))
-        self._millard_fl_seg_bounds = fl['seg_bounds']
-        self._millard_fl_n_segments = fl['n_segments']
-        self._millard_fl_x_lo = fl['x_lo']
-        self._millard_fl_x_hi = fl['x_hi']
-        self._millard_fl_y_lo = fl['y_lo']
-        self._millard_fl_y_hi = fl['y_hi']
-        self._millard_fl_dydx_lo = fl['dydx_lo']
-        self._millard_fl_dydx_hi = fl['dydx_hi']
-
-        fpe = _upload_curve(mc.fpe)
-        self._millard_fpe_x_coeffs = fpe['x_coeffs']
-        self._millard_fpe_y_coeffs = fpe['y_coeffs']
-        self._millard_fpe_F_coeffs = fpe['F_coeffs']
-        self._millard_fpe_seg_bounds = fpe['seg_bounds']
-        self._millard_fpe_n_segments = fpe['n_segments']
-        self._millard_fpe_x_lo = fpe['x_lo']
-        self._millard_fpe_x_hi = fpe['x_hi']
-        self._millard_fpe_y_lo = fpe['y_lo']
-        self._millard_fpe_y_hi = fpe['y_hi']
-        self._millard_fpe_dydx_lo = fpe['dydx_lo']
-        self._millard_fpe_dydx_hi = fpe['dydx_hi']
-
-        print(f"  Millard curves initialized: f_L ({mc.fl.segments.__len__()} seg), "
-              f"f_PE ({mc.fpe.segments.__len__()} seg)")
-
-    def _init_fields(self):
-        self.pos0 = wp.from_numpy(self.pos0_np.astype(np.float32), dtype=wp.vec3)
-        self.pos = wp.from_numpy(self.pos0_np.astype(np.float32), dtype=wp.vec3)
-        self.vel.zero_()
-        self.force.zero_()
-        self.mass.zero_()
-        self.stopped.zero_()
-        self.tet_indices = wp.from_numpy(self.tet_np.astype(np.int32), dtype=wp.vec4i)
-
-        if self.v_fiber_np is None:
-            self.v_fiber_np = np.tile(np.array([[0.0, 1.0, 0.0]], dtype=np.float32), (self.n_verts, 1))
-        self.v_fiber_dir = wp.from_numpy(self.v_fiber_np.astype(np.float32), dtype=wp.vec3)
-
-        n_tet = self.tet_np.shape[0]
-        self.tendonmask = wp.zeros(n_tet, dtype=wp.float32)
-        if self.v_tendonmask_np is not None:
-            v_tendonmask_wp = wp.from_numpy(self.v_tendonmask_np.astype(np.float32), dtype=wp.float32)
-            wp.launch(compute_cell_tendon_mask_kernel, dim=n_tet,
-                      inputs=[self.tet_indices, v_tendonmask_wp, self.tendonmask])
-
-        self.activation.zero_()
-        self.total_rest_volume = wp.zeros(1, dtype=wp.float32)
-
-        print("Initialized fields done.")
-
-    def _precompute_rest(self):
-        n_tet = self.tet_np.shape[0]
-        self.total_rest_volume.zero_()
-        self.mass.zero_()
-        wp.launch(precompute_rest_kernel, dim=n_tet,
-                  inputs=[self.pos0, self.tet_indices, self.rest_volume,
-                          self.rest_matrix, self.mass, self.cfg.density,
-                          self.total_rest_volume])
-        # Clamp vertex mass to prevent instability from degenerate tets.
-        mass_floor = getattr(self.cfg, 'mass_floor', 0.0)
-        if mass_floor <= 0.0 and getattr(self.cfg, 'sigma0', 0.0) > 0.0:
-            mass_np = self.mass.numpy()
-            mass_floor = float(np.median(mass_np[mass_np > 0])) * 0.01
-        if mass_floor > 0.0:
-            mass_np = self.mass.numpy()
-            n_clamped = int((mass_np < mass_floor).sum())
-            if n_clamped > 0:
-                mass_np = np.maximum(mass_np, mass_floor)
-                self.mass = wp.from_numpy(mass_np, dtype=wp.float32)
-                print(f"  Mass floor applied: {mass_floor:.2e} kg ({n_clamped} vertices clamped)")
-
-    def _init_renderer(self):
-        self.renderer = None
-        if self.cfg.gui and self.cfg.render_mode in ("human", "usd"):
-            if self.cfg.render_mode == "usd":
-                stage_path = getattr(self.cfg, "output_path", None) or "output/bicep_oneway.usd"
-                os.makedirs(os.path.dirname(stage_path) or ".", exist_ok=True)
-            else:
-                stage_path = None
-            self.renderer = WarpRenderer(mode=self.cfg.render_mode, stage_path=stage_path)
-
-    def reset(self):
-        self.pos = wp.from_numpy(self.pos0_np.astype(np.float32), dtype=wp.vec3)
-        self.pprev = wp.from_numpy(self.pos0_np.astype(np.float32), dtype=wp.vec3)
-        self.vel.zero_()
-        self.force.zero_()
-        self.activation.zero_()
-        self.clear()
-        self.step_cnt = 1
-
-    def update_attach_targets(self):
-        if (
-            hasattr(self, "bone_pos_field")
-            and self.bone_pos_field is not None
-            and self.bone_pos_field.shape[0] > 0
-            and self.n_cons > 0
-            and (
-                len(getattr(self, "attach_constraints", []) or []) > 0
-                or len(getattr(self, "pintotarget_constraints", []) or []) > 0
-                or len(getattr(self, "distanceline_constraints", []) or []) > 0
-            )
-        ):
-            wp.launch(update_attach_targets_kernel, dim=self.n_cons,
-                      inputs=[self.cons, self.bone_pos_field, self.n_cons])
-
-    def clear_forces(self):
-        """Zero the per-vertex force accumulator."""
-        self.force.zero_()
-
-    def accumulate_active_fiber_force(self):
-        """Compute explicit active fiber force per tet, scatter to vertex force field.
-
-        Uses tau = sigma0 * (a * f_FL(r) * f_V(v_norm) + d_damp * v_norm)
-        where r = lambda_f / lambda_opt, v_norm = dlm_dt / v_max_norm.
-        See docs/notes/xpbd_fem_fiber_lm.md for derivation.
-        """
-        if not getattr(self, '_has_active_fiber_force', False):
-            return
-        n_tet = self.tet_np.shape[0]
-        wp.launch(accumulate_active_fiber_force_kernel, dim=n_tet, inputs=[
-            self.tet_indices, self.pos, self.vel, self.force,
-            self.rest_matrix, self.rest_volume,
-            self.v_fiber_dir, self.activation,
-            self.sigma0, self.lambda_opt,
-            self.v_max_norm, self.d_damp,
-            self._millard_fl_x_coeffs, self._millard_fl_y_coeffs,
-            self._millard_fl_seg_bounds, self._millard_fl_n_segments,
-            self._millard_fl_x_lo, self._millard_fl_x_hi,
-            self._millard_fl_y_lo, self._millard_fl_y_hi,
-            self._millard_fl_dydx_lo, self._millard_fl_dydx_hi,
-        ])
-        # Clamp per-vertex acceleration to prevent instability on degenerate tets.
-        max_accel = getattr(self.cfg, 'max_accel', 2000.0)
-        if max_accel > 0.0:
-            wp.launch(_clamp_force_by_accel_kernel, dim=self.n_verts,
-                      inputs=[self.force, self.mass, wp.float32(max_accel)])
-
-    def save_predicted_positions(self, vertex_ids):
-        """Save predicted positions after integrate() and before solve()."""
-        self._predicted_pos = self.pos.numpy()[vertex_ids].copy()
-        self._predicted_ids = vertex_ids
-
-    def get_insertion_force(self, insertion_vids, dts):
-        """Get net muscle force on bone from insertion constraint correction.
-
-        Requires save_predicted_positions() called after integrate().
-        """
-        pos_np = self.pos.numpy()
-        corrected = pos_np[insertion_vids]
-        predicted = self._predicted_pos
-
-        mass_np = self.mass.numpy()
-        masses = mass_np[insertion_vids]
-        dts2 = dts * dts
-
-        corrections = corrected.astype(np.float64) - predicted.astype(np.float64)
-        forces = masses[:, None].astype(np.float64) * corrections / dts2
-
-        return (-forces.sum(axis=0)).astype(np.float32)
-
-    def set_lbs_T_rel(self, T_rel_flat_np):
-        """Upload (n_bones * 12,) float32 row-major T_rel buffer to GPU.
-
-        Allocates the Warp array on first call.
-        """
-        if getattr(self, "_lbs_T_rel_field", None) is None:
-            self._lbs_T_rel_field = wp.from_numpy(
-                T_rel_flat_np.astype(np.float32), dtype=wp.float32)
-        else:
-            self._lbs_T_rel_field.assign(T_rel_flat_np.astype(np.float32))
-
-    def apply_lbs(self, vertex_bone_field, blend: float = 1.0):
-        """Overwrite pos with LBS target = pos0 @ T_rel[vertex_bone[v]],
-        lerped from current pos by ``blend``.
-
-        Caller must have called ``set_lbs_T_rel`` first.
-        """
-        if self._lbs_T_rel_field is None:
-            return
-        wp.launch(lbs_apply_kernel, dim=self.n_verts,
-                  inputs=[self.pos, self.pos0, vertex_bone_field,
-                          self._lbs_T_rel_field, float(blend)])
-
-    def calc_vol_error(self):
-        total_vol = wp.zeros(1, dtype=wp.float32)
-        n_tet = self.tet_np.shape[0]
-        wp.launch(calc_vol_error_kernel, dim=n_tet,
-                  inputs=[self.tet_indices, self.pos, self.rest_volume, total_vol])
-        total_vol_np = total_vol.numpy()[0]
-        total_rest_np = self.total_rest_volume.numpy()[0]
-        if total_rest_np == 0.0:
-            return 0.0
-        return (total_vol_np - total_rest_np) / total_rest_np
-
-    def clear_reaction(self):
-        if self.n_cons > 0:
-            wp.launch(clear_reaction_kernel, dim=max(self.n_cons, 1),
-                      inputs=[self.reaction_accum])
-
-    def _mark_pintotarget_stopped(self):
-        """Mark all pintotarget source verts as `stopped=1`.
-
-        Effect: integrate_kernel skips them (no velocity, no pos drift), and
-        constraint solvers see inv_mass=0 (they act as kinematic anchors).
-        Position is then driven *only* by solve_pintotarget_kernel each substep.
-        Without this, apply_pintotarget creates huge artificial velocities
-        (pinned vert jumps several cm per substep) which integrate then over-
-        shoots — fatal under GMG (restrict feeds the overshoot into coarse).
-        """
-        src_idx = np.array([c["pts"][0] for c in self.pintotarget_constraints],
-                           dtype=np.int32)
-        if src_idx.size == 0:
-            return
-        stopped_np = self.stopped.numpy()
-        stopped_np[src_idx] = 1
-        self.stopped = wp.from_numpy(stopped_np, dtype=wp.int32)
-
-    def _capturable_substep(self):
-        """One muscle PBD substep — all Warp kernels, no CPU sync.
-
-        Safe for CUDA graph capture: no .numpy(), no wp.from_numpy(), no
-        wp.array() allocations. All conditionals (use_jacobi, use_colored_gs,
-        post_smooth_iters, etc.) are resolved at capture time.
-        """
-        self.clear_forces()
-        # self.accumulate_active_fiber_force()
-        self.integrate()
-        self.clear()
-        self.update_attach_targets()
-        # self.clear_reaction()
-        self.solve_constraints(run_extras=False)
-        if self.use_jacobi:
-            self.apply_dP()
-        # Extras (collision) AFTER apply_dP so ARAP/volume settles first;
-        # otherwise the stale pre-solve ARAP gradient gets added on top of
-        # the collision push and pulls penetrated verts back inward.
-        self.solve_extras()
-        self.post_smooth()
-        # self.freeze_near_inverted()
-        # self.repair_inverted_tets()
-        self.update_velocities()
-
-    def render(self):
-        if self.renderer is None:
-            return
-        pos_np = self.pos.numpy()
-        bone_pos_np = None
-        bone_idx = None
-        if hasattr(self, 'bone_pos_field') and self.bone_pos_field is not None:
-            bone_pos_np = self.bone_pos_field.numpy()
-            bone_idx = self.bone_indices_np if hasattr(self, 'bone_indices_np') else None
-        sim_time = self.step_cnt * self.cfg.dt
-        self.renderer.update(sim_time, pos_np, self.surface_tris_flat, bone_pos_np, bone_idx)
-
-    def run(self):
-        self.step_cnt = 1
-
-        if self.renderer is not None:
-            def on_key(symbol, modifiers):
-                import pyglet
-                if symbol == pyglet.window.key.R:
-                    self.reset()
-                    return pyglet.event.EVENT_HANDLED
-                if symbol == pyglet.window.key.SPACE:
-                    self.cfg.pause = not self.cfg.pause
-                    return pyglet.event.EVENT_HANDLED
-            self.renderer.register_key_press_callback(on_key)
-
-        while self.step_cnt <= self.cfg.nsteps:
-            if self.renderer is not None and not self.renderer.is_running():
-                break
-            if self.cfg.reset:
-                self.reset()
-                self.step_cnt = 1
-                self.cfg.reset = False
-            if not self.cfg.pause:
-                wp.launch(fill_float_kernel, dim=self.activation.shape[0],
-                          inputs=[self.activation, self.cfg.activation])
-                self.step_start_time = time.perf_counter()
-                self.step()
-                self.step_cnt += 1
-                self.step_end_time = time.perf_counter()
-            self.render()
-
-        if self.renderer is not None:
-            self.renderer.save()
-
-
-class MassSpringSim(XpbdEngine):
-    """Gaia S01 dynamic MassSpring as an XpbdEngine program.
-
-    The Gaia U-drop material — stiff edge springs, a hard det(F)=1 volume
-    constraint and an inverted-tet untangle — expressed entirely with engine
-    primitives: edges are ``DISTANCE`` constraints (reusing the engine distance
-    XPBD math), volume/inversion are the migrated ``TETVOLUMEHARD`` /
-    ``TETINVERSION`` constraint types, and ``integrate`` / ``update_velocities``
-    / graph-colored Gauss-Seidel are the shared ``XpbdEngine`` machinery.
-    Boundary + DCD self-collision run as program phases between the material
-    and finalize passes, reproducing Gaia's substep order::
-
-      integrate -> spring -> volume(hard) -> boundary -> inversion -> DCD -> update_vel
-    """
-
-    def __init__(self, verts, tets, *, dt=1.0 / 60.0, n_substeps=20,
-                 density=3.0, gravity=-9.8, spring_compliance=1e-4,
-                 spring_damping=0.01, inversion_multiplier=0.02,
-                 exp_vel_damping=0.95, const_vel_damping=0.02,
-                 mu_s=0.5, mu_d=0.4, bounds_lo=(-2.0, 0.0, -2.0),
-                 bounds_hi=(2.0, 5.0e4, 2.0), thickness=1e-3,
-                 no_inversion=False, no_dcd=False, init_vel=None,
-                 init_vel_y=0.0, device="cuda:0"):
-        from types import SimpleNamespace
-        from muscle.collision.udcf.kernel import box_boundary_kernel
-        from muscle.collision.udcf.solver import UdcfDcdCollider, UdcfParams
-        from muscle.util.mesh_io import build_surface_tris
-
-        self.device = device
-        dt_sub = dt / n_substeps
-        self.dt = float(dt_sub)
-        self.cfg = SimpleNamespace(veldamping=0.0, gravity=gravity,
-                                   num_substeps=int(n_substeps))
-        self._gravity_vec = wp.vec3(0.0, gravity, 0.0)
-        self.use_jacobi = False
-        self.use_colored_gs = True
-        self.has_compressstiffness = False
-        self.no_inversion = bool(no_inversion)
-        self.ms_inversion_mult = float(inversion_multiplier)
-        # Gaia velocity damping (consumed by update_velocities).
-        self._vel_exp_damp = float(exp_vel_damping ** dt_sub)
-        self._vel_const_damp = float(const_vel_damping * dt_sub)
-
-        verts = np.asarray(verts, np.float32).copy()
-        tets = np.asarray(tets, np.int32).copy()
-        n_v = verts.shape[0]
-        self.n_verts = n_v
-        self.tet_np = tets
-
-        # Gaia winds tets positive (det(Dm) > 0); U.geo winds the other way.
-        # Flip orientation so rest volume is positive and inversion doesn't
-        # fire on every rest tet (see fascia/houdini-lefthand-winding note).
-        v = verts
-        Dm0 = np.stack([v[tets[:, 1]] - v[tets[:, 0]],
-                        v[tets[:, 2]] - v[tets[:, 0]],
-                        v[tets[:, 3]] - v[tets[:, 0]]], axis=2)
-        if np.median(np.linalg.det(Dm0)) < 0:
-            tets[:, [2, 3]] = tets[:, [3, 2]]
-
-        Dm = np.stack([v[tets[:, 1]] - v[tets[:, 0]],
-                       v[tets[:, 2]] - v[tets[:, 0]],
-                       v[tets[:, 3]] - v[tets[:, 0]]], axis=2)
-        DmInv = np.linalg.inv(Dm)
-        rest_vol = np.linalg.det(Dm) / 6.0
-        mass = np.zeros(n_v, np.float64)
-        for k in range(4):
-            np.add.at(mass, tets[:, k], 0.25 * rest_vol * density)
-        inv_mass = np.where(mass > 0, 1.0 / np.where(mass > 0, mass, 1.0), 0.0)
-
-        edges = build_unique_edges(tets)
-        rest_len = np.linalg.norm(v[edges[:, 0]] - v[edges[:, 1]], axis=1)
-
-        dev = device
-        self.pos = wp.array(v, dtype=wp.vec3, device=dev)
-        self.pprev = wp.array(v, dtype=wp.vec3, device=dev)
-        self.vel = wp.zeros(n_v, dtype=wp.vec3, device=dev)
-        self.force = wp.zeros(n_v, dtype=wp.vec3, device=dev)
-        self.mass = wp.array(mass.astype(np.float32), dtype=wp.float32, device=dev)
-        self.inv_mass = wp.array(inv_mass.astype(np.float32), dtype=wp.float32, device=dev)
-        self.stopped = wp.zeros(n_v, dtype=wp.int32, device=dev)
-        self.dP = wp.zeros(n_v, dtype=wp.vec3, device=dev)
-        self.dPw = wp.zeros(n_v, dtype=wp.float32, device=dev)
-        self.ms_dm_inv = wp.array(DmInv.astype(np.float32), dtype=wp.mat33, device=dev)
-        self.ms_rest_vol = wp.array(rest_vol.astype(np.float32), dtype=wp.float32, device=dev)
-
-        if init_vel is not None:
-            self.vel.assign(np.asarray(init_vel, np.float32))
-        elif init_vel_y != 0.0:
-            v0 = np.zeros((n_v, 3), np.float32)
-            v0[:, 1] = init_vel_y
-            self.vel.assign(v0)
-
-        # --- constraints: springs (DISTANCE) + hard volume + inversion -------
-        spring_stiffness = 1.0 / spring_compliance   # engine alpha = 1/(k dt^2)
-        all_constraints = []
-        for e in range(edges.shape[0]):
-            all_constraints.append(dict(
-                type=DISTANCE, pts=[int(edges[e, 0]), int(edges[e, 1]), -1, -1],
-                stiffness=spring_stiffness, dampingratio=float(spring_damping),
-                tetid=-1, L=[0.0, 0.0, 0.0], restlength=float(rest_len[e]),
-                restvector=[0.0, 0.0, 0.0, 0.0], restdir=[0.0, 0.0, 0.0],
-                compressionstiffness=-1.0))
-        for t in range(tets.shape[0]):
-            pts = [int(tets[t, 0]), int(tets[t, 1]), int(tets[t, 2]), int(tets[t, 3])]
-            common = dict(pts=pts, stiffness=1.0, dampingratio=0.0, tetid=t,
-                          L=[0.0, 0.0, 0.0], restlength=0.0,
-                          restvector=[0.0, 0.0, 0.0, 0.0], restdir=[0.0, 0.0, 0.0],
-                          compressionstiffness=-1.0)
-            all_constraints.append(dict(type=TETVOLUMEHARD, **common))
-            all_constraints.append(dict(type=TETINVERSION, **{**common}))
-
-        self.n_cons = len(all_constraints)
-        for i, c in enumerate(all_constraints):
-            c['cidx'] = i
-        self._build_colored_gs(all_constraints)   # builds self.cons + color_type_ranges
-
-        # Per-color ranges split by type.  Gaia sweeps ALL springs, then ALL
-        # volume tets, then (after boundary) ALL inversion tets — so each gets
-        # its own full colored pass rather than interleaving per color.
-        def _ranges_of(ctype):
-            return [{ctype: tr[ctype]} for tr in self.color_type_ranges if ctype in tr]
-        self._spring_ranges = _ranges_of(DISTANCE)
-        self._volume_ranges = _ranges_of(TETVOLUMEHARD)
-        self._inversion_ranges = _ranges_of(TETINVERSION)
-
-        # --- boundary + DCD self-collision -----------------------------------
-        self._box_boundary_kernel = box_boundary_kernel
-        self.bounds_lo = wp.vec3(*bounds_lo)
-        self.bounds_hi = wp.vec3(*bounds_hi)
-        self.mu_s = float(mu_s)
-        self.mu_d = float(mu_d)
-        self.surf = build_surface_tris(tets, v).astype(np.int32)
-        self.dcd = None
-        if not no_dcd:
-            mp = max(65536, self.surf.shape[0] * (self.surf.shape[0] - 1) // 2)
-            self.dcd = UdcfDcdCollider(
-                self.pos, self.inv_mass, surface_tris=self.surf,
-                params=UdcfParams(allow_self=True, max_pairs=mp,
-                                  thickness=thickness, jacobi_avg=False,
-                                  gauss_seidel=True, max_push=0.0),
-                device=device)
-        self.build_program()
-
-    def build_program(self):
-        s = self
-
-        def integrate_phase():
-            s.integrate()
-            s.clear()                       # reset spring XPBD lambda each substep
-
-        def material_phase():
-            for tr in s._spring_ranges:        # all springs (Gaia projectConstraints)
-                s._dispatch_constraints(tr)
-            for tr in s._volume_ranges:        # then all hard-volume tets
-                s._dispatch_constraints(tr)
-
-        def boundary_phase():
-            wp.launch(s._box_boundary_kernel, dim=s.n_verts,
-                      inputs=[s.pos, s.pprev, s.bounds_lo, s.bounds_hi,
-                              wp.float32(s.mu_s), wp.float32(s.mu_d)],
-                      device=s.device)
-
-        def inversion_phase():
-            if s.no_inversion:
-                return
-            for tr in s._inversion_ranges:
-                s._dispatch_constraints(tr)
-
-        def dcd_phase():
-            if s.dcd is not None:
-                s.dcd.solve(0)
-
-        def finalize_phase():
-            s.update_velocities()
-
-        self.program = [integrate_phase, material_phase, boundary_phase,
-                        inversion_phase, dcd_phase, finalize_phase]
-
-    def step(self):
-        self.run_program()
-
-    @classmethod
-    def u_drop(cls, geo_path, *, dt=1.0 / 60.0, n_substeps=20, density=3.0,
-               gravity=-9.8, init_vel_y=-5.0, translate_y=0.2,
-               spring_compliance=1e-4, spring_damping=0.01,
-               mu_s=0.5, mu_d=0.4, thickness=1e-3, no_dcd=False,
-               no_inversion=False, init_verts=None, init_vel=None,
-               device="cuda:0"):
-        """Build the Gaia S01 U-drop.  ``init_verts`` (a recovery pose) becomes
-        the rest state (zero pre-strain), in which case ``translate_y`` is
-        ignored; ``init_vel`` overrides ``init_vel_y``."""
-        from muscle.util.geo_io import GeoFile
-        g = GeoFile(geo_path)
-        tets = np.asarray(g.tet_indices, np.int32)
-        if init_verts is not None:
-            verts = np.asarray(init_verts, np.float32).copy()
-        else:
-            verts = np.asarray(g.positions, np.float32).copy()
-            verts[:, 1] += translate_y
-        return cls(verts, tets, dt=dt, n_substeps=n_substeps, density=density,
-                   gravity=gravity, spring_compliance=spring_compliance,
-                   spring_damping=spring_damping, mu_s=mu_s, mu_d=mu_d,
-                   thickness=thickness, no_inversion=no_inversion, no_dcd=no_dcd,
-                   init_vel=init_vel, init_vel_y=init_vel_y, device=device)
+        def _col(key, np_dtype):
+            return np.array([c[key] for c in cons_list], dtype=np_dtype)
+
+        self.c_type = wp.array(_col('type', np.int32), dtype=wp.int32)
+        self.c_pts = wp.array(_col('pts', np.int32), dtype=wp.vec4i)
+        self.c_stiffness = wp.array(_col('stiffness', np.float32), dtype=wp.float32)
+        self.c_compressionstiffness = wp.array(_col('compressionstiffness', np.float32), dtype=wp.float32)
+        self.c_dampingratio = wp.array(_col('dampingratio', np.float32), dtype=wp.float32)
+        self.c_tetid = wp.array(_col('tetid', np.int32), dtype=wp.int32)
+        self.c_L = wp.array(_col('L', np.float32), dtype=wp.vec3)
+        self.c_restlength = wp.array(_col('restlength', np.float32), dtype=wp.float32)
+        self.c_restvector = wp.array(_col('restvector', np.float32), dtype=wp.vec4f)
+        self.c_restdir = wp.array(_col('restdir', np.float32), dtype=wp.vec3)
 
 
 def main():
     import sys
+    from muscle.musclesim import MuscleSim
     config_path = sys.argv[1] if len(sys.argv) > 1 else "data/muscle/config/bicep.json"
     print("Using config:", config_path)
     cfg = load_config(config_path)

@@ -27,7 +27,8 @@ from muscle.collision.sdf.kernel import solve_sdf_contact_kernel
 from muscle.util.util import load_config, setup_logging
 from muscle.util.geo_io import GeoFile
 from muscle.util.mesh_io import build_surface_tris
-from muscle.engine import MuscleSim, WarpRenderer
+from muscle.musclesim import MuscleSim
+from muscle.engine import WarpRenderer
 
 log = logging.getLogger(__name__)
 

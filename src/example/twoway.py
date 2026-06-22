@@ -32,7 +32,8 @@ from muscle.coupleTwoWay.solver import (
     run_eval_sweep,
 )
 from muscle.util.mesh_utils import MeshDistortionError, check_mesh_quality
-from muscle.engine import MuscleSim, activation_ramp
+from muscle.musclesim import MuscleSim
+from muscle.engine import activation_ramp
 from muscle.coupleTwoWay.solver import SolverMuscleBoneCoupled
 from muscle.util.usd_io import UsdIO, build_bone_prim_map
 

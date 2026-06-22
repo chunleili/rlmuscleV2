@@ -71,3 +71,30 @@ def load_config(json_path, args=None) -> SimpleNamespace:
     for key, value in data.items():
         setattr(args, key, value)
     return args
+
+
+
+def _check_unzipped(path: str) -> None:
+    """Raise if a required .geo asset is missing — model dirs ship as zips.
+
+    Each case's geometry (restpos, restpos_lowres, cons_*.geo) lives inside
+    ``data/<case>/model.zip`` to save LFS storage. Unzip once before running
+    any sim. See data/README.md.
+    """
+    p = Path(path)
+    if p.exists():
+        return
+    parts = p.parts
+    if "data" in parts:
+        i = parts.index("data")
+        if i + 1 < len(parts):
+            case_dir = Path(*parts[: i + 2])
+            zip_path = case_dir / "model.zip"
+            if zip_path.exists():
+                raise FileNotFoundError(
+                    f"missing asset: {path}\n"
+                    f"model assets are zipped — extract first:\n"
+                    f"    (cd {case_dir} && unzip -o model.zip)\n"
+                    f"see data/README.md"
+                )
+    raise FileNotFoundError(f"missing asset: {path}")
