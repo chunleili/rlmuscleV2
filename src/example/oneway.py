@@ -21,7 +21,7 @@ import time
 import numpy as np
 import warp as wp
 
-from muscle.coupleOneWayGmg.solver import OneWaySim, load_config
+from muscle.mg.mg import MultiGridSim, load_config
 from muscle.util.mesh_io import MeshExporter, vectorized_surface_tris
 
 
@@ -44,7 +44,7 @@ def main():
     if args.end_frame is not None:
         cfg["end_frame"] = args.end_frame
 
-    sim = OneWaySim(cfg, device=args.device)
+    sim = MultiGridSim(cfg, device=args.device)
     print(f"NV={sim.NV}  NT={sim.NT}  NCONS={sim.NCONS}  "
           f"frames={sim.start_frame}..{sim.end_frame}  "
           f"nsubsteps={sim.nsubsteps}  fine_iters={sim.fine_iters}")
