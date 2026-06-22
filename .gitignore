@@ -60,3 +60,4 @@ _npy_cache/
 
 # local backups of merged-away modules
 .backup_massspring/
+.draft
