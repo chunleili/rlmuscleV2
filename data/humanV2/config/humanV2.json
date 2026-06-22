@@ -8,13 +8,11 @@
 
     "use_fascia": true,
     "fascia_path": "data/humanV2/model/fascia/fascia.geo",
-    "fascia_rest_scale": 0.95,
+    "fascia_rest_scale": 0.9,
     "fascia_glue_mode": "surface",
-    "fascia_glue_target_distance": 0.01,
     "fascia_glue_iterations": 2,
     "fascia_free_ring": 1,
-    "fascia_surface_mu": 1e5,
-    "fascia_glue_stiffness_scale": 0.001,
+    "fascia_glue_stiffness_scale": 0.5,
     "fascia_soft_pin": 0.7,
 
     "use_pintotarget": true,
