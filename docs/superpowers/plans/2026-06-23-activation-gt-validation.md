@@ -12,6 +12,12 @@
 
 - All commands run from repo root `/mnt/storage_disk_1/chunleli/Dev/rlmuscleV2-finger`, prefixed with `uv run`.
 - Tests are flat runnable scripts under `tests/rl_mass/`, each with a `main()` that asserts and prints `OK`; run via `uv run python tests/rl_mass/<file>.py`. No pytest config in this repo.
+- `rl_mass` is an installed (editable) package, but `tools/` is **not** on `sys.path` when a test script runs (Python puts the script's own dir first, not the repo root). Any test that does `from tools.X import ...` MUST start with this repo-root bootstrap so the plain `uv run python tests/rl_mass/<file>.py` command resolves the import:
+  ```python
+  import os, sys
+  sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+  ```
+  Likewise, any `tools/` script that imports a sibling `tools` module (e.g. `from tools._rollout import rollout`) is run as `PYTHONPATH=. uv run python tools/<script>.py` from repo root.
 - Behavior/options go in JSON config; the only CLI arg for example/tool behavior is `--config`/`-d`/explicit `-i/-o` paths. No argparse flags that encode behavior choices.
 - Commit messages end with the trailer:
   `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
@@ -928,6 +934,8 @@ Expected: `output/arm26/train_rewards.csv` shows `avg_return` rising and `output
 ```python
 # tests/rl_mass/test_rollout_helper.py
 """Shared rollout helper: shapes line up on Arm26 with random-init nets."""
+import os, sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 import numpy as np
 from rl_mass.env_factory import make_env
 from rl_mass.model import MuscleNN, SimulationNN
@@ -1047,7 +1055,7 @@ from tools._rollout import rollout
 Run:
 ```bash
 uv run python tests/rl_mass/test_rollout_helper.py
-uv run python -c "import tools.bake_bimanual_usd"
+PYTHONPATH=. uv run python -c "import tools.bake_bimanual_usd"
 ```
 Expected: first prints `OK`; second prints nothing (clean import, no error).
 
@@ -1456,7 +1464,8 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 Uses untrained nets (no checkpoint dependency) by pointing at a config whose
 checkpoint is the empty string -> harness builds fresh nets. Asserts the three
 output files exist and metrics dict has the right shape."""
-import os, json, tempfile
+import os, sys, json, tempfile
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 import numpy as np
 from tools.validate_vs_gt import compare
 
