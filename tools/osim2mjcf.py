@@ -90,12 +90,50 @@ def parse_joints(root):
     return out
 
 
-def parse_muscles(root):  # implemented in Task 3
-    return []
+def parse_muscles(root):
+    out = []
+    fset = root.find(".//ForceSet/objects")
+    if fset is None:
+        return out
+    for mu in fset.findall("Thelen2003Muscle"):
+        name = mu.get("name")
+        pts = []
+        for k, pp in enumerate(mu.findall(".//PathPoint")):
+            body = pp.findtext("socket_parent_frame").split("/")[-1]
+            loc = _vec(pp.findtext("location"), 3)
+            pts.append((f"{name}_P{k}", body, loc))
+        out.append(dict(
+            name=name,
+            f0=float(mu.findtext("max_isometric_force")),
+            ofl=float(mu.findtext("optimal_fiber_length")),
+            tsl=float(mu.findtext("tendon_slack_length")),
+            pen=float(mu.findtext("pennation_angle_at_optimal", "0") or 0.0),
+            points=pts,
+        ))
+    return out
 
 
-def _muscle_xml(muscles):  # implemented in Task 3
-    return "", ""
+def _muscle_xml(muscles):
+    """Build tendon + actuator XML and populate _SITE_MAP. Returns (tendon, actuator)."""
+    global _SITE_MAP
+    _SITE_MAP = {}
+    tendons = ["  <tendon>\n"]
+    acts = ["  <actuator>\n"]
+    for mu in muscles:
+        tendons.append(f'    <spatial name="{mu["name"]}_t" width="0.002">\n')
+        for sname, body, loc in mu["points"]:
+            _SITE_MAP.setdefault(body, []).append((sname, loc))
+            tendons.append(f'      <site site="{sname}"/>\n')
+        tendons.append("    </spatial>\n")
+        # MuJoCo muscle actuator: force = peak isometric force -> gainprm[2].
+        # lengthrange auto-computed by the compiler; if that ever yields a
+        # degenerate range, set lengthrange="{tsl+0.5*ofl} {tsl+1.5*ofl}".
+        acts.append(
+            f'    <muscle name="{mu["name"]}" tendon="{mu["name"]}_t" '
+            f'force="{mu["f0"]:.9g}"/>\n')
+    tendons.append("  </tendon>\n")
+    acts.append("  </actuator>\n")
+    return "".join(tendons), "".join(acts)
 
 
 def _wrap_xml(root, muscles):  # implemented in Task 4
