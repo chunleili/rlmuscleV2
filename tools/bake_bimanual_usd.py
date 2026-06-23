@@ -29,78 +29,11 @@ from rl_mass.model import MuscleNN, SimulationNN
 
 try:
     import torch
-    from torch import Tensor
     _USE_CUDA = torch.cuda.is_available()
 except Exception:  # pragma: no cover - torch always present in this repo
     raise
 
-
-def rollout(env, model, muscle_model, max_steps, deterministic):
-    """Run one episode, recording per-control-step geom transforms + activations.
-
-    Returns:
-        geom_xpos   (T+1, ngeom, 3)
-        geom_xmat   (T+1, ngeom, 3, 3)
-        activations (T+1, nu)   -- activation applied during the step ending at
-                                   this frame (frame 0 is the reset pose: zeros)
-        qpos        (T+1, nq)
-        rewards     list[float]  (length T)
-    """
-    import mujoco
-
-    state = env.reset(rsi=False)
-    mujoco.mj_forward(env.model, env.data)
-    num_sim_per_control = env.simulation_hz // env.control_hz
-
-    geom_xpos = [env.data.geom_xpos.copy()]
-    geom_xmat = [env.data.geom_xmat.copy().reshape(-1, 3, 3)]
-    activations = [np.zeros(env.num_muscles, dtype=np.float32)]
-    qpos = [env.data.qpos.copy()]
-    rewards = []
-
-    for _ in range(max_steps):
-        s = Tensor(state.reshape(1, -1).astype(np.float32))
-        if _USE_CUDA:
-            s = s.cuda()
-        a_dist, _ = model(s)
-        action = (a_dist.loc if deterministic else a_dist.sample())
-        action = action.cpu().detach().numpy().squeeze()
-        env.set_action(action)
-
-        if env.use_muscle and muscle_model is not None:
-            mt = Tensor(env.get_muscle_torques().reshape(1, -1).astype(np.float32))
-            if _USE_CUDA:
-                mt = mt.cuda()
-            for _ in range(num_sim_per_control // 2):
-                dt = Tensor(
-                    env.get_desired_torques().reshape(1, -1).astype(np.float32)
-                )
-                if _USE_CUDA:
-                    dt = dt.cuda()
-                act = muscle_model(mt, dt).cpu().detach().numpy().squeeze()
-                env.set_activation_levels(act)
-                env.step()
-                env.step()
-        else:
-            env.steps_at_once()
-
-        geom_xpos.append(env.data.geom_xpos.copy())
-        geom_xmat.append(env.data.geom_xmat.copy().reshape(-1, 3, 3))
-        activations.append(env.get_activation_levels().astype(np.float32))
-        qpos.append(env.data.qpos.copy())
-
-        if env.is_end_of_episode():
-            break
-        rewards.append(env.get_reward())
-        state = env.get_state()
-
-    return (
-        np.stack(geom_xpos).astype(np.float32),
-        np.stack(geom_xmat).astype(np.float32),
-        np.stack(activations).astype(np.float32),
-        np.stack(qpos).astype(np.float32),
-        rewards,
-    )
+from tools._rollout import rollout
 
 
 def _sanitize(name: str, used: set) -> str:
