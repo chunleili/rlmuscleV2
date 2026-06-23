@@ -1,6 +1,7 @@
 # tests/rl_mass/test_osim2mjcf_muscles.py
 """osim2mjcf muscles: 6 spatial tendons + muscle actuators with Thelen force."""
 import os, sys
+import tempfile
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 import numpy as np
@@ -28,14 +29,13 @@ def main():
     assert anames == NAMES, anames
     # f0 lives in gainprm[:,2] for MuJoCo muscle actuators (what TendonMuscleSystem reads)
     bic_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_ACTUATOR, "BIClong")
-    assert abs(m.actuator_gainprm[bic_id, 2] - 624.3) < 1e-2, m.actuator_gainprm[bic_id, 2]
+    assert abs(m.actuator_gainprm[bic_id, 2] - 624.3) < 1e-3, m.actuator_gainprm[bic_id, 2]
     # MuJoCo auto-computed a valid length range
     assert np.all(m.actuator_lengthrange[:, 1] > m.actuator_lengthrange[:, 0])
 
     # TendonMuscleSystem builds against the generated model
-    import tempfile, os
     d = tempfile.mkdtemp(); p = os.path.join(d, "arm26.xml")
-    open(p, "w").write(xml)
+    with open(p, "w") as f: f.write(xml)
     eng = MuJoCoEngine(p, timestep=1/600); eng.forward()
     tms = TendonMuscleSystem(eng, force_scale=1.0)
     assert tms.n_muscles == 6 and tms.num_total_related_dofs > 0

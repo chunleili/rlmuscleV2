@@ -261,11 +261,13 @@ def build_mjcf(osim_path):
                       f'pos="{_fmt(w["translation"])}" quat="{_fmt(quat)}" '
                       f'size="{w["radius"]:.9g} {max(w["length"], 0.01) / 2:.9g}" '
                       f'contype="0" conaffinity="0" group="3"/>\n')
-            else:  # WrapEllipsoid -> sphere of dominant radius (documented approx)
+            elif w["type"] == "WrapEllipsoid":  # sphere of dominant radius (documented approx)
                 r = max(w["dims"]) if any(w["dims"]) else max(w["radius"], 0.005)
                 s += (f'{pad}  <geom name="{gname}" type="sphere" '
                       f'pos="{_fmt(w["translation"])}" quat="{_fmt(quat)}" '
                       f'size="{r:.9g}" contype="0" conaffinity="0" group="3"/>\n')
+            else:
+                raise NotImplementedError(f"wrap type {w['type']!r} not handled")
         # sites for muscle path points anchored on this body (Task 3 fills _SITE_MAP)
         for sname, sloc in _SITE_MAP.get(body_name, []):
             s += f'{pad}  <site name="{sname}" pos="{_fmt(sloc)}" size="0.005"/>\n'
