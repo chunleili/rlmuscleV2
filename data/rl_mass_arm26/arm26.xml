@@ -1,0 +1,113 @@
+<mujoco model="arm26">
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.001"/>
+  <worldbody>
+    <body name="base" pos="0 0.8 0">
+      <geom name="TRIlongglen_wrap" type="cylinder" pos="-0.043905 -0.0039 0.1478" quat="0.351543548 0.110519922 -0.628373085 0.68509105" size="0.003 0.015" contype="0" conaffinity="0" group="3"/>
+      <site name="TRIlong_P0" pos="-0.05365 -0.01373 0.14723" size="0.005"/>
+      <site name="BIClong_P0" pos="-0.039235 0.00347 0.14795" size="0.005"/>
+      <site name="BIClong_P1" pos="-0.028945 0.01391 0.15639" size="0.005"/>
+      <site name="BICshort_P0" pos="0.004675 -0.01231 0.13475" size="0.005"/>
+      <site name="BICshort_P1" pos="-0.007075 -0.04004 0.14507" size="0.005"/>
+      <body name="r_humerus" pos="-0.017545 -0.007 0.17">
+        <joint name="r_shoulder_elev" type="hinge" axis="-0.05889802 0.0023 0.99826136" limited="false"/>
+        <inertial pos="0 -0.180496 0" mass="1.864572" diaginertia="0.01481 0.004551 0.013193"/>
+        <geom name="TRI_wrap" type="cylinder" pos="0.0028 -0.2919 -0.0069" quat="0.994530139 -0.0700498022 0.00229591354 0.0774438951" size="0.016 0.025" contype="0" conaffinity="0" group="3"/>
+        <geom name="TRIlonghh_wrap" type="sphere" pos="-0.0078 -0.0041 -0.0014" quat="0.414199657 0.226398884 -0.879895757 -0.0544577527" size="0.035" contype="0" conaffinity="0" group="3"/>
+        <geom name="BIClonghh_wrap" type="sphere" pos="0.0033 0.0073 0.0003" quat="0.227667407 -0.774129581 0.117987168 0.578765904" size="0.025" contype="0" conaffinity="0" group="3"/>
+        <site name="TRIlong_P1" pos="-0.02714 -0.11441 -0.00664" size="0.005"/>
+        <site name="TRIlong_P2" pos="-0.03184 -0.22637 -0.01217" size="0.005"/>
+        <site name="TRIlong_P3" pos="-0.01743 -0.26757 -0.01208" size="0.005"/>
+        <site name="TRIlat_P0" pos="-0.00599 -0.12646 0.00428" size="0.005"/>
+        <site name="TRIlat_P1" pos="-0.02344 -0.14528 0.00928" size="0.005"/>
+        <site name="TRIlat_P2" pos="-0.03184 -0.22637 -0.01217" size="0.005"/>
+        <site name="TRIlat_P3" pos="-0.01743 -0.26757 -0.01208" size="0.005"/>
+        <site name="TRImed_P0" pos="-0.00838 -0.13695 -0.00906" size="0.005"/>
+        <site name="TRImed_P1" pos="-0.02601 -0.15139 -0.0108" size="0.005"/>
+        <site name="TRImed_P2" pos="-0.03184 -0.22637 -0.01217" size="0.005"/>
+        <site name="TRImed_P3" pos="-0.01743 -0.26757 -0.01208" size="0.005"/>
+        <site name="BIClong_P2" pos="0.02131 0.01793 0.01028" size="0.005"/>
+        <site name="BIClong_P3" pos="0.02378 -0.00511 0.01201" size="0.005"/>
+        <site name="BIClong_P4" pos="0.01345 -0.02827 0.00136" size="0.005"/>
+        <site name="BIClong_P5" pos="0.01068 -0.07736 -0.00165" size="0.005"/>
+        <site name="BIClong_P6" pos="0.01703 -0.12125 0.00024" size="0.005"/>
+        <site name="BIClong_P7" pos="0.0228 -0.1754 -0.0063" size="0.005"/>
+        <site name="BICshort_P2" pos="0.01117 -0.07576 -0.01101" size="0.005"/>
+        <site name="BICshort_P3" pos="0.01703 -0.12125 -0.01079" size="0.005"/>
+        <site name="BICshort_P4" pos="0.0228 -0.1754 -0.0063" size="0.005"/>
+        <site name="BRA_P0" pos="0.0068 -0.1739 -0.0036" size="0.005"/>
+        <body name="r_ulna_radius_hand" pos="0.0061 -0.2904 -0.0123">
+          <joint name="r_elbow_flex" type="hinge" axis="0.04940001 0.03660001 0.99810825" limited="false"/>
+          <inertial pos="0 -0.181479 0" mass="1.534315" diaginertia="0.019281 0.001571 0.020062"/>
+          <site name="TRIlong_P4" pos="-0.0219 0.01046 -0.00078" size="0.005"/>
+          <site name="TRIlat_P4" pos="-0.0219 0.01046 -0.00078" size="0.005"/>
+          <site name="TRImed_P4" pos="-0.0219 0.01046 -0.00078" size="0.005"/>
+          <site name="BIClong_P8" pos="0.00751 -0.04839 0.02179" size="0.005"/>
+          <site name="BICshort_P5" pos="0.00751 -0.04839 0.02179" size="0.005"/>
+          <site name="BRA_P1" pos="-0.0032 -0.0239 0.0009" size="0.005"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <tendon>
+    <spatial name="TRIlong_t" width="0.002">
+      <site site="TRIlong_P0"/>
+      <site site="TRIlong_P1"/>
+      <geom geom="TRI_wrap"/>
+      <site site="TRIlong_P2"/>
+      <site site="TRIlong_P3"/>
+      <site site="TRIlong_P4"/>
+    </spatial>
+    <spatial name="TRIlat_t" width="0.002">
+      <site site="TRIlat_P0"/>
+      <geom geom="TRI_wrap"/>
+      <site site="TRIlat_P1"/>
+      <site site="TRIlat_P2"/>
+      <site site="TRIlat_P3"/>
+      <site site="TRIlat_P4"/>
+    </spatial>
+    <spatial name="TRImed_t" width="0.002">
+      <site site="TRImed_P0"/>
+      <geom geom="TRI_wrap"/>
+      <site site="TRImed_P1"/>
+      <site site="TRImed_P2"/>
+      <site site="TRImed_P3"/>
+      <site site="TRImed_P4"/>
+    </spatial>
+    <spatial name="BIClong_t" width="0.002">
+      <site site="BIClong_P0"/>
+      <geom geom="TRIlongglen_wrap"/>
+      <site site="BIClong_P1"/>
+      <site site="BIClong_P2"/>
+      <geom geom="TRI_wrap"/>
+      <site site="BIClong_P3"/>
+      <site site="BIClong_P4"/>
+      <site site="BIClong_P5"/>
+      <site site="BIClong_P6"/>
+      <site site="BIClong_P7"/>
+      <site site="BIClong_P8"/>
+    </spatial>
+    <spatial name="BICshort_t" width="0.002">
+      <site site="BICshort_P0"/>
+      <geom geom="TRIlongglen_wrap"/>
+      <site site="BICshort_P1"/>
+      <site site="BICshort_P2"/>
+      <geom geom="TRI_wrap"/>
+      <site site="BICshort_P3"/>
+      <site site="BICshort_P4"/>
+      <site site="BICshort_P5"/>
+    </spatial>
+    <spatial name="BRA_t" width="0.002">
+      <site site="BRA_P0"/>
+      <site site="BRA_P1"/>
+    </spatial>
+  </tendon>
+  <actuator>
+    <muscle name="TRIlong" tendon="TRIlong_t" force="798.52"/>
+    <muscle name="TRIlat" tendon="TRIlat_t" force="624.3"/>
+    <muscle name="TRImed" tendon="TRImed_t" force="624.3"/>
+    <muscle name="BIClong" tendon="BIClong_t" force="624.3"/>
+    <muscle name="BICshort" tendon="BICshort_t" force="435.56"/>
+    <muscle name="BRA" tendon="BRA_t" force="987.26"/>
+  </actuator>
+</mujoco>
