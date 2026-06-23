@@ -1,0 +1,6 @@
+{
+    "train_config": "data/rl_mass_arm26/config.json",
+    "checkpoint": "output/arm26/nn/max",
+    "gt_sto": "/home/chunleli/Dev/OpenSimExample/Models/Arm26/OutputReference/StaticOptimization/PhysiologicalResults/arm26_StaticOptimization_activation.sto",
+    "out_dir": "output/arm26/gt_compare"
+}

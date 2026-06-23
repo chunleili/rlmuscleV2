@@ -628,6 +628,7 @@ name = "rlmuscle"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
+    { name = "matplotlib" },
     { name = "mujoco" },
     { name = "newton", extra = ["sim"] },
     { name = "numpy" },
@@ -657,6 +658,7 @@ video = [
 [package.metadata]
 requires-dist = [
     { name = "imageio", extras = ["ffmpeg"], marker = "extra == 'video'", specifier = ">=2.37.3" },
+    { name = "matplotlib", specifier = ">=3.10.9" },
     { name = "matplotlib", marker = "extra == 'plot'", specifier = ">=3.7" },
     { name = "meshio", marker = "extra == 'mesh-export'", specifier = ">=5.3" },
     { name = "mujoco", specifier = ">=3.1" },

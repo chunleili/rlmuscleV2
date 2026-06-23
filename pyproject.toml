@@ -14,6 +14,7 @@ dependencies = [
     # Newton physics — used by the muscle-bone coupling examples.
     # Pinned to GitHub source (PyPI 0.2.0 has API drift vs RLMuscle).
     "newton[sim]",
+    "matplotlib>=3.10.9",
 ]
 
 [project.optional-dependencies]
