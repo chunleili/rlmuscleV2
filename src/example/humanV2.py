@@ -452,13 +452,16 @@ def build_humanV2_sim_from_args(args):
         cfg["end_frame"] = args.end_frame
     if getattr(args, "no_gmg", False):
         cfg["use_multigrid"] = False
+    # CLI overrides patch the constraints[] array (bicep.json style) in place.
+    cons = cfg.setdefault("constraints", [])
+    _by_name = {c.get("name"): c for c in cons}
     if getattr(args, "tendon_pin_threshold", None) is not None:
-        cfg["tendon_pin_threshold"] = args.tendon_pin_threshold
+        _by_name["belly_attach"]["tendon_pin_threshold"] = args.tendon_pin_threshold
     if getattr(args, "fiber", "none") not in ("none", None):
-        cfg["use_fiber"] = True
-        cfg["fiber_model"] = args.fiber
-        cfg["fiber_stiffness"] = getattr(args, "fiber_stiffness", 1.0e8)
-        cfg["contraction_ratio"] = getattr(args, "contraction_ratio", 0.4)
+        cons.append(dict(type="fiber", name="fiber", fiber_model=args.fiber,
+                         stiffness=getattr(args, "fiber_stiffness", 1.0e8),
+                         dampingratio=0.0,
+                         contraction_ratio=getattr(args, "contraction_ratio", 0.4)))
     demo = {"device": getattr(args, "device", "cuda:0"),
             "activate": getattr(args, "activate", None)}
     sim, surf_flat, fascia_flat = build_humanV2_sim(cfg, demo)

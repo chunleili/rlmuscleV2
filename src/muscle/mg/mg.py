@@ -36,6 +36,16 @@ from muscle.util.geo_io import GeoFile, read_cons_frame
 from muscle.util.util import _check_unzipped
 
 
+def find_constraint(cfg: dict, name: str) -> dict | None:
+    """Look up a constraint config block by ``name`` in the cfg ``constraints``
+    array (bicep.json style: every constraint type carries its own stiffness /
+    dampingratio / extra params). Returns None when absent — for the optional
+    constraints (muscle volume, fiber) absence == disabled."""
+    for c in cfg.get("constraints", []):
+        if c.get("name") == name:
+            return c
+    return None
+
 
 class MultiGridSim(MuscleSim):
     """Per-frame ARAP-HPBD driver for the pin-to-target workflow.
@@ -49,7 +59,16 @@ class MultiGridSim(MuscleSim):
 
     def __init__(self, cfg: dict, device: str | None = None):
         self.cfg = cfg
-        self.mu = float(cfg["mu"])
+        # ── Per-constraint params (bicep.json style: cfg["constraints"]) ──────
+        # Each constraint type owns its stiffness / dampingratio / extra params.
+        # arap is mandatory (the muscle ARAP-SVD shape match, stiffness = the old
+        # `mu`); muscle volume / fiber are optional (absence == disabled).
+        _arap = find_constraint(cfg, "arap")
+        if _arap is None:
+            raise ValueError("constraints[] must define an 'arap' entry "
+                             "(the muscle ARAP-SVD shape match)")
+        self.mu = float(_arap["stiffness"])
+        self._arap_damp = float(_arap.get("dampingratio", 0.0))
         self.omega = float(cfg["omega"])
         self.dt_frame = float(cfg["delta_t"])
         self.nsubsteps = int(cfg["nsubsteps"])
@@ -66,8 +85,24 @@ class MultiGridSim(MuscleSim):
         self.fascia_path = cfg.get("fascia_path") if self.use_fascia else None
         if self.fascia_path is not None and not Path(self.fascia_path).is_absolute():
             self.fascia_path = str(Path.cwd() / self.fascia_path)
-        self.fascia_rest_scale = float(cfg.get("fascia_rest_scale", 0.95))
-        self.fascia_glue_iters = int(cfg.get("fascia_glue_iterations", self.fine_iters))
+        # Fascia constraint params resolved from the constraints[] array (so the
+        # standalone Fascia sub-solver reads them off the parent, not raw cfg):
+        #   fascia_arap   -> shell ARAP-SVD shape (stiffness<0 == use geo attr),
+        #                    plus its shrink rest_scale (the squeeze target);
+        #   fascia_volume -> shell incompressibility;
+        #   fascia_glue   -> muscle<->fascia glue (stiffness_scale, iterations).
+        _f_arap = find_constraint(cfg, "fascia_arap") or {}
+        _f_vol = find_constraint(cfg, "fascia_volume") or {}
+        _f_glue = find_constraint(cfg, "fascia_glue") or {}
+        self.fascia_rest_scale = float(_f_arap.get("rest_scale", 0.95))
+        self.fascia_arap_stiffness = float(_f_arap.get("stiffness", -1.0))
+        self.fascia_arap_damp = float(_f_arap.get("dampingratio", 0.0))
+        self.fascia_volume_stiffness = float(_f_vol.get("stiffness", 1.0e10))
+        self.fascia_volume_damp = float(_f_vol.get("dampingratio", 0.0))
+        self.fascia_glue_scale = float(_f_glue.get("stiffness_scale", 0.001))
+        self.fascia_glue_stiffness = _f_glue.get("stiffness", None)
+        self.fascia_glue_damp = float(_f_glue.get("dampingratio", 0.0))
+        self.fascia_glue_iters = int(_f_glue.get("iterations", self.fine_iters))
         self.dt = self.dt_frame / self.nsubsteps
         self.end_frame = int(cfg.get("end_frame", 90))
         self.start_frame = int(cfg.get("start_frame", 1))
@@ -93,11 +128,12 @@ class MultiGridSim(MuscleSim):
         self._resid_buf = None
 
         # Hydrostatic volume constraint (incompressibility). ARAP-SVD matches
-        # shape only; the fine loop adds a det(F)=1 XPBD constraint at stiffness
-        # volume_stiffness. ON by default — incompressibility is intrinsic to
-        # muscle/soft tissue; set "use_volume": false to recover pure ARAP-HPBD.
-        self.use_volume = bool(cfg.get("use_volume", True))
-        self.volume_stiffness = float(cfg.get("volume_stiffness", 1.0e10))
+        # shape only; the fine loop adds a det(F)=1 XPBD constraint. Enabled by
+        # adding a 'volume' entry to constraints[] (absence == pure ARAP-HPBD).
+        _vol = find_constraint(cfg, "volume")
+        self.use_volume = _vol is not None
+        self.volume_stiffness = float(_vol["stiffness"]) if _vol else 1.0e10
+        self.volume_damp = float(_vol.get("dampingratio", 0.0)) if _vol else 0.0
 
         # Optional PASSIVE fiber constraint. The humanV2 asset (restpos.geo)
         # carries the per-vertex rest fiber direction in the ``materialW`` point
@@ -106,10 +142,12 @@ class MultiGridSim(MuscleSim):
         #   "aniso_arap" -> solve_aniso_arap_kernel (quadratic HOBAK fiber)
         # The active "fibermillard" model still needs per-tet activation (from an
         # RL trajectory) that the asset lacks, so it remains gated off.
-        self.use_fiber = bool(cfg.get("use_fiber", False))
-        self.fiber_model = str(cfg.get("fiber_model", "fibernorm"))
-        self.fiber_stiffness = float(cfg.get("fiber_stiffness", 1.0e8))
-        self.contraction_ratio = float(cfg.get("contraction_ratio", 0.4))
+        _fib = find_constraint(cfg, "fiber")
+        self.use_fiber = _fib is not None
+        self.fiber_model = str((_fib or {}).get("fiber_model", "fibernorm"))
+        self.fiber_stiffness = float((_fib or {}).get("stiffness", 1.0e8))
+        self.fiber_damp = float((_fib or {}).get("dampingratio", 0.0))
+        self.contraction_ratio = float((_fib or {}).get("contraction_ratio", 0.4))
         if self.use_fiber and self.fiber_model not in ("fibernorm", "aniso_arap"):
             raise NotImplementedError(
                 f"fiber_model={self.fiber_model!r} not supported. The OneWayGmg "
@@ -175,17 +213,20 @@ class MultiGridSim(MuscleSim):
         # ARAP stiffness = mu (the old HPBD ARAP stiffness); volume / fiber take
         # their configured stiffness. Targets / pins stay kinematic (apply_pintotarget).
         self.constraint_configs = [
-            dict(type="tetarapsvd", name="arap", stiffness=self.mu),
+            dict(type="tetarapsvd", name="arap", stiffness=self.mu,
+                 dampingratio=self._arap_damp),
         ]
         if self.use_volume:
             self.constraint_configs.append(
-                dict(type="volume", name="volume", stiffness=self.volume_stiffness))
+                dict(type="volume", name="volume", stiffness=self.volume_stiffness,
+                     dampingratio=self.volume_damp))
         if self.use_fiber:
             # fibernorm -> linear TETFIBERNORM; aniso_arap -> quadratic HOBAK
             # along-fiber ARAP (TETARAPANISO). Both read the materialW fiber field.
             _ftype = "aniso_arap" if self.fiber_model == "aniso_arap" else "fiber"
             self.constraint_configs.append(
-                dict(type=_ftype, name="fiber", stiffness=self.fiber_stiffness))
+                dict(type=_ftype, name="fiber", stiffness=self.fiber_stiffness,
+                     dampingratio=self.fiber_damp))
 
         # Allocate base SoA fields, build + upload the constraint table, then
         # fill geometry via the reused MuscleSim helpers: _init_fields sets
@@ -223,16 +264,27 @@ class MultiGridSim(MuscleSim):
         self.rest_offset = wp.array(rest_offset_np, dtype=wp.vec3, device=device)
         self.target_pos = wp.array(cons0.target_pos.copy(), dtype=wp.vec3, device=device)
 
+        # Belly-attach constraint config (the freed-belly pin system). It carries
+        # both the compliant attach stiffness / dampingratio AND tendon_pin_threshold
+        # (the hard-tendon vs freed-belly split is a property of this pin mode).
+        _belly = find_constraint(cfg, "belly_attach")
+        if _belly is None:
+            raise ValueError("constraints[] must define a 'belly_attach' entry "
+                             "(the freed-belly compliant pin)")
+        self.pin_attach_stiffness = float(_belly["stiffness"])
+        self.pin_attach_damp = float(_belly.get("dampingratio", 0.0))
+
         # Partial pinning (REQUIRED). Fully hard-pinning every vert (pts == all NV,
         # targets self-overlap) forces the belly through neighbouring muscles with
         # no collision give. Instead: verts whose tendonmask exceeds
         # tendon_pin_threshold (the tendon attachment regions) stay HARD-pinned; the
         # belly is freed and driven by the compliant belly-attach below. Fascia
         # rebuilds pin_active from its own glue ring later.
-        self.tendon_pin_threshold = cfg.get("tendon_pin_threshold", None)
+        self.tendon_pin_threshold = _belly.get("tendon_pin_threshold", None)
         if self.tendon_pin_threshold is None:
-            raise ValueError("tendon_pin_threshold is required (defines the hard "
-                             "tendon vs freed-belly split)")
+            raise ValueError("belly_attach constraint must define "
+                             "tendon_pin_threshold (the hard tendon vs freed-belly "
+                             "split)")
         tmask = rest.point_attr("tendonmask").astype(np.float32)
         active = (tmask[self._pin_pts_np]
                   > float(self.tendon_pin_threshold)).astype(np.int32)
@@ -248,10 +300,10 @@ class MultiGridSim(MuscleSim):
         # (attach_target_kernel). Force-based, so collision / fascia compete with
         # it (vs a position-blend pin they could not move). The fine attach is
         # built after fascia so pin_active is final.
-        self.pin_attach_compliance = float(cfg.get("pin_attach_compliance", 1e-6))
         self.attach_L = None
         print(f"[belly-attach] XPBD point attach for belly verts "
-              f"(compliance={self.pin_attach_compliance:g})")
+              f"(stiffness={self.pin_attach_stiffness:g}, "
+              f"dampingratio={self.pin_attach_damp:g})")
 
         if self.use_multigrid:
             # The conforming cage feeds the full-pin scaffold path (Galerkin
@@ -309,7 +361,7 @@ class MultiGridSim(MuscleSim):
         """Append a per-belly-vert ATTACH constraint (target filled per frame)."""
         active = (self.pin_active.numpy() if self.pin_active is not None
                   else np.ones(self.NCONS, np.int32))
-        k = 1.0 / float(max(self.pin_attach_compliance, 1e-30))
+        k = float(self.pin_attach_stiffness)
         belly = np.where(active == 0)[0].astype(np.int64)
         self._belly_cons_idx = belly                 # cons-frame index per attach
         cons = list(self.raw_constraints)
@@ -317,7 +369,7 @@ class MultiGridSim(MuscleSim):
             v = int(self._pin_pts_np[i])
             cons.append(dict(
                 type=ConstraintType.ATTACH, pts=[v, -1, -1, -1], stiffness=k,
-                compressionstiffness=-1.0, dampingratio=0.0, tetid=-1,
+                compressionstiffness=-1.0, dampingratio=self.pin_attach_damp, tetid=-1,
                 L=[0.0, 0.0, 0.0], restlength=0.0,
                 restvector=[0.0, 0.0, 0.0, 1.0], restdir=[0.0, 0.0, 0.0]))
         self._finalize_constraints(cons)

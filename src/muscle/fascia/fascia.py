@@ -137,8 +137,11 @@ class Fascia(MuscleSim):
         self.millard_stiffness_scale = 1.0
         # Volume (incompressibility) is always part of the fascia shell — the
         # shrink rest only sets the target SHAPE; volume keeps it from collapsing.
-        self._volume_stiffness = float(cfg.get("fascia_volume_stiffness",
-                                               cfg.get("volume_stiffness", 1.0e10)))
+        # All per-constraint params resolved by the parent from cfg["constraints"]
+        # (fascia_arap / fascia_volume / fascia_glue entries, bicep.json style).
+        self._volume_stiffness = float(p.fascia_volume_stiffness)
+        self._volume_damp = float(p.fascia_volume_damp)
+        self._arap_damp = float(p.fascia_arap_damp)
 
         _check_unzipped(p.fascia_path)
         fg = GeoFile(p.fascia_path)
@@ -149,8 +152,11 @@ class Fascia(MuscleSim):
         self.NT = int(self.tet_np.shape[0])
         self.v_fiber_np = None
         self.v_tendonmask_np = None
-        # Shell ARAP stiffness from the fascia geo attribute.
-        self._fascia_stiff = float(fg.point_attr("solidshapestiffness").mean())
+        # Shell ARAP stiffness: config fascia_arap.stiffness when >= 0, else the
+        # per-vertex geo attribute (solidshapestiffness) mean.
+        self._fascia_stiff = (float(p.fascia_arap_stiffness)
+                              if p.fascia_arap_stiffness >= 0.0
+                              else float(fg.point_attr("solidshapestiffness").mean()))
 
         # SoA pipeline: ARAP-SVD (+ optional volume), then shrink the ARAP rest.
         self._allocate_fields()
@@ -179,9 +185,10 @@ class Fascia(MuscleSim):
     def _build_fascia_constraints(self):
         # ARAP-SVD (shape) + volume (incompressibility) — both always present.
         cons = self.create_tet_arap_constraints(
-            {'stiffness': self._fascia_stiff}, ctype=ConstraintType.TETARAPSVD)
+            {'stiffness': self._fascia_stiff, 'dampingratio': self._arap_damp},
+            ctype=ConstraintType.TETARAPSVD)
         cons += self.create_tet_volume_constraint(
-            {'stiffness': self._volume_stiffness})
+            {'stiffness': self._volume_stiffness, 'dampingratio': self._volume_damp})
         cons.sort(key=lambda c: c['type'])
         self.n_cons = len(cons)
         self.cons_ranges = {}
@@ -226,7 +233,7 @@ class Fascia(MuscleSim):
         fascia_pos = self.pos0_np
         nvm = rest_muscle_pos.shape[0]
 
-        glue_scale = float(cfg.get("fascia_glue_stiffness_scale", 0.001))
+        glue_scale = float(p.fascia_glue_scale)
         glue_fascia, glue_muscle, glue_restlen, glue_stiff = self._pair_surface(
             fg, fascia_pos, mrest, rest_muscle_pos, glue_scale)
 
@@ -306,7 +313,7 @@ class Fascia(MuscleSim):
         pair toward an absolute target, so it can't catapult a weakly-connected
         fascia vert where the shell is sparse (the old ``min(want, d)`` slammed
         every pair toward ~2mm regardless of gap and flung such verts ~1m)."""
-        cfg = self.parent.cfg
+        p = self.parent
         surf = mrest.point_group("surface_points")
         fascia_tree = cKDTree(fascia_pos)
         d, floc = fascia_tree.query(rest_muscle_pos[surf], k=1)
@@ -315,9 +322,11 @@ class Fascia(MuscleSim):
         glue_fascia = floc.astype(np.int32)
         glue_restlen = d.astype(np.float32)
 
-        base_stiff = float(cfg.get(
-            "fascia_glue_stiffness",
-            float(fg.point_attr("tissuetomusclestiffness").mean())))
+        # Absolute glue stiffness from config (fascia_glue.stiffness) when set,
+        # else the per-vertex geo attribute (tissuetomusclestiffness) mean.
+        base_stiff = (float(p.fascia_glue_stiffness)
+                      if p.fascia_glue_stiffness is not None
+                      else float(fg.point_attr("tissuetomusclestiffness").mean()))
         glue_stiff = np.full(len(surf), base_stiff * glue_scale, dtype=np.float32)
         return glue_fascia, glue_muscle, glue_restlen, glue_stiff
 
