@@ -4,10 +4,17 @@
     "out_dir": "output/inversion_test",
     "device": "cuda:0",
 
-    "stiffness": 1e9,
+    "arap_stiffness": 1e9,
     "dt": 0.004166,
     "cap_every": 100,
     "log_every": 500,
+
+    "variants": [
+        { "name": "arap",         "volume_stiffness": 0.0  },
+        { "name": "vol_seq_1e6",  "volume_stiffness": 1e6,  "sequential": true },
+        { "name": "vol_seq_1e8",  "volume_stiffness": 1e8,  "sequential": true },
+        { "name": "vol_pool_1e6", "volume_stiffness": 1e6 }
+    ],
 
     "sweep": [
         { "y_scale":  0.5, "nframes":  50 },
