@@ -138,6 +138,19 @@ def _set_sum_is_collide(stage, prim_path, total, time,
     attr.Set(int(total), time)
 
 
+def _set_global_primvar(stage, prim_path, name, value, time, vtype):
+    """Write a whole-prim (constant-interpolation) scalar primvar, time-sampled.
+    One value per frame for the entire mesh — used for global per-frame
+    diagnostics (e.g. inverted-tet count / percentage) that usdview can plot."""
+    from pxr import UsdGeom
+    prim = stage.GetPrimAtPath(prim_path)
+    api = UsdGeom.PrimvarsAPI(prim)
+    pv = api.GetPrimvar(name)
+    if not pv:
+        pv = api.CreatePrimvar(name, vtype, UsdGeom.Tokens.constant)
+    pv.Set(value, time)
+
+
 class CollisionMeter:
     """Per-frame penetration metering instrument. Wraps the bone collider
     (``inside_depth``) and an optional muscle-vs-muscle ``mm_meter`` callable.
@@ -384,11 +397,12 @@ def _render_layered_frame(inner, first, ref_rel, pos_np, sim, fascia_flat,
 
 def _render_frame(renderer, frame, sim, collider, compaction, use_layered,
                   ref_rel, meter, no_collide_primvars, fascia_flat,
-                  geo_writer, geo_out):
+                  geo_writer, geo_out, n_inv=None):
     """Author one frame of output: the muscle/fascia/bone meshes into the USD
     (layered thin-layer over the usd_ref, or standalone full meshes) plus the
     optional in-place .geo dump. ``first`` gates the write-once data (colors,
-    static primvars) so the per-frame USD stays small."""
+    static primvars) so the per-frame USD stays small. ``n_inv`` (when given) is
+    baked as global per-frame inverted-tet count/percentage primvars."""
     (muscle_used, muscle_local, fascia_used, fascia_local,
      bone_used, bone_local, fascia_sep) = compaction
     pos_np = sim.positions_np()
@@ -400,6 +414,7 @@ def _render_frame(renderer, frame, sim, collider, compaction, use_layered,
     if use_layered:
         _render_layered_frame(inner, first, ref_rel, pos_np, sim,
                               fascia_flat, compaction, meter, no_collide_primvars)
+        muscle_path = "/root/model/muscle"
     else:
         # Constant displayColor only needs writing once — warp's render_mesh
         # re-sets it (time-sampled) on every call, so pass colors ONLY on the
@@ -420,6 +435,14 @@ def _render_frame(renderer, frame, sim, collider, compaction, use_layered,
         inner.render_mesh(name="bones", points=collider._cur_verts[bone_used],
                           indices=bone_local,
                           colors=(0.9, 0.88, 0.8) if first else None)
+    # Global per-frame inversion diagnostics on the muscle prim (constant interp).
+    if n_inv is not None:
+        from pxr import Sdf
+        pct = (n_inv / sim.NT * 100.0) if sim.NT else 0.0
+        _set_global_primvar(inner.stage, muscle_path, "inverted_count",
+                            int(n_inv), inner.time, Sdf.ValueTypeNames.Int)
+        _set_global_primvar(inner.stage, muscle_path, "inverted_pct",
+                            float(pct), inner.time, Sdf.ValueTypeNames.Float)
     inner.end_frame()
 
     if geo_writer is not None:
@@ -716,14 +739,14 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
             sim.set_fiber_activation(a * sim._activate_mask)
         sim.step_frame(frame)
         meter.measure()
+        n_inv = sim.count_inverted()   # every frame: feeds the USD primvar + print
 
         if renderer is not None:
             _render_frame(renderer, frame, sim, collider, compaction, use_layered,
                           ref_rel, meter, no_collide_primvars, fascia_flat,
-                          geo_writer, geo_out)
+                          geo_writer, geo_out, n_inv)
         if frame % 5 == 0 or frame == sim.end_frame:
             elapsed = time.perf_counter() - t0
-            n_inv = sim.count_inverted()
             print(f"  frame {frame:>3d}  {elapsed:6.1f}s  {meter.summary()}  "
                   f"inverted {n_inv}/{sim.NT} ({n_inv / sim.NT * 100:.2f}%)")
     if renderer is not None:
