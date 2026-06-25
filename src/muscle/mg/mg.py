@@ -32,7 +32,7 @@ import numpy as np
 
 from muscle.musclesim import MuscleSim
 from muscle.defs import ConstraintType
-from muscle.util.geo_io import GeoFile, read_cons_frame
+from muscle.util.geo_io import GeoFile, read_cons_frame, read_geo_attr_cached
 from muscle.util.util import _check_unzipped
 
 
@@ -103,6 +103,20 @@ class MultiGridSim(MuscleSim):
         self.fascia_glue_stiffness = _f_glue.get("stiffness", None)
         self.fascia_glue_damp = float(_f_glue.get("dampingratio", 0.0))
         self.fascia_glue_iters = int(_f_glue.get("iterations", self.fine_iters))
+        # Fascia coupling mode (Phase-1 Han-style redesign):
+        #   "squeeze" -> legacy: bone-anchored shrunk-ARAP shell + one-way glue
+        #                drags the muscle belly inward (the active squeeze; this
+        #                folds muscle tets -> inversions, super-additive with MG).
+        #   "ride"    -> Han 2024: bind each fascia vert barycentrically to the
+        #                closest MUSCLE-surface triangle and follow it each
+        #                substep (no inward push -> ~zero muscle-tet inversions).
+        #                Constitutive = SNH (volume-preserving), no rest_scale.
+        _f_snh = find_constraint(cfg, "fascia_snh") or {}
+        self.fascia_mode = str(cfg.get("fascia_mode", "squeeze"))
+        self.fascia_snh_mu = float(_f_snh.get("mu", 1.0e3))
+        self.fascia_snh_lam = float(_f_snh.get("lam", 1.0e8))
+        self.fascia_snh_damp = float(_f_snh.get("dampingratio", 0.0))
+        self.fascia_bind_max_dist = float(cfg.get("fascia_bind_max_dist", 0.05))
         self.dt = self.dt_frame / self.nsubsteps
         self.end_frame = int(cfg.get("end_frame", 90))
         self.start_frame = int(cfg.get("start_frame", 1))
@@ -251,18 +265,41 @@ class MultiGridSim(MuscleSim):
             np.where(_m > 0.0, 1.0 / _m, 0.0).astype(np.float32),
             dtype=wp.float32, device=device)
 
-        # Pin-to-target: topology (pts) is constant across all cons_<frame>.geo
-        # files; only target_pos varies.
-        cons0_path = str(Path(self.cons_dir) / f"cons_{self.start_frame}.geo")
-        _check_unzipped(cons0_path)
-        cons0 = GeoFile(cons0_path)
-        self.NCONS = int(cons0.pts.shape[0])
-        self.pts = wp.array(cons0.pts, dtype=wp.int32, device=device)
-        self._pin_pts_np = np.asarray(cons0.pts, dtype=np.int64)
+        # Per-frame target source. Two modes:
+        #   "points" — read the baked per-vertex traction target from
+        #              cons_<frame>.geo (the target_pos attribute).
+        #   "mesh"   — bind each muscle vert to the closest point on the bone
+        #              SURFACE at the start frame, then each frame the target rides
+        #              that surface through the bone_<frame>.geo sequence, so the
+        #              muscle follows the actual skeleton mesh motion instead of
+        #              pre-baked traction points. `use_sliding` (mesh-only) lets the
+        #              binding re-project tangentially within slide_range each
+        #              slide_interval frames; off = pure follow (no drift).
+        # Either way the downstream machinery only sees `target_pos` (per muscle
+        # vert) + a constant `rest_offset`; the belly-attach goal is their sum.
+        self.target_mode = str(cfg.get("target_mode", "points"))
+        self.use_sliding = bool(cfg.get("use_sliding", False))
+        if self.use_sliding and self.target_mode != "mesh":
+            raise ValueError("use_sliding=true requires target_mode='mesh' "
+                             "(sliding has no meaning for the 'points' source)")
+        self.bone_dir = cfg.get("bone_dir")
+        self.slide_range = float(cfg.get("slide_range", 0.02))      # max tangential drift (m)
+        self.slide_interval = int(cfg.get("slide_interval", 1))     # re-project every N frames
+        if self.target_mode == "mesh":
+            self._build_bone_slide_binding(rest, device)
+        else:
+            # Pin-to-target: topology (pts) is constant across all cons_<frame>.geo
+            # files; only target_pos varies.
+            cons0_path = str(Path(self.cons_dir) / f"cons_{self.start_frame}.geo")
+            _check_unzipped(cons0_path)
+            cons0 = GeoFile(cons0_path)
+            self.NCONS = int(cons0.pts.shape[0])
+            self.pts = wp.array(cons0.pts, dtype=wp.int32, device=device)
+            self._pin_pts_np = np.asarray(cons0.pts, dtype=np.int64)
+            rest_offset_np = (rest.positions[cons0.pts] - cons0.target_pos).astype(np.float32)
+            self.rest_offset = wp.array(rest_offset_np, dtype=wp.vec3, device=device)
+            self.target_pos = wp.array(cons0.target_pos.copy(), dtype=wp.vec3, device=device)
         self.pin_active = None  # rebuilt by Fascia (glue-ring free) when fascia is active
-        rest_offset_np = (rest.positions[cons0.pts] - cons0.target_pos).astype(np.float32)
-        self.rest_offset = wp.array(rest_offset_np, dtype=wp.vec3, device=device)
-        self.target_pos = wp.array(cons0.target_pos.copy(), dtype=wp.vec3, device=device)
 
         # Belly-attach constraint config (the freed-belly pin system). It carries
         # both the compliant attach stiffness / dampingratio AND tendon_pin_threshold
@@ -494,8 +531,77 @@ class MultiGridSim(MuscleSim):
         else:
             self.activation.assign(acti)
 
+    def _bone_frame_path(self, frame: int) -> str:
+        if self.bone_dir is None:
+            raise ValueError("target_mode='mesh' requires 'bone_dir' in the config")
+        return str(Path(self.bone_dir) / f"bone_{frame}.geo")
+
+    def _bone_frame_positions(self, frame: int) -> np.ndarray:
+        """Raw bone-surface vertex positions at `frame` (for the slide mesh)."""
+        path = self._bone_frame_path(frame)
+        _check_unzipped(path)
+        return np.asarray(read_geo_attr_cached(path, "P"), dtype=np.float32)
+
+    def _build_bone_slide_binding(self, rest, device) -> None:
+        """Bind each muscle vert to the closest point on the bone SURFACE at the
+        start frame, storing (face, barycentric) + signed normal gap. The binding
+        rides bone_<frame>.geo each frame and re-projects ("slides") tangentially
+        within slide_range. target_pos carries the full goal, so rest_offset=0."""
+        bone0_path = self._bone_frame_path(self.start_frame)
+        _check_unzipped(bone0_path)
+        g0 = GeoFile(bone0_path)
+        bpos = np.asarray(g0.positions, dtype=np.float32)
+        bfaces = np.asarray(g0.tet_indices, dtype=np.int32).reshape(-1)   # tris stored in tet_indices
+        self._bone_mesh = wp.Mesh(
+            points=wp.array(bpos, dtype=wp.vec3, device=device),
+            indices=wp.array(bfaces, dtype=wp.int32, device=device))
+        self._slide_max_dist = float(self.slide_range + 1.0)             # generous query radius
+        self.NCONS = int(self.NV)
+        _ident = np.arange(self.NV, dtype=np.int32)
+        self.pts = wp.array(_ident, dtype=wp.int32, device=device)
+        self._pin_pts_np = _ident.astype(np.int64)
+        rest_pos_wp = wp.array(np.asarray(rest.positions, dtype=np.float32),
+                               dtype=wp.vec3, device=device)
+        self._anchor_face = wp.zeros(self.NV, dtype=wp.int32, device=device)
+        self._anchor_uv = wp.zeros(self.NV, dtype=wp.vec2, device=device)
+        self._slide_gap = wp.zeros(self.NV, dtype=wp.float32, device=device)
+        wp.launch(bone_bind_kernel, dim=self.NV,
+                  inputs=[self._bone_mesh.id, rest_pos_wp, self._slide_max_dist,
+                          self._anchor_face, self._anchor_uv, self._slide_gap],
+                  device=device)
+        # Current (mutable) binding starts at the anchor.
+        self._bind_face = wp.clone(self._anchor_face)
+        self._bind_uv = wp.clone(self._anchor_uv)
+        self.rest_offset = wp.zeros(self.NV, dtype=wp.vec3, device=device)
+        self.target_pos = wp.zeros(self.NV, dtype=wp.vec3, device=device)
+        # Initialise target on the start-frame bone (follow only, no slide).
+        wp.launch(bone_slide_target_kernel, dim=self.NV,
+                  inputs=[self._bone_mesh.id, self.pos, self._anchor_face, self._anchor_uv,
+                          self._bind_face, self._bind_uv, self._slide_gap,
+                          self.slide_range, 0, self._slide_max_dist, self.target_pos],
+                  device=device)
+        print(f"[bone-slide] bound {self.NV} muscle verts to bone surface "
+              f"({bpos.shape[0]} verts, {bfaces.shape[0]//3} tris); "
+              f"slide_range={self.slide_range:g}m every {self.slide_interval} frame(s)")
+
+    def _update_slide_target(self, frame: int) -> None:
+        """Advance the bone mesh to `frame`, re-project (slide) the binding every
+        slide_interval frames, and write the per-vert bone target."""
+        bpos = self._bone_pos_stack[frame] if hasattr(self, "_bone_pos_stack") \
+            and frame in getattr(self, "_bone_pos_stack", {}) else self._bone_frame_positions(frame)
+        self._bone_mesh.points.assign(bpos)
+        self._bone_mesh.refit()
+        reproject = 1 if (self.use_sliding and
+                          (frame - self.start_frame) % max(1, self.slide_interval) == 0) else 0
+        wp.launch(bone_slide_target_kernel, dim=self.NV,
+                  inputs=[self._bone_mesh.id, self.pos, self._anchor_face, self._anchor_uv,
+                          self._bind_face, self._bind_uv, self._slide_gap,
+                          self.slide_range, reproject, self._slide_max_dist, self.target_pos],
+                  device=self._device)
+        self._update_belly_attach_targets()
+
     def preload_targets(self, frames=None) -> None:
-        """Parse every frame's cons target_pos once and hold it in RAM.
+        """Parse every frame's target once and hold it in RAM.
 
         Per-frame ``.geo`` is large JSON; parsing it inside the step loop is the
         dominant cost. Preloading lifts all of it out of the loop (and, via the
@@ -504,9 +610,15 @@ class MultiGridSim(MuscleSim):
         """
         if frames is None:
             frames = range(self.start_frame, self.end_frame + 1)
-        self._target_stack = {f: read_cons_frame(self.cons_dir, f) for f in frames}
+        if self.target_mode == "mesh":
+            self._bone_pos_stack = {f: self._bone_frame_positions(f) for f in frames}
+        else:
+            self._target_stack = {f: read_cons_frame(self.cons_dir, f) for f in frames}
 
     def load_frame_targets(self, frame: int) -> None:
+        if self.target_mode == "mesh":
+            self._update_slide_target(frame)
+            return
         stack = getattr(self, "_target_stack", None)
         if stack is None or frame not in stack:
             # lazy fallback for callers that did not preload (also memoizes)
