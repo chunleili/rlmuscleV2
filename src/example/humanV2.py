@@ -20,6 +20,9 @@ consumed by ``OneWaySim``):
 
     "demo": {
       "out": "output/humanV2.usd",
+      "use_layered_usd": false,             # ON -> variant USD references a shared
+      "layered_usd_ref": "output/humanV2/usd_ref.usd",   # constant-data USD and only
+      "rebuild_usd_ref": false,             # overrides points; ref auto-built if missing
       "bone_dir": "data/humanV2/model/bone",
       "device": "cuda:0",
       "no_export": false,
@@ -41,6 +44,7 @@ consumed by ``OneWaySim``):
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from pathlib import Path
 
@@ -272,6 +276,157 @@ def _bake_static_primvars(stage, prim_path, sim, used):
         print(f"[usd] baked static primvars: {', '.join(baked)}")
 
 
+def _set_mesh_points(stage, prim_path, points, time):
+    """Author ONLY the points attr (time-sampled) on an existing mesh prim —
+    used by the usd_ref path, where topology / colors / static primvars come from
+    the referenced usd_ref and the variant layer overrides points alone (the only
+    thing the simulation changes)."""
+    from pxr import UsdGeom, Vt
+    mesh = UsdGeom.Mesh.Get(stage, prim_path)
+    mesh.GetPointsAttr().Set(
+        Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(points, np.float32)), time)
+
+
+def _build_usd_ref(path, sim, collider, fascia_flat, compaction, static_bone):
+    """Write the SHARED layered-USD reference ONCE — the data identical across
+    every variant of the same take:
+
+      * muscle + fascia: topology + displayColor + static per-vertex primvars
+        (fiber ``materialW``, ``tendonmask``, ``muscle_id``, optional ``Cd``) at a
+        single REST timecode. The muscle deformation IS the per-variant output,
+        so only a rest fallback lives here; variants override its points.
+      * bones: the FULL per-frame animation. The skeleton is a playback of the
+        input bone geos, identical for every variant, so storing it here once (not
+        copying ~36k verts x N frames into each variant USD) is the real saving.
+
+    Variants ``render_ref`` this file and author ONLY the muscle/fascia points.
+    Called with the sim in its REST state (before any ``step_frame``)."""
+    from muscle.engine import WarpRenderer
+    (muscle_used, muscle_local, fascia_used, fascia_local,
+     bone_used, bone_local, fascia_sep) = compaction
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    r = WarpRenderer(mode="usd", stage_path=path).renderer
+
+    # muscle + fascia: single rest pose carrying all the constant attrs.
+    r.begin_frame(0.0)
+    pos_np = sim.positions_np()
+    mpath = r.render_mesh(name="muscle", points=pos_np[muscle_used],
+                          indices=muscle_local, colors=(0.8, 0.3, 0.25))
+    _bake_static_primvars(r.stage, mpath, sim, muscle_used)
+    if fascia_flat is not None:
+        fpos = sim.fascia.pos.numpy() if fascia_sep else pos_np
+        r.render_mesh(name="fascia", points=fpos[fascia_used],
+                      indices=fascia_local, colors=(0.55, 0.75, 0.9))
+
+    # bones: full animation (shared by every variant). Topology + color on the
+    # first frame, points per frame after. Read verts straight from the collider's
+    # preloaded stack to skip the per-frame BVH refit (no queries needed here).
+    frames = ([sim.start_frame] if static_bone
+              else range(sim.start_frame, sim.end_frame + 1))
+    for frame in frames:
+        verts = (collider._bone_stack[frame]
+                 if collider._bone_stack is not None
+                 else _load_bone_verts(collider.bone_dir, frame))
+        r.begin_frame(frame / r.fps)
+        r.render_mesh(name="bones", points=verts[bone_used], indices=bone_local,
+                      colors=(0.9, 0.88, 0.8) if frame == sim.start_frame else None)
+    r.save()
+    nbf = 1 if static_bone else (sim.end_frame - sim.start_frame + 1)
+    print(f"[layered] wrote shared ref (const + {nbf}-frame bones) -> {path}")
+
+
+def _setup_layered_usd(demo, renderer, out, sim, collider, fascia_flat,
+                       compaction, static_bone):
+    """Resolve layered-USD mode (demo.use_layered_usd, default OFF) before the
+    frame loop. The constant scene data (topology, displayColor, static primvars)
+    plus the full bone animation are written ONCE to demo.layered_usd_ref; every
+    variant USD then references it and overrides per-frame muscle/fascia points.
+    The ref is built from the sim's REST state (no step_frame yet) — auto-built
+    when missing, or when rebuild_usd_ref.
+
+    Returns ``(use_layered, ref_rel)``: ref_rel is the variant->ref relative path
+    for ``render_ref`` (None when layered mode is off)."""
+    use_layered = bool(demo.get("use_layered_usd", False)) and renderer is not None
+    if not use_layered:
+        return False, None
+    layered_ref = demo.get("layered_usd_ref") or str(Path(out).with_name("usd_ref.usd"))
+    if demo.get("rebuild_usd_ref", False) or not Path(layered_ref).exists():
+        _build_usd_ref(layered_ref, sim, collider, fascia_flat,
+                       compaction, static_bone)
+    else:
+        print(f"[layered] reusing {layered_ref}")
+    ref_rel = os.path.relpath(layered_ref, os.path.dirname(out) or ".")
+    print(f"[layered] variant references {ref_rel} (points-only layer)")
+    return True, ref_rel
+
+
+def _render_layered_frame(inner, first, ref_rel, pos_np, sim, fascia_flat,
+                          compaction, meter, no_collide_primvars):
+    """Author one variant frame as a thin layer over the usd_ref: reference it
+    once (first frame), then author ONLY per-frame points. Topology / displayColor
+    / static primvars resolve from the referenced usd_ref, and bones animate from
+    it too — nothing constant is duplicated here."""
+    (muscle_used, _muscle_local, fascia_used, _fascia_local,
+     _bone_used, _bone_local, fascia_sep) = compaction
+    if first:
+        inner.render_ref(name="model", path=ref_rel,
+                         pos=(0.0, 0.0, 0.0), rot=(0.0, 0.0, 0.0, 1.0),
+                         scale=(1.0, 1.0, 1.0))
+    muscle_path = "/root/model/muscle"
+    _set_mesh_points(inner.stage, muscle_path, pos_np[muscle_used], inner.time)
+    meter.write_primvars(inner.stage, muscle_path, muscle_used,
+                         inner.time, per_vertex=not no_collide_primvars)
+    if fascia_flat is not None:
+        fascia_pos = (sim.fascia.pos.numpy() if fascia_sep else pos_np)
+        _set_mesh_points(inner.stage, "/root/model/fascia",
+                         fascia_pos[fascia_used], inner.time)
+
+
+def _render_frame(renderer, frame, sim, collider, compaction, use_layered,
+                  ref_rel, meter, no_collide_primvars, fascia_flat,
+                  geo_writer, geo_out):
+    """Author one frame of output: the muscle/fascia/bone meshes into the USD
+    (layered thin-layer over the usd_ref, or standalone full meshes) plus the
+    optional in-place .geo dump. ``first`` gates the write-once data (colors,
+    static primvars) so the per-frame USD stays small."""
+    (muscle_used, muscle_local, fascia_used, fascia_local,
+     bone_used, bone_local, fascia_sep) = compaction
+    pos_np = sim.positions_np()
+    inner = renderer.renderer
+    # One USD timecode per sim frame. (begin_frame does round(time*fps);
+    # passing frame*sim.dt collapses frames since sim.dt is the SUBSTEP dt.)
+    inner.begin_frame(frame / inner.fps)
+    first = frame == sim.start_frame
+    if use_layered:
+        _render_layered_frame(inner, first, ref_rel, pos_np, sim,
+                              fascia_flat, compaction, meter, no_collide_primvars)
+    else:
+        # Constant displayColor only needs writing once — warp's render_mesh
+        # re-sets it (time-sampled) on every call, so pass colors ONLY on the
+        # first frame and None after to keep the USD small. (Topology / face
+        # indices are already written once by warp; points must be per-frame.)
+        muscle_path = inner.render_mesh(
+            name="muscle", points=pos_np[muscle_used], indices=muscle_local,
+            colors=(0.8, 0.3, 0.25) if first else None)
+        meter.write_primvars(inner.stage, muscle_path, muscle_used, inner.time,
+                             per_vertex=not no_collide_primvars)
+        if first:
+            _bake_static_primvars(inner.stage, muscle_path, sim, muscle_used)
+        if fascia_flat is not None:
+            fascia_pos = (sim.fascia.pos.numpy() if fascia_sep else pos_np)
+            inner.render_mesh(name="fascia", points=fascia_pos[fascia_used],
+                              indices=fascia_local,
+                              colors=(0.55, 0.75, 0.9) if first else None)
+        inner.render_mesh(name="bones", points=collider._cur_verts[bone_used],
+                          indices=bone_local,
+                          colors=(0.9, 0.88, 0.8) if first else None)
+    inner.end_frame()
+
+    if geo_writer is not None:
+        geo_writer.write(str(Path(geo_out) / f"muscle_{frame}.geo"),
+                         pos_np, meter.bone_flag, meter.bone_depth)
+
+
 def _load_bone_verts(bone_dir: Path, frame: int) -> np.ndarray:
     pos = read_geo_attr_cached(str(bone_dir / f"bone_{frame}.geo"), "P")
     return np.ascontiguousarray(np.asarray(pos, dtype=np.float32))
@@ -483,6 +638,20 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
     ``is_collide_muscle_muscle`` / ``pen_depth_muscle_muscle``. Splitting them
     keeps the muscle-bone count from being inflated by the (different,
     deformable-surface) muscle-muscle overlaps.
+
+    Structure: build-once setup runs before the loop, then each frame steps the
+    sim and exports.
+
+      * ``_compact`` trims every prim (muscle / fascia / bones) to ONLY the verts
+        its surface tris touch, remapping the tris to local indices; the results
+        are packed into the ``compaction`` tuple shared by all the export helpers.
+      * ``_setup_layered_usd`` resolves layered-USD mode (``demo.use_layered_usd``,
+        default OFF): the constant scene data + the full bone animation are
+        written ONCE to the shared ``usd_ref``, so each variant USD only overrides
+        per-frame muscle/fascia points. Returns ``(use_layered, ref_rel)``.
+      * Per frame, ``_render_frame`` authors that frame's meshes — a thin
+        points-only layer over the ``usd_ref`` when layered, else standalone full
+        meshes — plus the optional in-place ``.geo`` dump.
     """
     coll = demo.get("collision", {})
     static_bone = bool(coll.get("static_bone", False))
@@ -527,8 +696,13 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
         _compact(fascia_flat, sim.fascia.NV if fascia_sep else sim.NV)
         if fascia_flat is not None else (None, None))
     bone_used, bone_local = _compact(collider.tris_flat, collider.n_bone_verts)
+    compaction = (muscle_used, muscle_local, fascia_used, fascia_local,
+                  bone_used, bone_local, fascia_sep)
 
     meter = CollisionMeter(collider, mm_meter, collide_eps, sim.NV)
+
+    use_layered, ref_rel = _setup_layered_usd(
+        demo, renderer, out, sim, collider, fascia_flat, compaction, static_bone)
 
     t0 = time.perf_counter()
     for frame in range(sim.start_frame, sim.end_frame + 1):
@@ -544,36 +718,9 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
         meter.measure()
 
         if renderer is not None:
-            pos_np = sim.positions_np()
-            inner = renderer.renderer
-            # One USD timecode per sim frame. (begin_frame does round(time*fps);
-            # passing frame*sim.dt collapses frames since sim.dt is the SUBSTEP dt.)
-            inner.begin_frame(frame / inner.fps)
-            # Constant displayColor only needs writing once — warp's render_mesh
-            # re-sets it (time-sampled) on every call, so pass colors ONLY on the
-            # first frame and None after to keep the USD small. (Topology / face
-            # indices are already written once by warp; points must be per-frame.)
-            first = frame == sim.start_frame
-            muscle_path = inner.render_mesh(
-                name="muscle", points=pos_np[muscle_used], indices=muscle_local,
-                colors=(0.8, 0.3, 0.25) if first else None)
-            meter.write_primvars(inner.stage, muscle_path, muscle_used, inner.time,
-                                 per_vertex=not no_collide_primvars)
-            if first:
-                _bake_static_primvars(inner.stage, muscle_path, sim, muscle_used)
-            if fascia_flat is not None:
-                fascia_pos = (sim.fascia.pos.numpy() if fascia_sep else pos_np)
-                inner.render_mesh(name="fascia", points=fascia_pos[fascia_used],
-                                  indices=fascia_local,
-                                  colors=(0.55, 0.75, 0.9) if first else None)
-            inner.render_mesh(name="bones", points=collider._cur_verts[bone_used],
-                              indices=bone_local,
-                              colors=(0.9, 0.88, 0.8) if first else None)
-            inner.end_frame()
-
-            if geo_writer is not None:
-                geo_writer.write(str(Path(geo_out) / f"muscle_{frame}.geo"),
-                                 pos_np, meter.bone_flag, meter.bone_depth)
+            _render_frame(renderer, frame, sim, collider, compaction, use_layered,
+                          ref_rel, meter, no_collide_primvars, fascia_flat,
+                          geo_writer, geo_out)
         if frame % 5 == 0 or frame == sim.end_frame:
             elapsed = time.perf_counter() - t0
             n_inv = sim.count_inverted()
