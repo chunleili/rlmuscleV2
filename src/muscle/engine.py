@@ -439,6 +439,7 @@ def integrate_kernel(
     gravity_vec: wp.vec3,
     veldamping: float,
     dt: float,
+    quasi_static: int,
 ):
     i = wp.tid()
     if stopped[i] != 0:
@@ -450,10 +451,17 @@ def integrate_kernel(
     if m > 1.0e-12:
         extacc = extacc + force[i] / m
     pprev[i] = pos[i]
-    v = (1.0 - veldamping) * vel[i]
-    v = v + dt * extacc
-    vel[i] = v
-    pos[i] = pos[i] + dt * v
+    if quasi_static != 0:
+        # No inertia: external force drives position directly, velocity held at
+        # zero so no momentum carries across substeps (pos relaxes to the
+        # force/constraint equilibrium each step).
+        pos[i] = pos[i] + dt * dt * extacc
+        vel[i] = wp.vec3(0.0, 0.0, 0.0)
+    else:
+        v = (1.0 - veldamping) * vel[i]
+        v = v + dt * extacc
+        vel[i] = v
+        pos[i] = pos[i] + dt * v
 
 
 @wp.kernel
@@ -790,14 +798,21 @@ class XpbdEngine(ConstraintBuilderMixin):
     def integrate(self):
         gravity_vec = getattr(self, '_gravity_vec', None)
         if gravity_vec is None:
-            # Default: Y-axis gravity (legacy behavior)
-            gravity_vec = wp.vec3(0.0, self.cfg.gravity, 0.0)
+            # Default: Y-axis gravity (legacy behavior). getattr keeps this robust
+            # to dict-style cfgs (MultiGridSim) that have no .gravity attribute.
+            gravity_vec = wp.vec3(0.0, getattr(self.cfg, 'gravity', 0.0), 0.0)
+        veldamping = float(getattr(self.cfg, 'veldamping', 0.0))
+        qs = 1 if getattr(self, 'quasi_static', False) else 0
         wp.launch(integrate_kernel, dim=self.n_verts,
                   inputs=[self.pos, self.pprev, self.vel,
                           self.force, self.mass, self.stopped,
-                          gravity_vec, self.cfg.veldamping, self.dt])
+                          gravity_vec, veldamping, self.dt, qs])
 
     def update_velocities(self):
+        # Quasi-static: no inertia, velocity stays ~0 — skip the v=(pos-pprev)/dt
+        # post-phase entirely so no momentum is rebuilt for the next step.
+        if getattr(self, 'quasi_static', False):
+            return
         is_collide = getattr(self, "is_collide", None)
         contact_normal = getattr(self, "contact_normal", None)
         if is_collide is None or contact_normal is None:

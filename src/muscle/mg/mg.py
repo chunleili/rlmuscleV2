@@ -62,6 +62,11 @@ class MultiGridSim(MuscleSim):
 
     def __init__(self, cfg: dict, device: str | None = None):
         self.cfg = cfg
+        # Quasi-static muscle: no inertia. Engine-level flag (XpbdEngine.integrate
+        # / update_velocities honor it); gravity vec feeds the same path (humanV2
+        # runs gravity-free, so this is [0,0,0] but stays config-driven).
+        self.quasi_static = bool(cfg.get("quasi_static", False))
+        self._gravity_vec = wp.vec3(*[float(x) for x in cfg.get("gravity", [0.0, 0.0, 0.0])])
         # ── Per-constraint params (bicep.json style: cfg["constraints"]) ──────
         # Each constraint type owns its stiffness / dampingratio / extra params.
         # arap is mandatory (the muscle ARAP-SVD shape match, stiffness = the old
@@ -434,14 +439,6 @@ class MultiGridSim(MuscleSim):
         _, volumes, valid = self._batch_compute_tet_rest_matrices()
         return self.total_mass / float(max(volumes[valid].sum(), 1e-30))
 
-    def integrate(self):
-        """Quasi-static predict: no gravity / inertia. Each substep just snapshots
-        the start positions into pprev so the XPBD velocity-damping term vanishes
-        and the solve is a pure compliance projection (pin-to-target is kinematic,
-        applied separately). Overrides XpbdEngine.integrate (which reads
-        cfg.gravity — absent from this dict cfg)."""
-        wp.copy(self.pprev, self.pos)
-
     # ------------------------------------------------------------------
 
     def _init_coarse_cage(self) -> None:
@@ -744,6 +741,11 @@ class MultiGridSim(MuscleSim):
             # verts are protected by the collider's own inv_mass=0 mask.
             for fn in getattr(s, "collision_solvers", None) or []:
                 fn()
+            # End-of-substep velocity rebuild: v=(pos-pprev)/dt over the whole
+            # substep's net displacement. Engine no-ops this when quasi_static
+            # (vel held at 0 -> no inertia); when quasi_static is off the carried
+            # velocity feeds next substep's integrate as momentum.
+            s.update_velocities()
 
         self.program = [pre_phase, iter_phase, post_phase]
 

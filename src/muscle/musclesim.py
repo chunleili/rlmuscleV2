@@ -43,6 +43,9 @@ class MuscleSim(XpbdEngine):
 
     def __init__(self, cfg: SimConfig):
         self.cfg = cfg
+        # Quasi-static: drop inertia (integrate skips velocity carry, post-phase
+        # skips the velocity update). Engine-level toggle honored by XpbdEngine.
+        self.quasi_static = bool(getattr(cfg, 'quasi_static', False))
         self._init_backend()
 
         self.constraint_configs = self.cfg.constraints if self.cfg.constraints else []
