@@ -39,11 +39,14 @@ from muscle.util.util import _check_unzipped
 def find_constraint(cfg: dict, name: str) -> dict | None:
     """Look up a constraint config block by ``name`` in the cfg ``constraints``
     array (bicep.json style: every constraint type carries its own stiffness /
-    dampingratio / extra params). Returns None when absent — for the optional
-    constraints (muscle volume, fiber) absence == disabled."""
+    dampingratio / extra params). Returns None when absent OR when the entry sets
+    ``"enable": false`` — so a constraint can be toggled off in place without
+    deleting its tuned params. ``enable`` defaults to true. For the optional
+    constraints (muscle volume, fiber) absence/disabled == off; for the mandatory
+    ones (arap, belly_attach) disabling raises at the call site."""
     for c in cfg.get("constraints", []):
         if c.get("name") == name:
-            return c
+            return c if c.get("enable", True) else None
     return None
 
 

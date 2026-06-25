@@ -23,8 +23,8 @@ consumed by ``OneWaySim``):
       "use_layered_usd": false,             # ON -> variant USD references a shared
       "layered_usd_ref": "output/humanV2/usd_ref.usd",   # constant-data USD and only
       "rebuild_usd_ref": false,             # overrides points; ref auto-built if missing
-      "bone_dir": "data/humanV2/model/bone",
-      "device": "cuda:0",
+      "device": "cuda:0",                   # NB: bone_dir lives at the json top level
+                                            #     (shared by sim target_mode + collider)
       "no_export": false,
       "geo_out": null,
       "no_collide_primvars": true,
@@ -846,7 +846,9 @@ def main(argv=None):
     coll = demo.get("collision", {}) or {}
     collision_on = bool(coll.get("enabled", True))
     static_bone = bool(coll.get("static_bone", False))
-    bone_dir = demo.get("bone_dir", "data/humanV2/model/bone")
+    # Single source of truth: the top-level bone_dir (also read by the sim for
+    # target_mode='mesh'); the collider/meter reuses it.
+    bone_dir = cfg.get("bone_dir", "data/humanV2/model/bone")
 
     # Always build the bone collider — it is the penetration METER (inside_depth
     # drives the USD primvars) even when collision resolution is disabled.

@@ -27,12 +27,12 @@
     "nsubsteps": 10,
 
     "constraints": [
-        { "type": "tetarapsvd", "name": "arap",          "stiffness": 1e9,       "dampingratio": 0.1 },
-        { "type": "attach",     "name": "belly_attach",  "stiffness": 1e6,       "dampingratio": 0.1, "tendon_pin_threshold": 1.1 },
-        { "type": "glue",       "name": "fascia_glue",   "stiffness_scale": 0.5, "dampingratio": 0.1, "iterations": 2 },
-        { "type": "tetarapsvd", "name": "fascia_arap",   "stiffness": -1.0,      "dampingratio": 0.1, "rest_scale": 0.9 },
-        { "type": "volume",     "name": "fascia_volume", "stiffness": 1e6,      "dampingratio": 0.1 },
-        { "type": "snh",        "name": "fascia_snh",    "mu": 1e3,              "lam": 1e8, "dampingratio": 0.1 }
+        { "type": "tetarapsvd", "name": "arap",          "enable": true,  "stiffness": 1e9,       "dampingratio": 0.1 },
+        { "type": "attach",     "name": "belly_attach",  "enable": true,  "stiffness": 1e6,       "dampingratio": 0.1, "tendon_pin_threshold": 1.1 },
+        { "type": "glue",       "name": "fascia_glue",   "enable": true,  "stiffness_scale": 0.5, "dampingratio": 0.1, "iterations": 2 },
+        { "type": "tetarapsvd", "name": "fascia_arap",   "enable": true,  "stiffness": -1.0,      "dampingratio": 0.1, "rest_scale": 0.9 },
+        { "type": "volume",     "name": "fascia_volume", "enable": true,  "stiffness": 1e6,      "dampingratio": 0.1 },
+        { "type": "snh",        "name": "fascia_snh",    "enable": true,  "mu": 1e3,              "lam": 1e8, "dampingratio": 0.1 }
     ],
 
     "demo": {
@@ -40,7 +40,6 @@
         "use_layered_usd": true,
         "layered_usd_ref": "output/humanV2/humanV2.ref.usd",
         "rebuild_usd_ref": true,
-        "bone_dir": "data/humanV2/model/bone",
         "device": "cuda:0",
         "no_export": false,
         "geo_out": null,
