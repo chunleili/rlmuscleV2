@@ -114,10 +114,68 @@ def solve_glue_kernel(
     wp.atomic_add(muscle_pos, mi, (-f * wj) * dirn)
 
 
+# ─── Han-2024 "ride" coupling kernels (fascia -> muscle SURFACE) ────────────
+
+@wp.kernel
+def fascia_bind_kernel(
+    mesh: wp.uint64,
+    rest_pos: wp.array(dtype=wp.vec3),         # fascia rest verts
+    max_dist: wp.float32,
+    out_face: wp.array(dtype=wp.int32),
+    out_uv: wp.array(dtype=wp.vec2),
+    out_gap: wp.array(dtype=wp.float32),       # signed normal gap (rest - surface)·n
+    out_ok: wp.array(dtype=wp.int32),          # 1 if a surface point was found
+):
+    """Bind each fascia vert to the closest point on the muscle-surface mesh —
+    face + barycentric (u,v) + signed normal gap. The gap preserves the shell's
+    OUTWARD offset from the muscle so the ride never collapses onto the surface."""
+    i = wp.tid()
+    q = wp.mesh_query_point_sign_winding_number(mesh, rest_pos[i], max_dist)
+    if q.result:
+        out_face[i] = q.face
+        out_uv[i] = wp.vec2(q.u, q.v)
+        cp = wp.mesh_eval_position(mesh, q.face, q.u, q.v)
+        nrm = wp.mesh_eval_face_normal(mesh, q.face)
+        out_gap[i] = wp.dot(rest_pos[i] - cp, nrm)
+        out_ok[i] = 1
+    else:
+        out_face[i] = 0
+        out_uv[i] = wp.vec2(0.0, 0.0)
+        out_gap[i] = 0.0
+        out_ok[i] = 0
+
+
+@wp.kernel
+def fascia_ride_kernel(
+    mesh: wp.uint64,                           # current muscle-surface mesh
+    bound_local: wp.array(dtype=wp.int32),     # bound fascia vert ids
+    face: wp.array(dtype=wp.int32),
+    uv: wp.array(dtype=wp.vec2),
+    gap: wp.array(dtype=wp.float32),
+    fascia_pos: wp.array(dtype=wp.vec3),
+):
+    """Snap each bound fascia vert onto its barycentric point on the CURRENT
+    muscle surface, plus the preserved normal gap. Pure follow: the muscle is
+    never pushed (the fascia is the slave), so no muscle-tet inversion is
+    injected. Free (unbound) fascia verts are left to the SNH relax."""
+    i = wp.tid()
+    f = face[i]
+    cp = wp.mesh_eval_position(mesh, f, uv[i][0], uv[i][1])
+    nrm = wp.mesh_eval_face_normal(mesh, f)
+    fascia_pos[bound_local[i]] = cp + nrm * gap[i]
+
+
 class Fascia(MuscleSim):
-    """Fascia shell sub-solver (ARAP-SVD + optional volume), coupled to the
-    parent muscle sim by anchor + two-way glue. Built like ``_CoarseEngine``:
-    manual field setup (no ``MuscleSim.__init__`` mesh/bone loading)."""
+    """Fascia shell sub-solver. Two modes (parent ``fascia_mode``):
+
+    * ``"squeeze"`` (legacy) — ARAP-SVD (shrunk rest) + volume, coupled to the
+      parent muscle by a bone anchor + one-way glue that drags the belly inward.
+    * ``"ride"`` (Han 2024) — SNH shell whose verts are barycentrically bound to
+      the closest muscle-surface triangle and follow it each substep; the muscle
+      is never pushed, so it injects ~no muscle-tet inversions.
+
+    Built like ``_CoarseEngine``: manual field setup (no ``MuscleSim.__init__``
+    mesh/bone loading)."""
 
     def __init__(self, parent):
         self.parent = parent
@@ -129,7 +187,12 @@ class Fascia(MuscleSim):
         self.omega = p.omega
         self.total_mass = float(cfg.get("fascia_total_mass", p.total_mass))
         self.glue_iters = int(p.fascia_glue_iters)
+        self.mode = str(getattr(p, "fascia_mode", "squeeze"))
         self._rest_scale = float(p.fascia_rest_scale)
+        self._snh_mu = float(getattr(p, "fascia_snh_mu", 1.0e3))
+        self._snh_lam = float(getattr(p, "fascia_snh_lam", 1.0e8))
+        self._snh_damp = float(getattr(p, "fascia_snh_damp", 0.0))
+        self._bind_max_dist = float(getattr(p, "fascia_bind_max_dist", 0.05))
         self.use_jacobi = bool(getattr(p, "use_jacobi", True))
         self.use_colored_gs = False
         self.has_compressstiffness = False
@@ -158,17 +221,25 @@ class Fascia(MuscleSim):
                               if p.fascia_arap_stiffness >= 0.0
                               else float(fg.point_attr("solidshapestiffness").mean()))
 
-        # SoA pipeline: ARAP-SVD (+ optional volume), then shrink the ARAP rest.
+        # SoA pipeline: build constraints (SNH for ride, ARAP+volume for squeeze).
         self._allocate_fields()
         self._build_fascia_constraints()
         self._init_fields()
         self._precompute_rest()
-        self._apply_rest_shrink()
+        if self.mode != "ride":
+            self._apply_rest_shrink()        # squeeze only: shrink the ARAP rest
         self.pprev = wp.clone(self.pos)
 
-        # Coupling (glue / anchor) + free the glued muscle verts from the pin.
-        self._build_coupling(fg)
-        self.build_program()
+        if self.mode == "ride":
+            # Han: bind to muscle surface, follow it; no squeeze, no bone anchor.
+            self.n_glue = 0
+            self.n_anchor = 0
+            self._build_muscle_bind()
+            self.build_program_ride()
+        else:
+            # Legacy: bone anchor + one-way glue, free glued muscle verts.
+            self._build_coupling(fg)
+            self.build_program()
 
     # -- MuscleSim seams --------------------------------------------------
 
@@ -183,12 +254,21 @@ class Fascia(MuscleSim):
     # -- build ------------------------------------------------------------
 
     def _build_fascia_constraints(self):
-        # ARAP-SVD (shape) + volume (incompressibility) — both always present.
-        cons = self.create_tet_arap_constraints(
-            {'stiffness': self._fascia_stiff, 'dampingratio': self._arap_damp},
-            ctype=ConstraintType.TETARAPSVD)
-        cons += self.create_tet_volume_constraint(
-            {'stiffness': self._volume_stiffness, 'dampingratio': self._volume_damp})
+        if self.mode == "ride":
+            # Volume-preserving Stable Neo-Hookean (mu small = floppy shape, lam
+            # large = near-incompressible). No rest_scale shrink: the shell drapes
+            # over the muscle it rides, it does not contract into it. SNH's J term
+            # also keeps det(F) > 0 (built-in inversion barrier for the shell).
+            cons = self.create_tet_snh_constraint(
+                {'mu': self._snh_mu, 'lam': self._snh_lam,
+                 'dampingratio': self._snh_damp})
+        else:
+            # ARAP-SVD (shape) + volume (incompressibility) — both always present.
+            cons = self.create_tet_arap_constraints(
+                {'stiffness': self._fascia_stiff, 'dampingratio': self._arap_damp},
+                ctype=ConstraintType.TETARAPSVD)
+            cons += self.create_tet_volume_constraint(
+                {'stiffness': self._volume_stiffness, 'dampingratio': self._volume_damp})
         cons.sort(key=lambda c: c['type'])
         self.n_cons = len(cons)
         self.cons_ranges = {}
@@ -330,12 +410,91 @@ class Fascia(MuscleSim):
         glue_stiff = np.full(len(surf), base_stiff * glue_scale, dtype=np.float32)
         return glue_fascia, glue_muscle, glue_restlen, glue_stiff
 
+    def _build_muscle_bind(self):
+        """Han 2024: bind each fascia rest vert barycentrically to the closest
+        triangle on the MUSCLE surface (rest pose). Stores per-bound-vert
+        (face, uv, normal_gap); verts with no surface within ``_bind_max_dist``
+        are left free (SNH-relaxed). The muscle-surface ``wp.Mesh`` is kept
+        resident; each substep its points are re-assigned to the live muscle pos
+        and the bound verts re-snapped (no BVH refit — face/uv are fixed)."""
+        from muscle.util.mesh_io import vectorized_surface_tris
+        p = self.parent
+        device = self._device
+        log = logging.getLogger(__name__)
+
+        # Muscle boundary triangles (topology fixed) + a resident mesh seeded at
+        # the muscle REST pose for the one-time closest-point bind.
+        msurf = vectorized_surface_tris(np.asarray(p.tet_np, dtype=np.int64))
+        mrest = GeoFile(p.rest_path).positions.astype(np.float32)
+        self._msurf_tris = wp.array(msurf.reshape(-1).astype(np.int32),
+                                    dtype=wp.int32, device=device)
+        self._msurf_points = wp.array(mrest, dtype=wp.vec3, device=device)
+        self._msurf_mesh = wp.Mesh(points=self._msurf_points, indices=self._msurf_tris)
+
+        face = wp.zeros(self.NV, dtype=wp.int32, device=device)
+        uv = wp.zeros(self.NV, dtype=wp.vec2, device=device)
+        gap = wp.zeros(self.NV, dtype=wp.float32, device=device)
+        ok = wp.zeros(self.NV, dtype=wp.int32, device=device)
+        rest_fpos = wp.array(self.pos0_np, dtype=wp.vec3, device=device)
+        wp.launch(fascia_bind_kernel, dim=self.NV,
+                  inputs=[self._msurf_mesh.id, rest_fpos, self._bind_max_dist,
+                          face, uv, gap, ok], device=device)
+
+        ok_np = ok.numpy()
+        bound = np.where(ok_np == 1)[0].astype(np.int32)
+        self.n_bound = int(bound.shape[0])
+        self.bound_local = wp.array(bound, dtype=wp.int32, device=device)
+        self.bound_face = wp.array(face.numpy()[bound].astype(np.int32),
+                                   dtype=wp.int32, device=device)
+        self.bound_uv = wp.array(uv.numpy()[bound].astype(np.float32),
+                                 dtype=wp.vec2, device=device)
+        self.bound_gap = wp.array(gap.numpy()[bound].astype(np.float32),
+                                  dtype=wp.float32, device=device)
+        log.info(f"fascia[ride]: bound {self.n_bound}/{self.NV} "
+                 f"({100.0 * self.n_bound / max(self.NV, 1):.1f}%) verts to muscle "
+                 f"surface ({msurf.shape[0]} tris, max_dist={self._bind_max_dist}); "
+                 f"{self.NV - self.n_bound} free; SNH mu={self._snh_mu:g} "
+                 f"lam={self._snh_lam:g}")
+
+    def _ride(self):
+        """Snap bound fascia verts onto the current muscle surface."""
+        if self.n_bound:
+            wp.launch(fascia_ride_kernel, dim=self.n_bound,
+                      inputs=[self._msurf_mesh.id, self.bound_local,
+                              self.bound_face, self.bound_uv, self.bound_gap,
+                              self.pos], device=self._device)
+
+    def build_program_ride(self):
+        s = self
+
+        def ride_phase():
+            # Refresh the muscle-surface mesh to the live muscle pos (no refit:
+            # eval_position only reads points at the fixed bound face), snap the
+            # bound verts onto it, then snapshot pprev for the quasi-static relax.
+            s._msurf_mesh.points.assign(s.parent.pos)
+            s._ride()
+            s.integrate()
+
+        def relax_phase():
+            # SNH relax lets the free verts conform; re-snap the bound verts each
+            # iter so they stay Dirichlet on the muscle surface.
+            for _ in range(s.glue_iters):
+                s.clear()
+                s.solve_constraints(run_extras=False)
+                if s.use_jacobi:
+                    s.apply_dP()
+                s._ride()
+
+        self.program = [ride_phase, relax_phase]
+
     # -- run --------------------------------------------------------------
 
     def advect_bone(self):
         """Ride the skeleton: add this frame's bone DELTA to every fascia vert.
         Called ONCE per frame by the parent (target_pos is constant across a
         frame's substeps), BEFORE the substep loop — lag-free gross motion."""
+        if self.mode == "ride":
+            return                 # ride mode follows the muscle surface, not bone
         wp.launch(fascia_advect_bone_kernel, dim=self.NV,
                   inputs=[self.follow_cons, self.parent.target_pos,
                           self.parent.rest_offset, self.follow_prev, self.pos],

@@ -12,10 +12,10 @@
 
     "use_fascia": false,
     "fascia_path": "data/humanV2/model/fascia/fascia.geo",
-    "fascia_mode": "ride",
+    "fascia_mode": "squeeze",
     "fascia_bind_max_dist": 0.05,
 
-    "quasi_static": true,
+    "quasi_static": false,
     "use_multigrid": false,
     "coarse_npz_path": "data/humanV2/model/muscle/coarse_cage.npz",
     "omega": 0.1,
@@ -29,15 +29,15 @@
     "constraints": [
         { "type": "tetarapsvd", "name": "arap",          "enable": true,  "stiffness": 1e9,       "dampingratio": 0.1 },
         { "type": "attach",     "name": "belly_attach",  "enable": true,  "stiffness": 1e6,       "dampingratio": 0.1, "tendon_pin_threshold": 1.1 },
-        { "type": "glue",       "name": "fascia_glue",   "enable": true,  "stiffness_scale": 0.5, "dampingratio": 0.1, "iterations": 2 },
-        { "type": "tetarapsvd", "name": "fascia_arap",   "enable": true,  "stiffness": -1.0,      "dampingratio": 0.1, "rest_scale": 0.9 },
+        { "type": "glue",       "name": "fascia_glue",   "enable": true,  "stiffness_scale": 0.5, "dampingratio": 0.1, "iterations": 20},
+        { "type": "tetarapsvd", "name": "fascia_arap",   "enable": true,  "stiffness": -1.0,      "dampingratio": 0.1, "rest_scale": 1.0 },
         { "type": "volume",     "name": "fascia_volume", "enable": true,  "stiffness": 1e6,      "dampingratio": 0.1 },
         { "type": "snh",        "name": "fascia_snh",    "enable": true,  "mu": 1e3,              "lam": 1e8, "dampingratio": 0.1 }
     ],
 
     "demo": {
         "out": "output/humanV2/humanV2.usd",
-        "use_layered_usd": true,
+        "use_layered_usd": false,
         "layered_usd_ref": "output/humanV2/humanV2.ref.usd",
         "rebuild_usd_ref": true,
         "device": "cuda:0",
@@ -46,7 +46,7 @@
         "no_collide_primvars": true,
         "activate": null,
         "collision": {
-            "enabled": false,
+            "enabled": true,
             "static_bone": false,
             "max_dist": 0.2,
             "contact_offset": 1e-5,
