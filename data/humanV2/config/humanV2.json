@@ -12,7 +12,7 @@
 
     "use_fascia": false,
     "fascia_path": "data/humanV2/model/fascia/fascia.geo",
-    "fascia_mode": "squeeze",
+    "fascia_mode": "ride",
     "fascia_bind_max_dist": 0.05,
 
     "quasi_static": false,
@@ -37,9 +37,6 @@
 
     "demo": {
         "out": "output/humanV2/humanV2.usd",
-        "use_layered_usd": false,
-        "layered_usd_ref": "output/humanV2/humanV2.ref.usd",
-        "rebuild_usd_ref": true,
         "device": "cuda:0",
         "no_export": false,
         "geo_out": null,
