@@ -34,6 +34,7 @@ from muscle.musclesim import MuscleSim
 from muscle.defs import ConstraintType
 from muscle.util.geo_io import GeoFile, read_cons_frame, read_geo_attr_cached
 from muscle.util.util import _check_unzipped
+from muscle.util.bone_source import make_bone_source
 
 
 def find_constraint(cfg: dict, name: str) -> dict | None:
@@ -179,8 +180,13 @@ class MultiGridSim(MuscleSim):
                 "humanV2 asset does not carry — bake it in to enable that."
             )
 
-        _check_unzipped(self.rest_path)
-        rest = GeoFile(self.rest_path)
+        if str(self.rest_path).lower().endswith((".usd", ".usda", ".usdc", ".usdz")):
+            from muscle.util.mesh_io import UsdTetRest
+            rest = UsdTetRest(self.rest_path,        # USD TetMesh muscle asset
+                              scale=float(cfg.get("asset_scale", 1.0)))
+        else:
+            _check_unzipped(self.rest_path)
+            rest = GeoFile(self.rest_path)
         self.NV = self.n_verts = int(rest.positions.shape[0])
         self.NT = int(rest.tet_indices.shape[0])
 
@@ -531,27 +537,19 @@ class MultiGridSim(MuscleSim):
         else:
             self.activation.assign(acti)
 
-    def _bone_frame_path(self, frame: int) -> str:
-        if self.bone_dir is None:
-            raise ValueError("target_mode='mesh' requires 'bone_dir' in the config")
-        return str(Path(self.bone_dir) / f"bone_{frame}.geo")
-
     def _bone_frame_positions(self, frame: int) -> np.ndarray:
         """Raw bone-surface vertex positions at `frame` (for the slide mesh)."""
-        path = self._bone_frame_path(frame)
-        _check_unzipped(path)
-        return np.asarray(read_geo_attr_cached(path, "P"), dtype=np.float32)
+        return self._bone_source.positions(frame)
 
     def _build_bone_slide_binding(self, rest, device) -> None:
         """Bind each muscle vert to the closest point on the bone SURFACE at the
         start frame, storing (face, barycentric) + signed normal gap. The binding
-        rides bone_<frame>.geo each frame and re-projects ("slides") tangentially
-        within slide_range. target_pos carries the full goal, so rest_offset=0."""
-        bone0_path = self._bone_frame_path(self.start_frame)
-        _check_unzipped(bone0_path)
-        g0 = GeoFile(bone0_path)
-        bpos = np.asarray(g0.positions, dtype=np.float32)
-        bfaces = np.asarray(g0.tet_indices, dtype=np.int32).reshape(-1)   # tris stored in tet_indices
+        rides the per-frame bone source each frame and re-projects ("slides")
+        tangentially within slide_range. target_pos carries the full goal, so
+        rest_offset=0. The source is a 'bone_usd' file or a 'bone_dir' of .geo."""
+        self._bone_source = make_bone_source(self.cfg, self.start_frame)
+        bpos = self._bone_source.positions(self.start_frame)
+        bfaces = self._bone_source.tris.reshape(-1)
         self._bone_mesh = wp.Mesh(
             points=wp.array(bpos, dtype=wp.vec3, device=device),
             indices=wp.array(bfaces, dtype=wp.int32, device=device))

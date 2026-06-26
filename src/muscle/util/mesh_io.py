@@ -368,6 +368,120 @@ def load_bone_mesh(path: Path, bone_root: str = "/character/bone"):
     return _load_bone_usd(path, bone_root=bone_root)
 
 
+class UsdTetRest:
+    """GeoFile-compatible rest reader for a USD ``TetMesh`` muscle asset.
+
+    Exposes only the slice of the ``GeoFile`` API that ``MultiGridSim`` reads at
+    build time: ``positions``, ``tet_indices``, ``point_attr`` /
+    ``has_point_attr`` (materialW fiber dir, tendonmask, optional Cd) and the
+    ``prim_attr`` family (muscle_id — usually absent on a TetMesh, reported
+    missing). Points are pushed to world space; ``materialW`` is a direction so
+    it gets the rotation only (no translation).
+
+    Winding is normalised to the solver's convention: the ARAP rest frame
+    expects ``det(Dm) < 0`` (the orientation Houdini ``.geo`` assets carry after
+    import — verified against the working humanV2 rest). USD ``TetMesh`` winds
+    the other way (``det > 0``); each such tet is flipped on load, otherwise
+    every tet reads as pre-inverted and ARAP fights itself (~23% inverted).
+    """
+
+    def __init__(self, usd_path, prim_path: str | None = None, scale: float = 1.0):
+        from pxr import Usd, UsdGeom
+
+        self._scale = float(scale)
+        stage = Usd.Stage.Open(str(usd_path))
+        if stage is None:
+            raise FileNotFoundError(f"Cannot open muscle USD: {usd_path}")
+        prim = None
+        for p in stage.Traverse():
+            if p.GetTypeName() == "TetMesh" and (
+                    prim_path is None or str(p.GetPath()) == prim_path):
+                prim = p
+                break
+        if prim is None:
+            raise ValueError(
+                f"no TetMesh prim in {usd_path}"
+                + (f" at {prim_path}" if prim_path else ""))
+
+        pts = prim.GetAttribute("points").Get()
+        tvi = prim.GetAttribute("tetVertexIndices").Get()
+        if pts is None or tvi is None:
+            raise ValueError(
+                f"{prim.GetPath()} missing points / tetVertexIndices")
+
+        rest_t = stage.GetStartTimeCode()
+        if rest_t == Usd.TimeCode.Default().GetValue():
+            rest_t = 1.0
+        wm = UsdGeom.XformCache(float(rest_t)).GetLocalToWorldTransform(prim)
+        R = np.array([[wm[i][j] for j in range(3)] for i in range(3)], np.float32)
+        T = np.array([wm[3][j] for j in range(3)], np.float32)
+
+        self._positions = (np.asarray(pts, np.float32) @ R + T).astype(np.float32)
+        if self._scale != 1.0:        # cm->m asset_scale (match the bone source)
+            self._positions = np.ascontiguousarray(
+                (self._positions * np.float32(self._scale)).astype(np.float32))
+        self._tet_indices = np.ascontiguousarray(
+            np.asarray(tvi, np.int64).reshape(-1, 4))
+        self._fix_tet_winding()       # USD det>0 -> solver det<0
+
+        self._attrs = {}
+        for nm in ("materialW", "tendonmask", "Cd"):
+            a = prim.GetAttribute(f"primvars:{nm}")
+            v = a.Get() if (a and a.HasValue()) else None
+            if v is None:
+                continue
+            arr = np.asarray(v, np.float32)
+            if nm == "materialW" and arr.ndim == 2:    # direction -> rotate only
+                arr = (arr @ R).astype(np.float32)
+            self._attrs[nm] = arr
+        self._prim_attrs: dict = {}
+        self._prim_attr_strings: dict = {}
+        print(f"[muscle-usd] {usd_path}: {self._positions.shape[0]} verts, "
+              f"{self._tet_indices.shape[0]} tets, "
+              f"attrs={sorted(self._attrs)}")
+
+    def _fix_tet_winding(self) -> None:
+        """Flip any tet with det>0 to det<0 (the solver's ARAP rest convention)."""
+        p, t = self._positions.astype(np.float64), self._tet_indices
+        e1 = p[t[:, 1]] - p[t[:, 0]]
+        e2 = p[t[:, 2]] - p[t[:, 0]]
+        e3 = p[t[:, 3]] - p[t[:, 0]]
+        det = np.einsum("ij,ij->i", np.cross(e1, e2), e3)
+        flip = det > 0
+        n = int(flip.sum())
+        if n:
+            t[flip] = t[flip][:, [0, 2, 1, 3]]   # swap v1,v2 -> negate det
+            print(f"[muscle-usd] flipped {n}/{t.shape[0]} tets to det<0 "
+                  f"(solver winding)")
+
+    @property
+    def positions(self) -> np.ndarray:
+        return self._positions
+
+    @property
+    def tet_indices(self) -> np.ndarray:
+        return self._tet_indices
+
+    def point_attr(self, name: str) -> np.ndarray:
+        if name not in self._attrs:
+            raise KeyError(f"point attr '{name}' not in {sorted(self._attrs)}")
+        return self._attrs[name]
+
+    def has_point_attr(self, name: str) -> bool:
+        return name in self._attrs
+
+    def has_prim_attr(self, name: str) -> bool:
+        return name in self._prim_attrs
+
+    def prim_attr(self, name: str) -> np.ndarray:
+        if name not in self._prim_attrs:
+            raise KeyError(f"prim attr '{name}' not present")
+        return self._prim_attrs[name]
+
+    def prim_attr_strings(self, name: str) -> list:
+        return self._prim_attr_strings.get(name, [])
+
+
 # ---------------------------------------------------------------------------
 # Export: PLY
 # ---------------------------------------------------------------------------

@@ -10,19 +10,24 @@ ONLY command-line argument is ``--config``::
     PYTHONPATH=src python -m example.humanV2 --config data/humanV2/config/humanV2.json
     # -> output/humanV2.usd
 
-The skeleton is driven by the same 200-frame animation that generated the
-muscle's ``cons`` targets (``data/humanV2/model/bone/bone_<N>.geo``, constant
-topology). Each frame the bone verts are loaded into a ``wp.Mesh`` and
-``refit()``-ed before the solve, so penetration stays shallow / local.
+The skeleton is driven by a constant-topology, per-frame animation from one of
+two backends (top-level keys, shared by the sim target_mode + the collider):
+
+    "bone_dir": "data/humanV2/model/bone"   # dir of bone_<N>.geo (default), OR
+    "bone_usd": "data/Emil/model/bone.usd"  # single USD, points timeSamples
+    "bone_root": "/character/bone"          # optional: scope which USD prims
+
+Each frame the bone verts are loaded into a ``wp.Mesh`` and ``refit()``-ed
+before the solve, so penetration stays shallow / local.
 
 Config schema (``demo`` object; solver keys stay at the json top level and are
 consumed by ``OneWaySim``):
 
     "demo": {
       "out": "output/humanV2.usd",
-      "use_layered_usd": false,             # ON -> variant USD references a shared
-      "layered_usd_ref": "output/humanV2/usd_ref.usd",   # constant-data USD and only
-      "rebuild_usd_ref": false,             # overrides points; ref auto-built if missing
+      "graft_src": null,                    # set -> graft sim meshes onto a copy of
+      "sim_scope": "/char/sim",             # this UsdSkel asset under sim_scope; bones
+                                            #   ride its skel anim (no baked bone points)
       "device": "cuda:0",                   # NB: bone_dir lives at the json top level
                                             #     (shared by sim target_mode + collider)
       "no_export": false,
@@ -34,7 +39,8 @@ consumed by ``OneWaySim``):
         "static_bone": false,
         "max_dist": 0.2,
         "contact_offset": 1e-5,
-        "collide_eps": 1e-6
+        "collide_eps": 1e-6,
+        "flip_bone_winding": true            # .geo bones wind inward; USD may not
       },
       "self_collision": {                     # method: none | dcd | intermuscle
         "method": "none"
@@ -55,6 +61,7 @@ from muscle.mg.mg import MultiGridSim, load_config
 from muscle.util.mesh_io import vectorized_surface_tris
 from muscle.collision.sdf.kernel import solve_mesh_contact_pos_kernel
 from muscle.util.geo_io import GeoFile, GeoWriter, read_geo_attr_cached
+from muscle.util.bone_source import make_bone_source
 
 
 @wp.kernel
@@ -289,120 +296,61 @@ def _bake_static_primvars(stage, prim_path, sim, used):
         print(f"[usd] baked static primvars: {', '.join(baked)}")
 
 
-def _set_mesh_points(stage, prim_path, points, time):
-    """Author ONLY the points attr (time-sampled) on an existing mesh prim —
-    used by the usd_ref path, where topology / colors / static primvars come from
-    the referenced usd_ref and the variant layer overrides points alone (the only
-    thing the simulation changes)."""
-    from pxr import UsdGeom, Vt
-    mesh = UsdGeom.Mesh.Get(stage, prim_path)
-    mesh.GetPointsAttr().Set(
-        Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(points, np.float32)), time)
+def _graft_sim_into_asset(out, src_usd, sim_stage_path, scope_path, mesh_names,
+                          start, end):
+    """Build the final output by GRAFTING the freshly-simulated meshes onto a
+    self-contained copy of the source asset.
+
+    The source ``src_usd`` (e.g. Emil.usd) keeps its compact UsdSkel bones +
+    skinned surface muscle — the skeleton plays back via LBS, so NO per-frame bone
+    points are baked (the real space saving vs a full mesh bake). Only the
+    deforming sim meshes cost per-frame points; warp has already authored them
+    (the proven-visible Mesh attrs) into ``sim_stage_path`` under ``/root/<name>``
+    in WORLD metres.
+
+    Those meshes are copied (``Sdf.CopySpec``, timesamples and all) under a new
+    ``scope_path`` (e.g. ``/char/sim``, leaving room for ``/char/sim/fascia`` etc.)
+    so the simulation lives beside the asset's own ``/char/muscle``. The asset's
+    parent (``/char``) carries a cm->m world xform; the scope gets that xform's
+    INVERSE so the world-metre sim points render in place (otherwise the 0.01
+    scale shrinks them 100x). Exported as ONE dependency-free ``.usd`` (the source
+    has no sublayers/references)."""
+    from pxr import Usd, UsdGeom, Sdf
+    stage = Usd.Stage.Open(src_usd)
+    parent = scope_path.rsplit("/", 1)[0] or "/"
+    tinv = (UsdGeom.Xformable(stage.GetPrimAtPath(parent))
+            .ComputeLocalToWorldTransform(float(start)).GetInverse())
+    scope = UsdGeom.Xform(stage.DefinePrim(scope_path, "Xform"))
+    scope.AddTransformOp().Set(tinv)
+    stage.SetStartTimeCode(float(start))
+    stage.SetEndTimeCode(float(end))
+    dst = stage.GetRootLayer()
+    sim = Sdf.Layer.FindOrOpen(os.path.abspath(sim_stage_path))
+    grafted = []
+    for nm in mesh_names:
+        s, d = f"/root/{nm}", f"{scope_path}/{nm}"
+        if sim.GetPrimAtPath(s):
+            Sdf.CreatePrimInLayer(dst, d)
+            Sdf.CopySpec(sim, s, dst, d)
+            grafted.append(nm)
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    if os.path.exists(out):
+        os.remove(out)
+    stage.Export(out)
+    print(f"[graft] {os.path.basename(src_usd)} (skel bones) + {scope_path}/"
+          f"{{{','.join(grafted)}}} -> {out} (self-contained)")
 
 
-def _build_usd_ref(path, sim, collider, fascia_flat, compaction, static_bone):
-    """Write the SHARED layered-USD reference ONCE — the data identical across
-    every variant of the same take:
-
-      * muscle + fascia: topology + displayColor + static per-vertex primvars
-        (fiber ``materialW``, ``tendonmask``, ``muscle_id``, optional ``Cd``) at a
-        single REST timecode. The muscle deformation IS the per-variant output,
-        so only a rest fallback lives here; variants override its points.
-      * bones: the FULL per-frame animation. The skeleton is a playback of the
-        input bone geos, identical for every variant, so storing it here once (not
-        copying ~36k verts x N frames into each variant USD) is the real saving.
-
-    Variants ``render_ref`` this file and author ONLY the muscle/fascia points.
-    Called with the sim in its REST state (before any ``step_frame``)."""
-    from muscle.engine import WarpRenderer
-    (muscle_used, muscle_local, fascia_used, fascia_local,
-     bone_used, bone_local, fascia_sep) = compaction
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    r = WarpRenderer(mode="usd", stage_path=path).renderer
-
-    # muscle + fascia: single rest pose carrying all the constant attrs.
-    r.begin_frame(0.0)
-    pos_np = sim.positions_np()
-    mpath = r.render_mesh(name="muscle", points=pos_np[muscle_used],
-                          indices=muscle_local, colors=(0.8, 0.3, 0.25))
-    _bake_static_primvars(r.stage, mpath, sim, muscle_used)
-    if fascia_flat is not None:
-        fpos = sim.fascia.pos.numpy() if fascia_sep else pos_np
-        r.render_mesh(name="fascia", points=fpos[fascia_used],
-                      indices=fascia_local, colors=(0.55, 0.75, 0.9))
-
-    # bones: full animation (shared by every variant). Topology + color on the
-    # first frame, points per frame after. Read verts straight from the collider's
-    # preloaded stack to skip the per-frame BVH refit (no queries needed here).
-    frames = ([sim.start_frame] if static_bone
-              else range(sim.start_frame, sim.end_frame + 1))
-    for frame in frames:
-        verts = (collider._bone_stack[frame]
-                 if collider._bone_stack is not None
-                 else _load_bone_verts(collider.bone_dir, frame))
-        r.begin_frame(frame / r.fps)
-        r.render_mesh(name="bones", points=verts[bone_used], indices=bone_local,
-                      colors=(0.9, 0.88, 0.8) if frame == sim.start_frame else None)
-    r.save()
-    nbf = 1 if static_bone else (sim.end_frame - sim.start_frame + 1)
-    print(f"[layered] wrote shared ref (const + {nbf}-frame bones) -> {path}")
-
-
-def _setup_layered_usd(demo, renderer, out, sim, collider, fascia_flat,
-                       compaction, static_bone):
-    """Resolve layered-USD mode (demo.use_layered_usd, default OFF) before the
-    frame loop. The constant scene data (topology, displayColor, static primvars)
-    plus the full bone animation are written ONCE to demo.layered_usd_ref; every
-    variant USD then references it and overrides per-frame muscle/fascia points.
-    The ref is built from the sim's REST state (no step_frame yet) — auto-built
-    when missing, or when rebuild_usd_ref.
-
-    Returns ``(use_layered, ref_rel)``: ref_rel is the variant->ref relative path
-    for ``render_ref`` (None when layered mode is off)."""
-    use_layered = bool(demo.get("use_layered_usd", False)) and renderer is not None
-    if not use_layered:
-        return False, None
-    layered_ref = demo.get("layered_usd_ref") or str(Path(out).with_name("usd_ref.usd"))
-    if demo.get("rebuild_usd_ref", False) or not Path(layered_ref).exists():
-        _build_usd_ref(layered_ref, sim, collider, fascia_flat,
-                       compaction, static_bone)
-    else:
-        print(f"[layered] reusing {layered_ref}")
-    ref_rel = os.path.relpath(layered_ref, os.path.dirname(out) or ".")
-    print(f"[layered] variant references {ref_rel} (points-only layer)")
-    return True, ref_rel
-
-
-def _render_layered_frame(inner, first, ref_rel, pos_np, sim, fascia_flat,
-                          compaction, meter, no_collide_primvars):
-    """Author one variant frame as a thin layer over the usd_ref: reference it
-    once (first frame), then author ONLY per-frame points. Topology / displayColor
-    / static primvars resolve from the referenced usd_ref, and bones animate from
-    it too — nothing constant is duplicated here."""
-    (muscle_used, _muscle_local, fascia_used, _fascia_local,
-     _bone_used, _bone_local, fascia_sep) = compaction
-    if first:
-        inner.render_ref(name="model", path=ref_rel,
-                         pos=(0.0, 0.0, 0.0), rot=(0.0, 0.0, 0.0, 1.0),
-                         scale=(1.0, 1.0, 1.0))
-    muscle_path = "/root/model/muscle"
-    _set_mesh_points(inner.stage, muscle_path, pos_np[muscle_used], inner.time)
-    meter.write_primvars(inner.stage, muscle_path, muscle_used,
-                         inner.time, per_vertex=not no_collide_primvars)
-    if fascia_flat is not None:
-        fascia_pos = (sim.fascia.pos.numpy() if fascia_sep else pos_np)
-        _set_mesh_points(inner.stage, "/root/model/fascia",
-                         fascia_pos[fascia_used], inner.time)
-
-
-def _render_frame(renderer, frame, sim, collider, compaction, use_layered,
-                  ref_rel, meter, no_collide_primvars, fascia_flat,
-                  geo_writer, geo_out, n_inv=None):
-    """Author one frame of output: the muscle/fascia/bone meshes into the USD
-    (layered thin-layer over the usd_ref, or standalone full meshes) plus the
-    optional in-place .geo dump. ``first`` gates the write-once data (colors,
-    static primvars) so the per-frame USD stays small. ``n_inv`` (when given) is
-    baked as global per-frame inverted-tet count/percentage primvars."""
+def _render_frame(renderer, frame, sim, collider, compaction,
+                  meter, no_collide_primvars, fascia_flat,
+                  geo_writer, geo_out, n_inv=None, skip_bones=False):
+    """Author one frame of output: the muscle/fascia (and, unless ``skip_bones``,
+    bone) meshes into the USD plus the optional in-place .geo dump. ``first`` gates
+    the write-once data (colors, static primvars) so the per-frame USD stays small.
+    ``n_inv`` (when given) is baked as global per-frame inverted-tet
+    count/percentage primvars. ``skip_bones`` leaves bones out — used by the graft
+    output mode, where the source asset's UsdSkel bones ride a compact skel
+    animation instead of baked per-frame points."""
     (muscle_used, muscle_local, fascia_used, fascia_local,
      bone_used, bone_local, fascia_sep) = compaction
     pos_np = sim.positions_np()
@@ -411,27 +359,23 @@ def _render_frame(renderer, frame, sim, collider, compaction, use_layered,
     # passing frame*sim.dt collapses frames since sim.dt is the SUBSTEP dt.)
     inner.begin_frame(frame / inner.fps)
     first = frame == sim.start_frame
-    if use_layered:
-        _render_layered_frame(inner, first, ref_rel, pos_np, sim,
-                              fascia_flat, compaction, meter, no_collide_primvars)
-        muscle_path = "/root/model/muscle"
-    else:
-        # Constant displayColor only needs writing once — warp's render_mesh
-        # re-sets it (time-sampled) on every call, so pass colors ONLY on the
-        # first frame and None after to keep the USD small. (Topology / face
-        # indices are already written once by warp; points must be per-frame.)
-        muscle_path = inner.render_mesh(
-            name="muscle", points=pos_np[muscle_used], indices=muscle_local,
-            colors=(0.8, 0.3, 0.25) if first else None)
-        meter.write_primvars(inner.stage, muscle_path, muscle_used, inner.time,
-                             per_vertex=not no_collide_primvars)
-        if first:
-            _bake_static_primvars(inner.stage, muscle_path, sim, muscle_used)
-        if fascia_flat is not None:
-            fascia_pos = (sim.fascia.pos.numpy() if fascia_sep else pos_np)
-            inner.render_mesh(name="fascia", points=fascia_pos[fascia_used],
-                              indices=fascia_local,
-                              colors=(0.55, 0.75, 0.9) if first else None)
+    # Constant displayColor only needs writing once — warp's render_mesh re-sets it
+    # (time-sampled) on every call, so pass colors ONLY on the first frame and None
+    # after to keep the USD small. (Topology / face indices are already written
+    # once by warp; points must be per-frame.)
+    muscle_path = inner.render_mesh(
+        name="muscle", points=pos_np[muscle_used], indices=muscle_local,
+        colors=(0.8, 0.3, 0.25) if first else None)
+    meter.write_primvars(inner.stage, muscle_path, muscle_used, inner.time,
+                         per_vertex=not no_collide_primvars)
+    if first:
+        _bake_static_primvars(inner.stage, muscle_path, sim, muscle_used)
+    if fascia_flat is not None:
+        fascia_pos = (sim.fascia.pos.numpy() if fascia_sep else pos_np)
+        inner.render_mesh(name="fascia", points=fascia_pos[fascia_used],
+                          indices=fascia_local,
+                          colors=(0.55, 0.75, 0.9) if first else None)
+    if not skip_bones:
         inner.render_mesh(name="bones", points=collider._cur_verts[bone_used],
                           indices=bone_local,
                           colors=(0.9, 0.88, 0.8) if first else None)
@@ -450,38 +394,38 @@ def _render_frame(renderer, frame, sim, collider, compaction, use_layered,
                          pos_np, meter.bone_flag, meter.bone_depth)
 
 
-def _load_bone_verts(bone_dir: Path, frame: int) -> np.ndarray:
-    pos = read_geo_attr_cached(str(bone_dir / f"bone_{frame}.geo"), "P")
-    return np.ascontiguousarray(np.asarray(pos, dtype=np.float32))
-
-
 class AnimatedBoneMeshCollider:
-    """Per-frame SNU-skeleton mesh as a moving rigid collider for the muscle.
+    """Per-frame skeleton mesh as a moving rigid collider for the muscle.
 
     Topology (triangles) is constant across the sequence, so the ``wp.Mesh`` is
     built once and only its ``points`` are refreshed + ``refit()`` each frame.
+    Vertices come from a :class:`BoneSource` (``.geo`` dir or animated USD).
     """
 
-    def __init__(self, sim: MultiGridSim, bone_dir: str,
+    def __init__(self, sim: MultiGridSim, bone_source,
                  max_dist: float = 0.2, contact_offset: float = 0.0,
-                 max_push: float = -1.0):     # <=0 = no deep-contact reject
+                 max_push: float = -1.0,      # <=0 = no deep-contact reject
+                 flip_winding: bool = True):
         self.sim = sim
         self.device = sim._device
-        self.bone_dir = Path(bone_dir)
+        self.source = bone_source
+        self.start_frame = int(sim.start_frame)
         self.max_dist = float(max_dist)
         self.contact_offset = float(contact_offset)
         self.max_push = float(max_push)
 
-        g0 = GeoFile(str(self.bone_dir / "bone_1.geo"))
-        tri = np.asarray(g0.tet_indices, dtype=np.int32)
+        tri = self.source.tris.reshape(-1, 3)
         # SNU bones are wound inward relative to Warp's signed query — without
         # flipping, mesh_query_point_sign_normal reports ~155640/157369 verts
         # "inside" at rest vs the true ~1729. Swap each tri's last two indices.
-        tri = np.ascontiguousarray(tri[:, [0, 2, 1]]).reshape(-1)
-        self.n_bone_verts = int(np.asarray(g0.positions).shape[0])
+        # (USD bones may already wind correctly — toggle via flip_bone_winding.)
+        if flip_winding:
+            tri = tri[:, [0, 2, 1]]
+        tri = np.ascontiguousarray(tri).reshape(-1)
+        self.n_bone_verts = int(self.source.n_verts)
         self.n_bone_tris = int(tri.shape[0] // 3)
 
-        verts0 = _load_bone_verts(self.bone_dir, 1)
+        verts0 = self.source.positions(self.start_frame)
         self.mesh = wp.Mesh(
             points=wp.array(verts0, dtype=wp.vec3, device=self.device),
             indices=wp.array(tri, dtype=wp.int32, device=self.device),
@@ -516,17 +460,17 @@ class AnimatedBoneMeshCollider:
         """Parse every frame's bone pose once and hold it in RAM (see
         OneWaySim.preload_targets — same rationale, lifts JSON parse out of the
         step loop so only the upload + BVH refit remain per frame)."""
-        self._bone_stack = {f: _load_bone_verts(self.bone_dir, f) for f in frames}
+        self._bone_stack = {f: self.source.positions(f) for f in frames}
 
     def set_frame(self, frame: int):
         """Load this frame's bone pose into the mesh and rebuild the BVH."""
         if self._bone_stack is not None and frame in self._bone_stack:
             verts = self._bone_stack[frame]
         else:
-            verts = _load_bone_verts(self.bone_dir, frame)
+            verts = self.source.positions(frame)
         if verts.shape[0] != self.n_bone_verts:
             raise ValueError(
-                f"bone_{frame}.geo has {verts.shape[0]} verts, "
+                f"bone frame {frame} has {verts.shape[0]} verts, "
                 f"expected {self.n_bone_verts} (topology must be constant)")
         self.mesh.points.assign(wp.array(verts, dtype=wp.vec3, device=self.device))
         self.mesh.refit()
@@ -668,13 +612,15 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
       * ``_compact`` trims every prim (muscle / fascia / bones) to ONLY the verts
         its surface tris touch, remapping the tris to local indices; the results
         are packed into the ``compaction`` tuple shared by all the export helpers.
-      * ``_setup_layered_usd`` resolves layered-USD mode (``demo.use_layered_usd``,
-        default OFF): the constant scene data + the full bone animation are
-        written ONCE to the shared ``usd_ref``, so each variant USD only overrides
-        per-frame muscle/fascia points. Returns ``(use_layered, ref_rel)``.
-      * Per frame, ``_render_frame`` authors that frame's meshes — a thin
-        points-only layer over the ``usd_ref`` when layered, else standalone full
-        meshes — plus the optional in-place ``.geo`` dump.
+      * Per frame, ``_render_frame`` authors that frame's full meshes plus the
+        optional in-place ``.geo`` dump.
+
+    Output modes (default = full WarpRenderer bake to ``demo.out``):
+      * ``demo.graft_src``: warp renders ONLY the sim meshes (muscle/fascia, no
+        bones) to a sidecar cache, then ``_graft_sim_into_asset`` copies them onto
+        a self-contained copy of that source asset under ``demo.sim_scope``
+        (default ``/char/sim``). The asset's UsdSkel bones ride a compact skel
+        animation instead of baked per-frame points — the real space saving.
     """
     coll = demo.get("collision", {})
     static_bone = bool(coll.get("static_bone", False))
@@ -684,14 +630,25 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
     out = demo.get("out", "output/humanV2.usd")
     geo_out = demo.get("geo_out")
 
+    # Output mode: full WarpRenderer bake by default; 'graft_src' renders only the
+    # sim meshes to a sidecar cache and grafts them onto a copy of the asset (bones
+    # ride the asset's compact skel anim). Warp always writes to ``sim_out`` (== out
+    # for the full bake, a sidecar cache for graft).
+    graft_src = demo.get("graft_src")
+    sim_scope = demo.get("sim_scope", "/char/sim")
     renderer = None
-    if not no_export:
-        from muscle.engine import WarpRenderer
-        Path(out).parent.mkdir(parents=True, exist_ok=True)
-        renderer = WarpRenderer(mode="usd", stage_path=out)
-        print(f"[render] writing USD to {out}")
-    else:
+    sim_out = out
+    if no_export:
         print("[no_export] pure-sim timing, no USD/geo output")
+    else:
+        from muscle.engine import WarpRenderer
+        if graft_src:
+            sim_out = str(Path(out).with_name(Path(out).stem + ".simcache.usd"))
+        Path(sim_out).parent.mkdir(parents=True, exist_ok=True)
+        renderer = WarpRenderer(mode="usd", stage_path=sim_out)
+        print(f"[render] writing USD to {sim_out}"
+              + (f"  (graft {os.path.basename(graft_src)} -> {out})"
+                 if graft_src else ""))
 
     geo_writer = None
     if geo_out and not no_export:
@@ -724,9 +681,6 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
 
     meter = CollisionMeter(collider, mm_meter, collide_eps, sim.NV)
 
-    use_layered, ref_rel = _setup_layered_usd(
-        demo, renderer, out, sim, collider, fascia_flat, compaction, static_bone)
-
     t0 = time.perf_counter()
     for frame in range(sim.start_frame, sim.end_frame + 1):
         if not static_bone:
@@ -742,15 +696,21 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
         n_inv = sim.count_inverted()   # every frame: feeds the USD primvar + print
 
         if renderer is not None:
-            _render_frame(renderer, frame, sim, collider, compaction, use_layered,
-                          ref_rel, meter, no_collide_primvars, fascia_flat,
-                          geo_writer, geo_out, n_inv)
+            _render_frame(renderer, frame, sim, collider, compaction,
+                          meter, no_collide_primvars, fascia_flat,
+                          geo_writer, geo_out, n_inv, skip_bones=bool(graft_src))
         if frame % 5 == 0 or frame == sim.end_frame:
             elapsed = time.perf_counter() - t0
             print(f"  frame {frame:>3d}  {elapsed:6.1f}s  {meter.summary()}  "
                   f"inverted {n_inv}/{sim.NT} ({n_inv / sim.NT * 100:.2f}%)")
     if renderer is not None:
         renderer.save()
+        if graft_src:
+            names = ["muscle"] + (["fascia"] if fascia_flat is not None else [])
+            _graft_sim_into_asset(out, graft_src, sim_out, sim_scope, names,
+                                  sim.start_frame, sim.end_frame)
+            if os.path.exists(sim_out):
+                os.remove(sim_out)
         print(f"USD saved -> {out}")
 
 
@@ -869,20 +829,22 @@ def main(argv=None):
     coll = demo.get("collision", {}) or {}
     collision_on = bool(coll.get("enabled", True))
     static_bone = bool(coll.get("static_bone", False))
-    # Single source of truth: the top-level bone_dir (also read by the sim for
-    # target_mode='mesh'); the collider/meter reuses it.
-    bone_dir = cfg.get("bone_dir", "data/humanV2/model/bone")
+    # Single source of truth: the top-level bone source (also read by the sim for
+    # target_mode='mesh') — a 'bone_usd' file or a 'bone_dir' of bone_<frame>.geo.
+    bone_source = make_bone_source(cfg, sim.start_frame)
 
     # Always build the bone collider — it is the penetration METER (inside_depth
     # drives the USD primvars) even when collision resolution is disabled.
     collider = AnimatedBoneMeshCollider(
-        sim, bone_dir,
+        sim, bone_source,
         max_dist=float(coll.get("max_dist", 0.2)),
         contact_offset=float(coll.get("contact_offset", 1e-5)),
         # <=0 (default) = push every inside vert out, however deep (resolves the
         # non-collision-free target). >0 re-enables the sign-flip-spike reject
         # at that depth (metres).
-        max_push=float(coll.get("max_push", -1.0)))
+        max_push=float(coll.get("max_push", -1.0)),
+        # SNU .geo bones wind inward -> flip; USD bones may not -> override.
+        flip_winding=bool(coll.get("flip_bone_winding", True)))
     if not static_bone:
         collider.preload(range(sim.start_frame, sim.end_frame + 1))
 
