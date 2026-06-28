@@ -214,7 +214,7 @@ def compare(config_path: str) -> dict:
         gt_env = _peak_norm(gt.activation[:, j])
         rl_env = _peak_norm(rl_cycles[:, j])
         axes[j].plot(grid, gt_env, "k", lw=1.5,
-                     label="real EMG (P8, 1.72m male, 2.5 km/h)")
+                     label="real EMG (Moreira 2021, P8 male 1.72 m, speed V4)")
         axes[j].fill_between(grid, 0, gt_env, color="0.7", alpha=0.4)
         axes[j].plot(grid, rl_env, color="tab:red", lw=1.5, label="rl_mass walk")
         axes[j].set_ylabel(labels.get(emg_k, emg_k), fontsize=8)
@@ -224,8 +224,10 @@ def compare(config_path: str) -> dict:
     axes[-1].set_xlabel("% gait cycle  (0 = right heel strike, Zeni-anchored)")
     fig.suptitle(
         f"rl_mass walk vs sEMG (Moreira 2021) — peak-normalised  "
-        f"mean_r={aggregate['mean_pearson']:.3f}",
-        fontsize=10,
+        f"mean_r={aggregate['mean_pearson']:.3f}\n"
+        f"confound: gait cadence NOT speed-matched (rl_mass walk.bvh vs Moreira V4); "
+        f"shape/timing only, magnitude not comparable",
+        fontsize=9,
     )
     fig.tight_layout()
     plot_path = os.path.join(out_dir, "compare.png")
