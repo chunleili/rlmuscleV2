@@ -41,6 +41,7 @@ from rl_mass.env import MassEnv
 from rl_mass.model import MuscleNN, SimulationNN
 from rl_mass.finger.gt import (
     EMGLoader,
+    EmgCohortLoader,
     anterior_projection,
     detect_heel_strikes,
     fold_cycles,
@@ -83,7 +84,12 @@ def compare(config_path: str) -> dict:
 
     walk_config  = cfg["walk_config"]
     chk_prefix   = cfg["checkpoint"]           # e.g. ".../walk_max"
-    emg_dir      = cfg["emg_dir"]
+    # GT source: a single-subject dir (emg_dir) OR a cohort root with one
+    # Participant* sub-dir per subject (emg_cohort_dir → human variability band).
+    emg_dir      = cfg.get("emg_dir")
+    emg_cohort_dir = cfg.get("emg_cohort_dir")
+    if not (emg_dir or emg_cohort_dir):
+        raise KeyError("config needs 'emg_dir' or 'emg_cohort_dir'")
     muscle_map   = cfg["muscle_map"]           # {EMG_label: SNU_name}
     out_dir      = cfg["out_dir"]
     max_steps    = int(cfg.get("max_steps", 420))
@@ -172,25 +178,47 @@ def compare(config_path: str) -> dict:
     rl_cycles  = fold_cycles(act_cols, strikes, n_points=n_points)  # (101, 4)
 
     # ── EMG ground truth ───────────────────────────────────────────────────────
-    gt = EMGLoader(emg_dir, muscles=emg_labels, n_points=n_points).load()
-    # gt.activation : (101, 4), raw μV
+    if emg_cohort_dir:
+        gt = EmgCohortLoader(emg_cohort_dir, muscles=emg_labels,
+                             n_points=n_points).load()
+        # gt.activation : (101, 4) cohort mean; gt.std : across-subject SD
+    else:
+        gt = EMGLoader(emg_dir, muscles=emg_labels, n_points=n_points).load()
+        # gt.activation : (101, 4) single-subject mean; gt.std is None
 
     # ── Metrics ────────────────────────────────────────────────────────────────
     # timing_lag dt = one gait-cycle percent step
     dt_pct = 100.0 / (n_points - 1)
 
+    has_band = gt.std is not None
     per_muscle: dict[str, dict] = {}
     for j, emg_k in enumerate(emg_labels):
         gt_env = gt.activation[:, j]
         rl_env = rl_cycles[:, j]
-        per_muscle[emg_k] = {
+        entry = {
             "pearson":    pearson_r(gt_env, rl_env),
             "timing_lag": timing_lag(gt_env, rl_env, dt_pct),
         }
+        if has_band:
+            # Compare in peak-normalised shape space (EMG is %MVC, rl_mass is
+            # neural activation — absolute magnitudes are not comparable).
+            # in_band_pct = fraction of the gait cycle where the rl_mass curve
+            # lies within the human mean ± 1 SD across-subject band.
+            peak = float(np.max(gt_env)) or 1.0
+            gt_n = gt_env / peak
+            sd_n = gt.std[:, j] / peak
+            rl_n = _peak_norm(rl_env)
+            lo, hi = gt_n - sd_n, gt_n + sd_n
+            entry["in_band_pct"] = float(np.mean((rl_n >= lo) & (rl_n <= hi)) * 100.0)
+        per_muscle[emg_k] = entry
 
     aggregate = {
         "mean_pearson": float(np.mean([v["pearson"] for v in per_muscle.values()])),
     }
+    if has_band:
+        aggregate["mean_in_band_pct"] = float(
+            np.mean([v["in_band_pct"] for v in per_muscle.values()])
+        )
 
     # ── Outputs ────────────────────────────────────────────────────────────────
     os.makedirs(out_dir, exist_ok=True)
@@ -210,23 +238,42 @@ def compare(config_path: str) -> dict:
     n_musc = len(emg_labels)
     fig, axes = plt.subplots(n_musc, 1, figsize=(8, 2.2 * n_musc), sharex=True)
     axes = np.atleast_1d(axes)
+    gt_label = (
+        "human EMG band (Moreira 2021, 13 subj, V4)" if has_band
+        else "real EMG (Moreira 2021, P8 male 1.72 m, speed V4)"
+    )
     for j, emg_k in enumerate(emg_labels):
-        gt_env = _peak_norm(gt.activation[:, j])
+        peak = float(np.max(gt.activation[:, j])) or 1.0
+        gt_env = gt.activation[:, j] / peak
         rl_env = _peak_norm(rl_cycles[:, j])
-        axes[j].plot(grid, gt_env, "k", lw=1.5,
-                     label="real EMG (Moreira 2021, P8 male 1.72 m, speed V4)")
-        axes[j].fill_between(grid, 0, gt_env, color="0.7", alpha=0.4)
-        axes[j].plot(grid, rl_env, color="tab:red", lw=1.5, label="rl_mass walk")
-        axes[j].set_ylabel(labels.get(emg_k, emg_k), fontsize=8)
+        if has_band:
+            sd_n = gt.std[:, j] / peak
+            axes[j].fill_between(grid, gt_env - sd_n, gt_env + sd_n,
+                                 color="0.6", alpha=0.35,
+                                 label=gt_label if j == 0 else None)
+            axes[j].plot(grid, gt_env, "k", lw=1.2,
+                         label="human mean" if j == 0 else None)
+        else:
+            axes[j].plot(grid, gt_env, "k", lw=1.5, label=gt_label)
+            axes[j].fill_between(grid, 0, gt_env, color="0.7", alpha=0.4)
+        axes[j].plot(grid, rl_env, color="tab:red", lw=1.5,
+                     label="rl_mass walk" if j == 0 else None)
+        ylab = labels.get(emg_k, emg_k)
+        if has_band:
+            ylab += f"\nin-band {per_muscle[emg_k]['in_band_pct']:.0f}%"
+        axes[j].set_ylabel(ylab, fontsize=8)
         axes[j].set_ylim(0, 1.12)
         if j == 0:
             axes[j].legend(fontsize=7, loc="upper right")
     axes[-1].set_xlabel("% gait cycle  (0 = right heel strike, Zeni-anchored)")
+    band_txt = (
+        f"  mean_in_band={aggregate['mean_in_band_pct']:.0f}%" if has_band else ""
+    )
     fig.suptitle(
         f"rl_mass walk vs sEMG (Moreira 2021) — peak-normalised  "
-        f"mean_r={aggregate['mean_pearson']:.3f}\n"
-        f"confound: gait cadence NOT speed-matched (rl_mass walk.bvh vs Moreira V4); "
-        f"shape/timing only, magnitude not comparable",
+        f"mean_r={aggregate['mean_pearson']:.3f}{band_txt}\n"
+        f"cadence matched: walk.bvh 1.10 s vs Moreira V4 1.09 s; "
+        f"shape/timing only, magnitude (%MVC vs activation) not comparable",
         fontsize=9,
     )
     fig.tight_layout()

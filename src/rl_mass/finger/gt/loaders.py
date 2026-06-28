@@ -11,8 +11,9 @@ import numpy as np
 
 class GTSeries(NamedTuple):
     names: list[str]
-    time: np.ndarray        # (T,)
-    activation: np.ndarray  # (T, M)
+    time: np.ndarray            # (T,)
+    activation: np.ndarray      # (T, M) — mean activation/envelope
+    std: Optional[np.ndarray] = None  # (T, M) — across-subject spread, if a cohort
 
 
 class GTLoader(ABC):
@@ -134,4 +135,59 @@ class EMGLoader(GTLoader):
             names=list(self.muscles),
             time=grid,
             activation=activation,
+        )
+
+
+class EmgCohortLoader(GTLoader):
+    """Aggregate Moreira sEMG across participants into a human variability band.
+
+    *root* holds one sub-directory per subject (``Participant*``), each a valid
+    :class:`EMGLoader` directory of ``T*.txt`` envelopes for one (speed, leg).
+    Each subject is reduced to its own mean gait-cycle envelope (over that
+    subject's strides), then the cohort mean and **across-subject** standard
+    deviation are returned — the latter is the human variability band that a
+    learned policy's activations should be judged against.
+
+    Returns:
+        GTSeries whose ``activation`` is the cohort mean ``(n_points, M)`` and
+        whose ``std`` is the across-subject SD ``(n_points, M)``.  Envelopes are
+        in % MVC (Moreira's ``EMGs_env`` unit); not peak-normalised here.
+
+    Raises:
+        ValueError: if *root* has no ``Participant*`` subdirectories.
+    """
+
+    def __init__(
+        self,
+        root: str,
+        muscles: Sequence[str] = ("VL", "BF", "TA", "GAL"),
+        n_points: int = 101,
+    ):
+        self.root = root
+        self.muscles = list(muscles)
+        self.n_points = n_points
+
+    def load(self) -> GTSeries:
+        subj_dirs = sorted(
+            d for d in _glob.glob(f"{self.root}/*")
+            if _glob.os.path.isdir(d)
+            and _glob.glob(f"{d}/T*.txt")
+        )
+        if not subj_dirs:
+            raise ValueError(
+                f"EmgCohortLoader: no subject sub-dirs with T*.txt under "
+                f"'{self.root}'"
+            )
+
+        per_subject = np.array([
+            EMGLoader(d, self.muscles, self.n_points).load().activation
+            for d in subj_dirs
+        ])  # (S, n_points, M)
+
+        grid = np.linspace(0, 100, self.n_points)
+        return GTSeries(
+            names=list(self.muscles),
+            time=grid,
+            activation=per_subject.mean(axis=0),
+            std=per_subject.std(axis=0),
         )
