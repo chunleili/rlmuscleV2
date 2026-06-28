@@ -2,8 +2,9 @@
 GTSeries shape; each GT source (OpenSim now, EMG later) is one GTLoader."""
 from __future__ import annotations
 
+import glob as _glob
 from abc import ABC, abstractmethod
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Sequence
 
 import numpy as np
 
@@ -52,3 +53,85 @@ class OpenSimStoLoader(GTLoader):
                 f"GT columns not found: {missing}. Available: {available}")
         idx = [header.index(c) for c in cols]
         return GTSeries(names=list(cols), time=time, activation=mat[:, idx])
+
+
+class EMGLoader(GTLoader):
+    """Load Moreira-2021-style sEMG envelope files into a GTSeries.
+
+    Each ``T*.txt`` file under *emg_dir* contains a tab-separated header row
+    followed by ~1001 rows (one full gait cycle, 0→100%).  The header has the
+    form ``St1_VL St2_VL St1_BF St2_BF St1_TA St2_TA St1_GAL St2_GAL``
+    (stride × muscle).  Every column whose suffix matches a requested muscle
+    name is treated as one independent stride envelope.
+
+    Returns:
+        GTSeries with:
+          - ``names``: list of the requested muscle labels (e.g. ``["VL","BF","TA","GAL"]``)
+          - ``time``:  ``np.linspace(0, 100, n_points)``  (% gait cycle)
+          - ``activation``: ``(n_points, len(muscles))`` mean envelope in raw μV.
+            Do **not** peak-normalise here — callers that need shape comparison
+            can normalise themselves.
+
+    Raises:
+        ValueError: if *emg_dir* contains no ``T*.txt`` files, or if any
+            requested muscle name is absent from all file headers.
+    """
+
+    def __init__(
+        self,
+        emg_dir: str,
+        muscles: Sequence[str] = ("VL", "BF", "TA", "GAL"),
+        n_points: int = 101,
+    ):
+        self.emg_dir = emg_dir
+        self.muscles = list(muscles)
+        self.n_points = n_points
+
+    def load(self) -> GTSeries:
+        files = sorted(_glob.glob(f"{self.emg_dir}/T*.txt"))
+        if not files:
+            raise ValueError(
+                f"EMGLoader: no T*.txt files found in '{self.emg_dir}'"
+            )
+
+        grid = np.linspace(0, 100, self.n_points)
+
+        # Accumulate stride envelopes per requested muscle
+        acc: dict[str, list[np.ndarray]] = {m: [] for m in self.muscles}
+        found: set[str] = set()
+
+        for fpath in files:
+            with open(fpath) as fh:
+                hdr = fh.readline().split()
+            data = np.loadtxt(fpath, skiprows=1)
+
+            for j, col in enumerate(hdr):
+                parts = col.split("_", 1)
+                if len(parts) != 2:
+                    continue
+                _stride_tag, muscle = parts
+                if muscle not in acc:
+                    continue
+                found.add(muscle)
+                # Resample this stride to n_points over 0–100%
+                x = np.linspace(0, 100, len(data))
+                acc[muscle].append(np.interp(grid, x, data[:, j]))
+
+        missing = [m for m in self.muscles if m not in found]
+        if missing:
+            raise ValueError(
+                f"EMGLoader: muscle(s) {missing} not found in headers of "
+                f"'{self.emg_dir}/T*.txt'. "
+                f"Available suffixes: {sorted(found)}"
+            )
+
+        # Mean over all strides (n_trials × n_strides_per_trial)
+        activation = np.column_stack(
+            [np.mean(acc[m], axis=0) for m in self.muscles]
+        )  # (n_points, M)
+
+        return GTSeries(
+            names=list(self.muscles),
+            time=grid,
+            activation=activation,
+        )
