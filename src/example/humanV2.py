@@ -549,6 +549,10 @@ def build_humanV2_sim(cfg, demo):
         fascia_flat = vectorized_surface_tris(fascia_tets).reshape(-1).astype(np.int32)
         print(f"fascia (merged): {muscle_tets.shape[0]} muscle tets, "
               f"{fascia_tets.shape[0]} fascia tets ({sim.NV - nvm} fascia verts)")
+    elif getattr(sim, "surface_tris_np", None) is not None:
+        surf_flat = np.asarray(sim.surface_tris_np, dtype=np.int32).reshape(-1)
+        fascia_flat = None
+        print(f"muscle surface: authored {surf_flat.shape[0] // 3} tris")
     else:
         surf_flat = vectorized_surface_tris(tets).reshape(-1).astype(np.int32)
         fascia_flat = None
@@ -556,8 +560,12 @@ def build_humanV2_sim(cfg, demo):
     # Separate Fascia sub-solver: its surface tris index fascia.pos (0..fascia.NV),
     # NOT the muscle pos array. The run loop renders it from sim.fascia.pos.
     if getattr(sim, "fascia", None) is not None:
-        fascia_flat = vectorized_surface_tris(
-            np.asarray(sim.fascia.tet_np, dtype=np.int64)).reshape(-1).astype(np.int32)
+        if getattr(sim.fascia, "surface_tris_np", None) is not None:
+            fascia_flat = np.asarray(sim.fascia.surface_tris_np,
+                                     dtype=np.int32).reshape(-1)
+        else:
+            fascia_flat = vectorized_surface_tris(
+                np.asarray(sim.fascia.tet_np, dtype=np.int64)).reshape(-1).astype(np.int32)
         print(f"fascia (separate sub-solver): {sim.fascia.NT} tets, "
               f"{sim.fascia.NV} verts")
     return sim, surf_flat, fascia_flat

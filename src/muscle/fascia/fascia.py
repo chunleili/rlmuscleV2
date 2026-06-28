@@ -29,6 +29,17 @@ from muscle.util.util import _check_unzipped
 from muscle.util.geo_io import GeoFile
 
 
+def _load_rest(path, prim_root=None, prim_path=None, local_space=False, scale=1.0):
+    """GeoFile for ``.geo``; UsdTetRest (merge prim_root / single prim_path,
+    optional local-space) for USD. Same dispatch the parent muscle uses."""
+    if str(path).lower().endswith((".usd", ".usda", ".usdc", ".usdz")):
+        from muscle.util.mesh_io import UsdTetRest
+        return UsdTetRest(path, prim_path=prim_path, prim_root=prim_root,
+                          local_space=bool(local_space), scale=float(scale))
+    _check_unzipped(path)
+    return GeoFile(path)
+
+
 # ─── Cross-array coupling kernels (fascia <-> muscle) ───────────────────────
 
 @wp.kernel
@@ -206,10 +217,19 @@ class Fascia(MuscleSim):
         self._volume_damp = float(p.fascia_volume_damp)
         self._arap_damp = float(p.fascia_arap_damp)
 
-        _check_unzipped(p.fascia_path)
-        fg = GeoFile(p.fascia_path)
+        # Fascia shell mesh (our "fascia" == the asset's TISSUE TetMesh). USD
+        # assets read via fascia_prim_root/path + usd_local_space; .geo via GeoFile.
+        fg = _load_rest(p.fascia_path,
+                        prim_root=cfg.get("fascia_prim_root"),
+                        prim_path=cfg.get("fascia_prim_path"),
+                        local_space=bool(cfg.get("usd_local_space", False)),
+                        scale=float(cfg.get("asset_scale", 1.0)))
         self.pos0_np = fg.positions.astype(np.float32)
         self.tet_np = np.asarray(fg.tet_indices, dtype=np.int64)
+        # Authored boundary tris for this shell (USD), else recomputed from tets.
+        self.surface_tris_np = (np.asarray(fg.surface_tris, dtype=np.int64)
+                                if getattr(fg, "surface_tris", None) is not None
+                                else None)
         self.n_verts = int(self.pos0_np.shape[0])
         self.NV = self.n_verts
         self.NT = int(self.tet_np.shape[0])
@@ -308,14 +328,19 @@ class Fascia(MuscleSim):
         log = logging.getLogger(__name__)
         device = self._device
 
-        mrest = GeoFile(p.rest_path)
-        rest_muscle_pos = mrest.positions
+        # Muscle rest + surface come from the PARENT (already loaded; works for
+        # .geo and USD — no re-read, no GeoFile-on-USD breakage).
+        rest_muscle_pos = p.pos0_np
+        surf_verts = p.surface_verts_np
+        if surf_verts is None:
+            raise ValueError("fascia squeeze needs muscle surface verts "
+                             "(surface_points group or USD surfaceFaceVertexIndices)")
         fascia_pos = self.pos0_np
         nvm = rest_muscle_pos.shape[0]
 
         glue_scale = float(p.fascia_glue_scale)
         glue_fascia, glue_muscle, glue_restlen, glue_stiff = self._pair_surface(
-            fg, fascia_pos, mrest, rest_muscle_pos, glue_scale)
+            fg, fascia_pos, surf_verts, rest_muscle_pos, glue_scale)
 
         # Bone follow: every fascia vert rides the SKELETON, not the muscle it
         # squeezes. The parent is fully pinned (pts == all NV), so target_pos is a
@@ -368,10 +393,13 @@ class Fascia(MuscleSim):
         # subsample as fallback) hard-snapped to bone each substep. anchor_offset
         # holds fascia_rest - bone_rest so the snap preserves the shell's offset
         # from the skeleton, not collapse onto the muscle surface.
-        if "rigid" in fg._groups:
+        has_rigid = (fg.has_point_group("rigid") if hasattr(fg, "has_point_group")
+                     else "rigid" in getattr(fg, "_groups", {}))
+        if has_rigid:
             rid = fg.point_group("rigid").astype(np.int64)
         else:
-            step = max(1, fascia_pos.shape[0] // 256)
+            n_anc = max(1, int(getattr(p, "fascia_anchor_count", 256)))
+            step = max(1, fascia_pos.shape[0] // n_anc)
             rid = np.arange(0, fascia_pos.shape[0], step, dtype=np.int64)
         self.n_anchor = int(rid.shape[0])
         self.anchor_local = wp.array(rid.astype(np.int32), dtype=wp.int32, device=device)
@@ -379,12 +407,14 @@ class Fascia(MuscleSim):
         anchor_off = (fascia_pos[rid] - bone_rest[rid]).astype(np.float32)
         self.anchor_offset = wp.array(anchor_off, dtype=wp.vec3, device=device)
         log.info(f"fascia: {self.n_anchor} bone-anchor BCs "
-                 f"({'rigid group' if 'rigid' in fg._groups else 'subsample'})")
+                 f"({'rigid group' if has_rigid else 'subsample'}, "
+                 f"target count={getattr(p, 'fascia_anchor_count', 256)})")
 
-    def _pair_surface(self, fg, fascia_pos, mrest, rest_muscle_pos, glue_scale):
+    def _pair_surface(self, fg, fascia_pos, surf, rest_muscle_pos, glue_scale):
         """Full-surface glue mode: pair each muscle surface vert to its nearest
-        fascia vert (un-dilutes the global squeeze metric). Returns LOCAL fascia
-        ids + GLOBAL muscle ids + restlen + scaled stiffness.
+        fascia vert (un-dilutes the global squeeze metric). ``surf`` = muscle
+        surface vert ids. Returns LOCAL fascia ids + GLOBAL muscle ids + restlen
+        + scaled stiffness.
 
         Rest length IS the rest distance — the glue is a plain attachment that
         holds each fascia/muscle pair at the gap they start with. ALL squeeze
@@ -394,7 +424,6 @@ class Fascia(MuscleSim):
         fascia vert where the shell is sparse (the old ``min(want, d)`` slammed
         every pair toward ~2mm regardless of gap and flung such verts ~1m)."""
         p = self.parent
-        surf = mrest.point_group("surface_points")
         fascia_tree = cKDTree(fascia_pos)
         d, floc = fascia_tree.query(rest_muscle_pos[surf], k=1)
 
@@ -422,10 +451,13 @@ class Fascia(MuscleSim):
         device = self._device
         log = logging.getLogger(__name__)
 
-        # Muscle boundary triangles (topology fixed) + a resident mesh seeded at
-        # the muscle REST pose for the one-time closest-point bind.
-        msurf = vectorized_surface_tris(np.asarray(p.tet_np, dtype=np.int64))
-        mrest = GeoFile(p.rest_path).positions.astype(np.float32)
+        # Muscle boundary triangles (authored surface when present, else recomputed
+        # from tet topology) + a resident mesh seeded at the muscle REST pose
+        # (parent.pos0_np) for the one-time closest-point bind.
+        msurf = (np.asarray(p.surface_tris_np, dtype=np.int64).reshape(-1, 3)
+                 if getattr(p, "surface_tris_np", None) is not None
+                 else vectorized_surface_tris(np.asarray(p.tet_np, dtype=np.int64)))
+        mrest = p.pos0_np.astype(np.float32)
         self._msurf_tris = wp.array(msurf.reshape(-1).astype(np.int32),
                                     dtype=wp.int32, device=device)
         self._msurf_points = wp.array(mrest, dtype=wp.vec3, device=device)
