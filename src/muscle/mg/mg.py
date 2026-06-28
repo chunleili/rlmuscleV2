@@ -29,6 +29,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 from muscle.musclesim import MuscleSim
 from muscle.defs import ConstraintType
@@ -112,6 +113,14 @@ class MultiGridSim(MuscleSim):
         self.fascia_glue_stiffness = _f_glue.get("stiffness", None)
         self.fascia_glue_damp = float(_f_glue.get("dampingratio", 0.0))
         self.fascia_glue_iters = int(_f_glue.get("iterations", self.fine_iters))
+        # fascia_anchor -> how many fascia verts are hard-snapped to the bone each
+        # substep (the shell's Dirichlet BC / bone binding). `count` is the target
+        # number of anchors when the asset has no authored "rigid" group; more
+        # anchors == the shell is held more rigidly to the bone rest shape (less
+        # free shrink), so it binds tighter to the skeleton and drags the muscle
+        # belly off the bone less. Default 256 (the historical subsample).
+        _f_anchor = find_constraint(cfg, "fascia_anchor") or {}
+        self.fascia_anchor_count = int(_f_anchor.get("count", 256))
         # Fascia coupling mode (Phase-1 Han-style redesign):
         #   "squeeze" -> legacy: bone-anchored shrunk-ARAP shell + one-way glue
         #                drags the muscle belly inward (the active squeeze; this
@@ -183,12 +192,26 @@ class MultiGridSim(MuscleSim):
         if str(self.rest_path).lower().endswith((".usd", ".usda", ".usdc", ".usdz")):
             from muscle.util.mesh_io import UsdTetRest
             rest = UsdTetRest(self.rest_path,        # USD TetMesh muscle asset
+                              prim_path=cfg.get("muscle_prim_path"),
+                              prim_root=cfg.get("muscle_prim_root"),
+                              local_space=bool(cfg.get("usd_local_space", False)),
                               scale=float(cfg.get("asset_scale", 1.0)))
         else:
             _check_unzipped(self.rest_path)
             rest = GeoFile(self.rest_path)
         self.NV = self.n_verts = int(rest.positions.shape[0])
         self.NT = int(rest.tet_indices.shape[0])
+        # Authored boundary tris (USD only) for rendering + fascia bind; None -> the
+        # example recomputes them from tet topology. Surface verts come from the
+        # 'surface_points' group (GeoFile authored, or USD unique-of-surface-tris).
+        self.surface_tris_np = (rest.surface_tris
+                                if hasattr(rest, "surface_tris") else None)
+        try:
+            self.surface_verts_np = np.asarray(rest.point_group("surface_points"),
+                                               dtype=np.int64)
+        except Exception:
+            self.surface_verts_np = (np.unique(self.surface_tris_np).astype(np.int64)
+                                     if self.surface_tris_np is not None else None)
 
         # Time-invariant per-vertex muscle attributes, cached for USD baking
         # (materialW = fiber direction, tendonmask, optional Cd) and named-muscle
@@ -203,6 +226,10 @@ class MultiGridSim(MuscleSim):
                              if rest.has_prim_attr("muscle_id") else None)
         self.muscle_id_strings = (rest.prim_attr_strings("muscle_id")
                                   if rest.has_prim_attr("muscle_id") else [])
+        # Per-vertex muscle id (authored muscle_id scattered to verts; USD merge
+        # only). Drives the muscle-to-muscle glue cross-muscle pairing.
+        self.vert_muscle_id_np = (np.asarray(rest.vert_muscle_id, dtype=np.int64)
+                                  if hasattr(rest, "vert_muscle_id") else None)
 
         # ── SoA constraint pipeline (inherited from MuscleSim / XpbdEngine) ──
         # The HPBD per-tet state (pos_mid, B, alpha, L, inv_mass, vol_*, fiber_*)
@@ -315,9 +342,8 @@ class MultiGridSim(MuscleSim):
             self.target_pos = wp.array(cons0.target_pos.copy(), dtype=wp.vec3, device=device)
         self.pin_active = None  # rebuilt by Fascia (glue-ring free) when fascia is active
 
-        # Belly-attach constraint config (the freed-belly pin system). It carries
-        # both the compliant attach stiffness / dampingratio AND tendon_pin_threshold
-        # (the hard-tendon vs freed-belly split is a property of this pin mode).
+        # Belly-attach constraint config (the compliant pin for the FREED verts —
+        # those not hard-pinned to bone). Stiffness / dampingratio only.
         _belly = find_constraint(cfg, "belly_attach")
         if _belly is None:
             raise ValueError("constraints[] must define a 'belly_attach' entry "
@@ -325,26 +351,64 @@ class MultiGridSim(MuscleSim):
         self.pin_attach_stiffness = float(_belly["stiffness"])
         self.pin_attach_damp = float(_belly.get("dampingratio", 0.0))
 
-        # Partial pinning (REQUIRED). Fully hard-pinning every vert (pts == all NV,
-        # targets self-overlap) forces the belly through neighbouring muscles with
-        # no collision give. Instead: verts whose tendonmask exceeds
-        # tendon_pin_threshold (the tendon attachment regions) stay HARD-pinned; the
-        # belly is freed and driven by the compliant belly-attach below. Fascia
-        # rebuilds pin_active from its own glue ring later.
-        self.tendon_pin_threshold = _belly.get("tendon_pin_threshold", None)
-        if self.tendon_pin_threshold is None:
-            raise ValueError("belly_attach constraint must define "
-                             "tendon_pin_threshold (the hard tendon vs freed-belly "
-                             "split)")
-        tmask = rest.point_attr("tendonmask").astype(np.float32)
-        active = (tmask[self._pin_pts_np]
-                  > float(self.tendon_pin_threshold)).astype(np.int32)
+        # Muscle-to-bone HARD pin set (REQUIRED, type 'pin'). `region` selects WHICH
+        # muscle verts are hard-pinned to their bone target (pin_active==1); the rest
+        # are freed and driven by the compliant belly-attach above. Fascia rebuilds
+        # pin_active from its own glue ring later.
+        #   region="tendonmask": pin only the tendon attachment regions — verts whose
+        #       tendonmask exceeds tendon_pin_threshold. Hard-pinning EVERY vert
+        #       forces the belly through neighbours with no collision give, so this
+        #       partial set is the physically sane default.
+        #   region="pinmask": pin verts whose authored 'pinmask' primvar exceeds
+        #       pin_threshold (the asset-authored attach set; otto carries it). If
+        #       the rest has no 'pinmask' attr (e.g. the .geo asset), fall back to
+        #       NO hard pins — every vert rides the compliant belly-attach.
+        #   region="full": pin every vert hard (no freed belly). Diagnostic.
+        _pin = find_constraint(cfg, "muscleToBonePin")
+        if _pin is None:
+            raise ValueError("constraints[] must define a 'muscleToBonePin' entry "
+                             "(type 'pin'; region: full | tendonmask | pinmask)")
+        region = str(_pin.get("region", "tendonmask")).lower()
+        n_tot = len(self._pin_pts_np)
+        self.tendon_pin_threshold = None
+        if region == "full":
+            active = np.ones(n_tot, dtype=np.int32)
+            print(f"[muscle-bone-pin] region=full: {n_tot}/{n_tot} hard pins "
+                  f"(100% pinned, no belly-attach)")
+        elif region in ("tendonmask", "pinmask"):
+            # tendonmask uses tendon_pin_threshold; pinmask uses pin_threshold
+            # (default 0.5 for the 0/1 authored mask).
+            attr = region
+            thr = (_pin.get("tendon_pin_threshold") if region == "tendonmask"
+                   else _pin.get("pin_threshold", 0.5))
+            if thr is None:
+                raise ValueError(f"muscleToBonePin region='{region}' requires "
+                                 f"{'tendon_pin_threshold' if region == 'tendonmask' else 'pin_threshold'}")
+            thr = float(thr)
+            if region == "tendonmask":
+                self.tendon_pin_threshold = thr
+            if not rest.has_point_attr(attr):
+                if region == "pinmask":
+                    # No authored pinmask (e.g. the .geo rest) -> no hard pins;
+                    # every vert falls back to the compliant belly-attach.
+                    active = np.zeros(n_tot, dtype=np.int32)
+                    print(f"[muscle-bone-pin] region=pinmask: rest has no "
+                          f"'pinmask' attr -> 0/{n_tot} hard pins "
+                          f"(all belly-attach)")
+                else:
+                    raise ValueError(f"muscleToBonePin region='{region}' needs a "
+                                     f"'{attr}' point attr on the rest asset")
+            else:
+                mask = rest.point_attr(attr).astype(np.float32)
+                active = (mask[self._pin_pts_np] > thr).astype(np.int32)
+                n_pin = int(active.sum())
+                print(f"[muscle-bone-pin] region={region}>{thr}: "
+                      f"{n_pin}/{n_tot} hard pins ({n_pin / n_tot * 100:.1f}% pinned, "
+                      f"{(n_tot - n_pin) / n_tot * 100:.1f}% belly-attach)")
+        else:
+            raise ValueError(f"muscleToBonePin 'region' must be 'full', "
+                             f"'tendonmask' or 'pinmask', got {region!r}")
         self.pin_active = wp.array(active, dtype=wp.int32, device=device)
-        n_pin = int(active.sum())
-        n_tot = len(active)
-        print(f"[partial-pin] tendonmask>{self.tendon_pin_threshold}: "
-              f"{n_pin}/{n_tot} hard pins ({n_pin / n_tot * 100:.1f}% pinned tendon, "
-              f"{(n_tot - n_pin) / n_tot * 100:.1f}% belly-attach)")
 
         # Belly attach: the freed belly (pin_active==0) is tied to its bone target
         # by a compliant XPBD point constraint solved in the iteration loop
@@ -373,12 +437,110 @@ class MultiGridSim(MuscleSim):
             from muscle.fascia.fascia import Fascia
             self.fascia = Fascia(self)
 
+        # Muscle-to-muscle glue: rest-state nearest-neighbour springs binding
+        # adjacent (different-muscle) verts so neighbouring muscles slide together
+        # instead of separating. Built from the authored 'muscletomuscleglue' mask.
+        self._build_m2m_glue(rest, self._device)
+
         # Fine belly-attach (built last so pin_active reflects tendon_pin / fascia):
         # each freed belly vert gets a compliant ATTACH toward its per-frame bone
         # target, appended to the SoA constraint table + refreshed each frame.
         self._build_fine_belly_attach()
         self._update_belly_attach_targets()
 
+
+    # ------------------------------------------------------------------
+
+    def _build_m2m_glue(self, rest, device):
+        """Build cross-muscle glue springs by rest-state nearest-neighbour search.
+
+        For every vertex flagged in the authored ``muscletomuscleglue`` mask, find
+        its nearest neighbour that belongs to a DIFFERENT muscle (per-vertex
+        ``muscle_id``) within the search radius, and emit one two-way XPBD distance
+        spring holding that pair at its rest gap. Pairs are de-duplicated. Stiffness
+        / radius come from the authored per-vertex primvars unless the config entry
+        overrides them. No-op when the ``muscleToMuscleGlue`` constraint is absent.
+        """
+        self.n_m2m = 0
+        _g = find_constraint(self.cfg, "muscleToMuscleGlue")
+        if _g is None:
+            return
+        if self.vert_muscle_id_np is None:
+            raise ValueError("muscleToMuscleGlue needs per-vertex muscle id "
+                             "(USD asset with authored muscle_id)")
+        if not rest.has_point_attr("muscletomuscleglue"):
+            raise ValueError("muscleToMuscleGlue needs a 'muscletomuscleglue' "
+                             "point attr (the per-vertex enable mask)")
+        mask = rest.point_attr("muscletomuscleglue").astype(np.float32)
+        thr = float(_g.get("mask_threshold", 0.5))
+        cand = np.where(mask > thr)[0].astype(np.int64)        # participating verts
+        if cand.shape[0] < 2:
+            print(f"[m2m-glue] mask has {cand.shape[0]} verts -> 0 pairs")
+            return
+
+        # Search radius: config 'distance' (>0) overrides authored mean.
+        cfg_dist = float(_g.get("distance", -1.0))
+        if cfg_dist > 0.0:
+            radius = cfg_dist
+        elif rest.has_point_attr("muscletomusclegluedistance"):
+            radius = float(rest.point_attr("muscletomusclegluedistance").mean())
+        else:
+            radius = 0.01
+
+        pos = self.pos0_np
+        cpos = pos[cand]
+        cmid = self.vert_muscle_id_np[cand]
+        K = int(_g.get("knn", 8))
+        tree = cKDTree(cpos)
+        dists, idxs = tree.query(cpos, k=min(K + 1, cand.shape[0]))
+        dists = np.atleast_2d(dists); idxs = np.atleast_2d(idxs)
+        seen = set()
+        A: list[int] = []
+        B: list[int] = []
+        for i in range(cand.shape[0]):
+            for jl, dd in zip(idxs[i][1:], dists[i][1:]):   # skip self (col 0)
+                if dd > radius:
+                    break
+                if cmid[i] == cmid[jl]:
+                    continue
+                a, b = int(cand[i]), int(cand[jl])
+                key = (a, b) if a < b else (b, a)
+                if key in seen:
+                    break
+                seen.add(key); A.append(key[0]); B.append(key[1])
+                break                                       # one pair per vert
+        if not A:
+            print(f"[m2m-glue] mask {cand.shape[0]} verts, r={radius:.3g}m "
+                  f"-> 0 cross-muscle pairs")
+            return
+
+        A = np.asarray(A, np.int32); B = np.asarray(B, np.int32)
+        restlen = np.linalg.norm(pos[A] - pos[B], axis=1).astype(np.float32)
+        base_stiff = (float(_g["stiffness"]) if _g.get("stiffness") is not None
+                      else (float(rest.point_attr("muscletomusclegluestiffness").mean())
+                            if rest.has_point_attr("muscletomusclegluestiffness")
+                            else 1.0e4))
+        stiff = max(base_stiff * float(_g.get("stiffness_scale", 1.0)), 1.0e-30)
+
+        self.n_m2m = int(A.shape[0])
+        self.m2m_a = wp.array(A, dtype=wp.int32, device=device)
+        self.m2m_b = wp.array(B, dtype=wp.int32, device=device)
+        self.m2m_restlen = wp.array(restlen, dtype=wp.float32, device=device)
+        self.m2m_compliance = wp.array(
+            np.full(self.n_m2m, 1.0 / stiff, np.float32), dtype=wp.float32, device=device)
+        self.m2m_L = wp.zeros(self.n_m2m, dtype=wp.float32, device=device)
+        print(f"[m2m-glue] {self.n_m2m} cross-muscle pairs "
+              f"(mask {cand.shape[0]} verts, r={radius:.3g}m, stiff={stiff:.3g})")
+
+    def _solve_m2m_glue(self):
+        if not getattr(self, "n_m2m", 0):
+            return
+        self.m2m_L.zero_()
+        wp.launch(solve_m2m_glue_kernel, dim=self.n_m2m,
+                  inputs=[self.m2m_a, self.m2m_b, self.m2m_restlen,
+                          self.m2m_compliance, self.mass, self.stopped,
+                          self.m2m_L, self.dt, self.omega, self.pos],
+                  device=self._device)
 
     # ------------------------------------------------------------------
 
@@ -562,10 +724,12 @@ class MultiGridSim(MuscleSim):
                                dtype=wp.vec3, device=device)
         self._anchor_face = wp.zeros(self.NV, dtype=wp.int32, device=device)
         self._anchor_uv = wp.zeros(self.NV, dtype=wp.vec2, device=device)
-        self._slide_gap = wp.zeros(self.NV, dtype=wp.float32, device=device)
+        # Full rest offset (rest - cp) in the bound face frame; reconstructs
+        # rest_pos exactly on the start-frame bone (pin = identity, no yank).
+        self._local_offset = wp.zeros(self.NV, dtype=wp.vec3, device=device)
         wp.launch(bone_bind_kernel, dim=self.NV,
                   inputs=[self._bone_mesh.id, rest_pos_wp, self._slide_max_dist,
-                          self._anchor_face, self._anchor_uv, self._slide_gap],
+                          self._anchor_face, self._anchor_uv, self._local_offset],
                   device=device)
         # Current (mutable) binding starts at the anchor.
         self._bind_face = wp.clone(self._anchor_face)
@@ -575,7 +739,7 @@ class MultiGridSim(MuscleSim):
         # Initialise target on the start-frame bone (follow only, no slide).
         wp.launch(bone_slide_target_kernel, dim=self.NV,
                   inputs=[self._bone_mesh.id, self.pos, self._anchor_face, self._anchor_uv,
-                          self._bind_face, self._bind_uv, self._slide_gap,
+                          self._bind_face, self._bind_uv, self._local_offset,
                           self.slide_range, 0, self._slide_max_dist, self.target_pos],
                   device=device)
         print(f"[bone-slide] bound {self.NV} muscle verts to bone surface "
@@ -593,7 +757,7 @@ class MultiGridSim(MuscleSim):
                           (frame - self.start_frame) % max(1, self.slide_interval) == 0) else 0
         wp.launch(bone_slide_target_kernel, dim=self.NV,
                   inputs=[self._bone_mesh.id, self.pos, self._anchor_face, self._anchor_uv,
-                          self._bind_face, self._bind_uv, self._slide_gap,
+                          self._bind_face, self._bind_uv, self._local_offset,
                           self.slide_range, reproject, self._slide_max_dist, self.target_pos],
                   device=self._device)
         self._update_belly_attach_targets()
@@ -722,6 +886,9 @@ class MultiGridSim(MuscleSim):
                 s.solve_constraints(run_extras=False)
                 if s.use_jacobi:
                     s.apply_dP()
+                # Muscle-to-muscle glue (two-way distance springs between adjacent
+                # muscles); pinned verts are kinematic so it only pulls free belly.
+                s._solve_m2m_glue()
                 s.apply_pintotarget()
                 # Per-iteration collision hook (UDCF DCD): interleaves contact
                 # resolution with ARAP/volume the way the reference PBD loop
