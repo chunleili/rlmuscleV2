@@ -74,7 +74,7 @@ def plot(csv_path: str, out_path: str):
             ax.legend(fontsize=8, loc="upper right", ncol=1, frameon=False)
     axes[-1].set_xlabel("% gait cycle (0 = right heel strike)")
     fig.tight_layout()
-    fig.savefig(out_path, dpi=120)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {out_path}  ({len(muscles)} muscles, cohort={cohort})")
 
