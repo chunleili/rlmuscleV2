@@ -61,17 +61,17 @@ def plot(csv_path: str, out_path: str):
             mean_n = mean / peak
             sd_n = col[f"{m}_human_std"] / peak
             ax.fill_between(t, mean_n - sd_n, mean_n + sd_n, color="0.6",
-                            alpha=0.35, label="± 1 std")
-            ax.plot(t, mean_n, "k", lw=1.2, label="Moreira 2021")
+                            alpha=0.35, label="EMG std (Moreira 2021, 13 subj)")
+            ax.plot(t, mean_n, "k", lw=1.2, label="EMG mean (Moreira 2021)")
         else:
             human = _norm(col[f"{m}_human"])
-            ax.plot(t, human, "k", lw=1.5, label="Moreira 2021")
+            ax.plot(t, human, "k", lw=1.5, label="EMG mean (Moreira 2021)")
             ax.fill_between(t, 0, human, color="0.7", alpha=0.4)
-        ax.plot(t, rl, color="tab:red", lw=1.5, label="ours")
+        ax.plot(t, rl, color="tab:red", lw=1.5, label="Ours")
         ax.set_ylabel(LABELS.get(m, m), fontsize=9)
         ax.set_ylim(0, 1.12)
         if i == 0:
-            ax.legend(fontsize=8, loc="upper right", ncol=3, frameon=False)
+            ax.legend(fontsize=8, loc="upper right", ncol=1, frameon=False)
     axes[-1].set_xlabel("% gait cycle (0 = right heel strike)")
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
