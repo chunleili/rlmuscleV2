@@ -111,6 +111,32 @@ def pintotarget_overwrite_masked_kernel(
     pos[pts[i]] = target_pos[i] + rest_offset[i]
 
 
+@wp.kernel
+def presubframe_pintotarget_kernel(
+    pts: wp.array(dtype=wp.int32),
+    target_pos: wp.array(dtype=wp.vec3),
+    rest_offset: wp.array(dtype=wp.vec3),
+    beta: wp.float32,                     # 1 = snap to target, <1 = partial follow
+    pos: wp.array(dtype=wp.vec3),
+):
+    """Kinematic skinning PRESTEP: blend EVERY muscle vert toward its bone target
+    BEFORE the XPBD iteration. The bone target rides the skeleton (= the muscle's
+    'skinned' position, verified ~rest-gap from bone every frame), so presetting it
+    here removes the slow XPBD belly-attach convergence that otherwise leaves the
+    belly lagging the bone by hundreds of mm under fast motion (Jacobi propagates
+    one ring/iter; 200 iters can't catch a fast walk). XPBD then applies fiber
+    bulge / collision / ARAP as LOCAL secondary deformation off this skinned base.
+
+    Runs over ALL verts (not just freed belly): hard-pinned verts are already at
+    target from apply_pintotarget, so blending them toward the same target is a
+    no-op, and their kinematic lock (wi=0) is unaffected — this keeps the prestep
+    correct even when there is NO pin mask (every vert is belly)."""
+    i = wp.tid()
+    v = pts[i]
+    tgt = target_pos[i] + rest_offset[i]
+    pos[v] = pos[v] + beta * (tgt - pos[v])
+
+
 # ── Bone-surface target (target_mode="mesh", use_sliding gates re-projection) ─
 # Each muscle vert binds to its nearest point on the bone SURFACE mesh. The
 # binding (face + barycentric uv) may re-project ("slide") tangentially as the

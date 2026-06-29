@@ -44,7 +44,7 @@
     ],
 
     "demo": {
-        "out": "output/otto/otto_m2m.usd",
+        "out": "output/otto/otto.usd",
         "graft_src": "data/humanV2/model/otto.usd",
         "sim_scope": "/char/sim",
         "device": "cuda:0",

@@ -32,10 +32,23 @@ from muscle.util.geo_io import GeoFile, read_geo_attr_cached
 from muscle.util.util import _check_unzipped
 
 
-def _require_tris(counts, prim) -> None:
-    if not np.all(np.asarray(counts, dtype=np.int32) == 3):
-        raise ValueError(f"{prim.GetPath()} is not triangulated "
-                         f"(faceVertexCounts != 3); triangulate the bone USD first")
+def _triangulate(counts, idx) -> np.ndarray:
+    """Fan-triangulate a polygon mesh's ``faceVertexIndices`` into a flat
+    ``(M*3,)`` int32 triangle-index list. Already-triangular meshes pass straight
+    through. Bone meshes are used only for proximity collision + display, so a
+    simple fan (0, k, k+1) over each face is sufficient (walk.usd ships quad/ngon
+    bone meshes; otto.usd ships triangles)."""
+    counts = np.asarray(counts, dtype=np.int64)
+    idx = np.asarray(idx, dtype=np.int64)
+    if np.all(counts == 3):
+        return idx.astype(np.int32)
+    tris, o = [], 0
+    for c in counts:
+        c = int(c)
+        for k in range(1, c - 1):              # fan around the first vertex
+            tris.append((idx[o], idx[o + k], idx[o + k + 1]))
+        o += c
+    return np.asarray(tris, dtype=np.int32).reshape(-1)
 
 
 def _xform_rt(xcache, prim):
@@ -112,11 +125,16 @@ class UsdBoneSource(BoneSource):
     """
 
     def __init__(self, usd_path: str, bone_root: str | None = None,
-                 scale: float = 1.0):
+                 scale: float = 1.0, deroot: bool = False):
         from pxr import Usd, UsdSkel
 
         self.usd_path = str(usd_path)
         self._scale = float(scale)
+        # De-root (skel mode only): subtract the root joint's ground-plane (x,z)
+        # world translation each frame so a locomotion clip walks IN PLACE at the
+        # origin instead of translating metres away from the static muscle rest.
+        # Vertical (y) bob is kept — that is real motion, not drift.
+        self._deroot = bool(deroot)
         stage = Usd.Stage.Open(self.usd_path)
         if stage is None:
             raise FileNotFoundError(f"Cannot open bone USD: {usd_path}")
@@ -131,7 +149,17 @@ class UsdBoneSource(BoneSource):
         # A UsdSkel rig (SkelRoot present) stores only rest points + per-joint
         # animation; per-frame verts are LBS-skinned on demand (the compact
         # layout). Otherwise points carry per-frame timeSamples (baked layout).
-        skelroot = next((UsdSkel.Root(p) for p in stage.Traverse()
+        # When ``bone_root`` is set the SkelRoot is searched ONLY under it — an
+        # asset can carry several SkelRoots (walk.usd: Rigid_body_tree / Joint_tree
+        # / Muscles) and a bare Traverse() would grab the wrong (often empty) one.
+        if bone_root:
+            root_prim = stage.GetPrimAtPath(bone_root)
+            if not root_prim or not root_prim.IsValid():
+                raise ValueError(f"bone_root '{bone_root}' not in {self.usd_path}")
+            search = Usd.PrimRange(root_prim)
+        else:
+            search = stage.Traverse()
+        skelroot = next((UsdSkel.Root(p) for p in search
                          if p.IsA(UsdSkel.Root)), None)
         if skelroot is not None:
             self._mode = "skel"
@@ -167,11 +195,10 @@ class UsdBoneSource(BoneSource):
             pts = m.GetPointsAttr().Get(self._rest_t)
             if counts is None or idx is None or pts is None:
                 continue
-            _require_tris(counts, prim)
             nv = int(np.asarray(pts).shape[0])
             R, T = _xform_rt(xcache, prim)
             self._prims.append((m, R, T, nv))
-            tri_chunks.append(np.asarray(idx, dtype=np.int32) + offset)
+            tri_chunks.append(_triangulate(counts, idx) + offset)
             offset += nv
 
         if not self._prims:
@@ -202,10 +229,9 @@ class UsdBoneSource(BoneSource):
                 rest = m.GetPointsAttr().Get()          # bind-pose points
                 if counts is None or idx is None or rest is None:
                     continue
-                _require_tris(counts, prim)
                 rest = np.asarray(rest, dtype=np.float32)
                 self._skin.append((skel_q, sq, rest, skel.GetPrim(), rest.shape[0]))
-                tri_chunks.append(np.asarray(idx, dtype=np.int32) + offset)
+                tri_chunks.append(_triangulate(counts, idx) + offset)
                 offset += rest.shape[0]
 
         if not self._skin:
@@ -221,14 +247,21 @@ class UsdBoneSource(BoneSource):
     def n_verts(self) -> int:
         return self._n_verts
 
-    def positions(self, frame: int) -> np.ndarray:
-        cached = self._cache.get(frame)
-        if cached is not None:
-            return cached
+    def positions(self, frame) -> np.ndarray:
+        # `frame` may be fractional (sub-frame bone sampling): UsdSkel/baked points
+        # interpolate natively at any TimeCode. Only INTEGER frames are cached --
+        # fractional sub-poses are unique per step and would blow RAM (e.g. 10x225
+        # poses x 36k verts ~ 1 GB).
+        cache = float(frame).is_integer()
+        if cache:
+            cached = self._cache.get(frame)
+            if cached is not None:
+                return cached
         out = (self._skinned(frame) if self._mode == "skel"
                else self._baked(frame))
         out = _scaled(out, self._scale)
-        self._cache[frame] = out
+        if cache:
+            self._cache[frame] = out
         return out
 
     def _baked(self, frame: int) -> np.ndarray:
@@ -255,7 +288,13 @@ class UsdBoneSource(BoneSource):
             arr = np.asarray(pts, dtype=np.float32)
             # ... then skeleton space -> world.
             R, T = _xform_rt(xcache, skel_prim)
-            chunks.append(arr @ R + T)
+            arr = arr @ R + T
+            if self._deroot:                          # pelvis (joint 0) -> origin in x,z
+                skelT = skel_q.ComputeJointSkelTransforms(tc)
+                root_w = np.asarray(skelT[0].ExtractTranslation(), np.float32) @ R + T
+                arr[:, 0] -= root_w[0]
+                arr[:, 2] -= root_w[2]
+            chunks.append(arr)
         return np.ascontiguousarray(np.vstack(chunks).astype(np.float32))
 
 
@@ -268,7 +307,8 @@ def make_bone_source(cfg: dict, start_frame: int = 1) -> BoneSource:
     scale = float(cfg.get("asset_scale", 1.0))
     usd = cfg.get("bone_usd")
     if usd:
-        return UsdBoneSource(usd, cfg.get("bone_root"), scale=scale)
+        return UsdBoneSource(usd, cfg.get("bone_root"), scale=scale,
+                             deroot=bool(cfg.get("bone_deroot", False)))
     bone_dir = cfg.get("bone_dir")
     if not bone_dir:
         raise ValueError("config needs 'bone_usd' or 'bone_dir' for bones")

@@ -526,6 +526,23 @@ def build_humanV2_sim(cfg, demo):
         sim._activate_mask = mask
         print(f"[activate] '{act_name}' -> {int(mask.sum())}/{mask.shape[0]} "
               f"muscle tets ramp 0->1")
+    # Per-muscle activation driven by a USD curve asset (walk.usd): read each
+    # muscle's per-frame muscle:activation, map walk-curve -> otto muscle_id via
+    # muscle_mapping.json, scatter to per-tet. Overrides the single-name ramp.
+    sim._walk_activation = None
+    act_usd = cfg.get("activation_usd") or demo.get("activation_usd")
+    if act_usd and getattr(sim, "use_fiber", False):
+        from muscle.util.activation_usd import WalkActivationSource
+        map_path = cfg.get("muscle_mapping") or demo.get("muscle_mapping")
+        if not map_path:
+            raise ValueError("activation_usd set but 'muscle_mapping' missing "
+                             "(walk-curve -> otto muscle_id table)")
+        sim._walk_activation = WalkActivationSource(
+            usd_path=act_usd, mapping_path=map_path,
+            muscle_id_np=sim.muscle_id_np, muscle_id_strings=sim.muscle_id_strings,
+            start_frame=sim.start_frame, end_frame=sim.end_frame,
+            muscles_root=cfg.get("activation_muscles_root", "/Human/Muscles"),
+            aggregate=cfg.get("activation_aggregate", "mean"))
     print(f"NV={sim.NV}  NT={sim.NT}  frames={sim.start_frame}..{sim.end_frame}")
 
     # Parse all per-frame cons/bone .geo up front (RAM-resident, .npy-backed) so
@@ -689,17 +706,38 @@ def run_humanV2_loop(sim, collider, cfg, demo, surf_flat, fascia_flat,
 
     meter = CollisionMeter(collider, mm_meter, collide_eps, sim.NV)
 
+    # Sub-frame bone: sample the bone pose at `nsubsteps` intermediate poses easing
+    # frame-1 -> frame so the muscle tracks the bone's PATH (no per-frame teleport ->
+    # less hysteretic detach). Needs a per-frame-interpolatable source (UsdSkel /
+    # baked points); fascia advect is per-frame-only so it is disallowed here.
+    nsub = int(getattr(sim, "nsubsteps", 1))
+    subframe = bool(cfg.get("subframe_bone", False)) and nsub > 1
+    if subframe and getattr(sim, "fascia", None) is not None:
+        raise ValueError("subframe_bone is not supported with fascia "
+                         "(set use_fascia=false or subframe_bone=false)")
+    if subframe:
+        print(f"[subframe] bone sampled at {nsub} sub-poses/frame (frame-1 -> frame)")
+
     t0 = time.perf_counter()
     for frame in range(sim.start_frame, sim.end_frame + 1):
-        if not static_bone:
-            collider.set_frame(frame)              # move bones BEFORE solving
         if pre_step is not None:
             pre_step(frame)
-        if getattr(sim, "_activate_mask", None) is not None:
+        if getattr(sim, "_walk_activation", None) is not None:
+            sim.set_fiber_activation(sim._walk_activation.per_tet(frame))
+        elif getattr(sim, "_activate_mask", None) is not None:
             span = max(1, sim.end_frame - sim.start_frame)
             a = (frame - sim.start_frame) / span      # linear ramp 0 -> 1
             sim.set_fiber_activation(a * sim._activate_mask)
-        sim.step_frame(frame)
+        if subframe and frame > sim.start_frame:
+            for s in range(nsub):                      # bone eases frame-1 -> frame
+                t = (frame - 1) + (s + 1) / nsub       # last substep lands on `frame`
+                if not static_bone:
+                    collider.set_frame(t)              # interpolated bone for SDF
+                sim.advance_substep(t)                 # target@t + pin + one substep
+        else:
+            if not static_bone:
+                collider.set_frame(frame)              # move bones BEFORE solving
+            sim.step_frame(frame)
         meter.measure()
         n_inv = sim.count_inverted()   # every frame: feeds the USD primvar + print
 
@@ -823,7 +861,7 @@ def _make_self_collider(sim, cfg, demo, surf_flat):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--config", default="data/humanV2/config/humanV2.json",
+    ap.add_argument("--config", default="data/humanV2/config/otto.json",
                     help="json scene+demo config (the ONLY argument; every other "
                          "knob lives in the json's solver keys + 'demo' object)")
     args = ap.parse_args(argv)

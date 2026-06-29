@@ -53,7 +53,7 @@ def find_constraint(cfg: dict, name: str) -> dict | None:
 
 
 class MultiGridSim(MuscleSim):
-    """Per-frame ARAP-HPBD driver for the pin-to-target workflow.
+    """
 
     Lifecycle (one frame):
         sim.load_frame_targets(frame)  # reads cons_<frame>.geo target_pos
@@ -82,6 +82,12 @@ class MultiGridSim(MuscleSim):
         self.omega = float(cfg["omega"])
         self.dt_frame = float(cfg["delta_t"])
         self.nsubsteps = int(cfg["nsubsteps"])
+        # Kinematic skinning pre-(sub)frame pin-to-target: blend every muscle vert
+        # toward its bone target before each solve so the muscle TRACKS the bone
+        # instead of lagging it (XPBD attach convergence is too slow for fast walk).
+        # Like apply_pintotarget but soft (verts stay free to relax) and over ALL
+        # verts. 0 = off (default, leaves plain otto.json unchanged); 1 = snap.
+        self.presubframe_pintotarget = float(cfg.get("presubframe_pintotarget", 0.0))
         self.fine_iters = int(cfg["fine_iterations"])
         self.total_mass = float(cfg["total_mass"])
         self.geo_dir = str(cfg["geo_dir"])
@@ -364,14 +370,21 @@ class MultiGridSim(MuscleSim):
         #       the rest has no 'pinmask' attr (e.g. the .geo asset), fall back to
         #       NO hard pins — every vert rides the compliant belly-attach.
         #   region="full": pin every vert hard (no freed belly). Diagnostic.
+        #   disabled/absent: no hard pins at all — every vert rides the compliant
+        #       belly-attach (the constraint is toggleable in place, like fiber).
         _pin = find_constraint(cfg, "muscleToBonePin")
-        if _pin is None:
-            raise ValueError("constraints[] must define a 'muscleToBonePin' entry "
-                             "(type 'pin'; region: full | tendonmask | pinmask)")
-        region = str(_pin.get("region", "tendonmask")).lower()
         n_tot = len(self._pin_pts_np)
         self.tendon_pin_threshold = None
-        if region == "full":
+        if _pin is None:
+            active = np.zeros(n_tot, dtype=np.int32)
+            region = None
+            print(f"[muscle-bone-pin] disabled: 0/{n_tot} hard pins "
+                  f"(all belly-attach)")
+        else:
+            region = str(_pin.get("region", "tendonmask")).lower()
+        if region is None:
+            pass
+        elif region == "full":
             active = np.ones(n_tot, dtype=np.int32)
             print(f"[muscle-bone-pin] region=full: {n_tot}/{n_tot} hard pins "
                   f"(100% pinned, no belly-attach)")
@@ -920,15 +933,44 @@ class MultiGridSim(MuscleSim):
         for phase in self.program:
             phase()
 
+    def presubframe_pintotarget_step(self) -> None:
+        """Move every muscle vert to its bone target (soft pin-to-target) before the
+        XPBD iters, so the muscle tracks the bone rather than lagging it. Like
+        apply_pintotarget but soft (verts stay free to relax into fiber/collision)
+        and over ALL verts (pinned ones are already at target -> no-op), so it works
+        with any/no pin mask. No-op when presubframe_pintotarget<=0 (default)."""
+        if self.presubframe_pintotarget <= 0.0:
+            return
+        wp.launch(presubframe_pintotarget_kernel, dim=self.NCONS,
+                  inputs=[self.pts, self.target_pos, self.rest_offset,
+                          float(self.presubframe_pintotarget), self.pos],
+                  device=self._device)
+
     def step_frame(self, frame: int) -> None:
         self.load_frame_targets(frame)
         self.apply_pintotarget()
+        self.presubframe_pintotarget_step()
         # Fascia rides the skeleton: advect the shell by this frame's bone motion
         # ONCE (target_pos is constant across the frame's substeps) before solving.
         if self.fascia is not None:
             self.fascia.advect_bone()
         for _ in range(self.nsubsteps):
             self.substep()
+
+    def advance_substep(self, t: float) -> None:
+        """One substep driven by the bone pose at FRACTIONAL frame ``t``.
+
+        Sub-frame bone path: instead of holding the bone target constant across a
+        frame's substeps (``step_frame``), the caller loops this ``nsubsteps`` times
+        with ``t`` easing ``frame-1 -> frame`` so the muscle tracks the bone's PATH,
+        not a once-per-frame teleport. ``load_frame_targets`` resamples the bone
+        surface at ``t`` (UsdSkel interpolates joints natively) and re-pins; one
+        substep advances the solve. Fascia is NOT supported here (the run loop
+        guards on ``use_fascia``)."""
+        self.load_frame_targets(t)
+        self.apply_pintotarget()
+        self.presubframe_pintotarget_step()
+        self.substep()
 
     def positions_np(self) -> np.ndarray:
         return self.pos.numpy()
