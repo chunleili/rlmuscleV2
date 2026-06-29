@@ -53,7 +53,7 @@ def plot(csv_path: str, out_path: str):
     fig, axes = plt.subplots(len(muscles), 1, figsize=(8, 2.2 * len(muscles)),
                              sharex=True)
     axes = np.atleast_1d(axes)
-    for ax, m in zip(axes, muscles):
+    for i, (ax, m) in enumerate(zip(axes, muscles)):
         rl = _norm(col[f"{m}_rl"])
         if cohort:
             mean = col[f"{m}_human_mean"]
@@ -61,18 +61,18 @@ def plot(csv_path: str, out_path: str):
             mean_n = mean / peak
             sd_n = col[f"{m}_human_std"] / peak
             ax.fill_between(t, mean_n - sd_n, mean_n + sd_n, color="0.6",
-                            alpha=0.35, label="human mean ± 1 SD")
-            ax.plot(t, mean_n, "k", lw=1.2, label="human mean")
+                            alpha=0.35, label="± 1 SD")
+            ax.plot(t, mean_n, "k", lw=1.2, label="Moreira 2021")
         else:
             human = _norm(col[f"{m}_human"])
-            ax.plot(t, human, "k", lw=1.5, label="human EMG")
+            ax.plot(t, human, "k", lw=1.5, label="Moreira 2021")
             ax.fill_between(t, 0, human, color="0.7", alpha=0.4)
-        ax.plot(t, rl, color="tab:red", lw=1.5, label="rl_mass walk")
-        ax.set_ylabel(LABELS.get(m, m), fontsize=8)
+        ax.plot(t, rl, color="tab:red", lw=1.5, label="ours")
+        ax.set_ylabel(LABELS.get(m, m), fontsize=9)
         ax.set_ylim(0, 1.12)
-        ax.legend(fontsize=7, loc="upper right")
+        if i == 0:
+            ax.legend(fontsize=8, loc="upper right", ncol=3, frameon=False)
     axes[-1].set_xlabel("% gait cycle (0 = right heel strike)")
-    fig.suptitle("rl_mass walk vs sEMG (peak-normalised)", fontsize=10)
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
