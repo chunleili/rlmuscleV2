@@ -281,6 +281,22 @@ def compare(config_path: str) -> dict:
     fig.savefig(plot_path, dpi=120)
     plt.close(fig)
 
+    # ── Raw series CSV ───────────────────────────────────────────────────────────
+    # One row per gait-cycle %; human columns in %MVC, rl in neural activation.
+    # Peak-normalise per column yourself for shape comparison.
+    cols = ["time_pct"]
+    data_cols = [grid]
+    for j, emg_k in enumerate(emg_labels):
+        if has_band:
+            cols += [f"{emg_k}_human_mean", f"{emg_k}_human_std", f"{emg_k}_rl"]
+            data_cols += [gt.activation[:, j], gt.std[:, j], rl_cycles[:, j]]
+        else:
+            cols += [f"{emg_k}_human", f"{emg_k}_rl"]
+            data_cols += [gt.activation[:, j], rl_cycles[:, j]]
+    csv_path = os.path.join(out_dir, "compare.csv")
+    np.savetxt(csv_path, np.column_stack(data_cols), delimiter=",",
+               header=",".join(cols), comments="")
+
     return {"per_muscle": per_muscle, "aggregate": aggregate, "out_dir": out_dir}
 
 
