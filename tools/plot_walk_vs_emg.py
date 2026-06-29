@@ -61,7 +61,7 @@ def plot(csv_path: str, out_path: str):
             mean_n = mean / peak
             sd_n = col[f"{m}_human_std"] / peak
             ax.fill_between(t, mean_n - sd_n, mean_n + sd_n, color="0.6",
-                            alpha=0.35, label="± 1 SD")
+                            alpha=0.35, label="± 1 std")
             ax.plot(t, mean_n, "k", lw=1.2, label="Moreira 2021")
         else:
             human = _norm(col[f"{m}_human"])
