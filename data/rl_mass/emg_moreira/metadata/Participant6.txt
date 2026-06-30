@@ -1,0 +1,7 @@
+ID: Subject6
+Age: 21
+Gender: Female
+Body Height: 1.65 m
+Body Mass: 60.0 kg
+Leg Length: 0.74 m
+Foot Length: 0.24 m

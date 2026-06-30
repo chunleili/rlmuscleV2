@@ -1,0 +1,7 @@
+ID: Subject10
+Age: 25
+Gender: Male
+Body Height: 1.82 m
+Body Mass: 76.8 kg
+Leg Length: 0.81 m
+Foot Length: 0.26 m

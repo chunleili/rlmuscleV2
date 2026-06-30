@@ -1,0 +1,45 @@
+{
+    "walk_config": "data/rl_mass/configs/walk_moreira.json",
+    "checkpoint": "output/walk_emgprior/nn/max",
+    "emg_cohort_dir": "data/rl_mass/emg_moreira/V4_R",
+    "muscle_map": {
+        "VL": [
+            "R_Vastus_Lateralis",
+            "R_Vastus_Lateralis1",
+            "R_Vastus_Medialis",
+            "R_Vastus_Medialis1",
+            "R_Vastus_Medialis2",
+            "R_Vastus_Intermedius",
+            "R_Vastus_Intermedius1",
+            "R_Rectus_Femoris",
+            "R_Rectus_Femoris1"
+        ],
+        "BF": [
+            "R_Bicep_Femoris_Longus",
+            "R_Bicep_Femoris_Short",
+            "R_Bicep_Femoris_Short1",
+            "R_Semitendinosus",
+            "R_Semimembranosus",
+            "R_Semimembranosus1"
+        ],
+        "TA": [
+            "R_Tibialis_Anterior",
+            "R_Extensor_Digitorum_Longus",
+            "R_Extensor_Digitorum_Longus1",
+            "R_Extensor_Digitorum_Longus2",
+            "R_Extensor_Digitorum_Longus3",
+            "R_Extensor_Digitorum1",
+            "R_Extensor_Hallucis_Longus",
+            "R_Peroneus_Tertius",
+            "R_Peroneus_Tertius1"
+        ],
+        "GAL": [
+            "R_Gastrocnemius_Lateral_Head",
+            "R_Gastrocnemius_Medial_Head",
+            "R_Soleus",
+            "R_Soleus1"
+        ]
+    },
+    "out_dir": "output/walk_vs_emg_emgprior_final",
+    "max_steps": 420
+}

@@ -111,6 +111,25 @@ class Character:
         self.bvh = BVH(bvh_map=bvh_map)
         self.bvh.parse(filepath, cyclic)
 
+    def load_usd(
+        self,
+        filepath: str,
+        cyclic: bool = True,
+        bvh_map: Optional[dict[str, str]] = None,
+        skel_path: Optional[str] = None,
+    ) -> None:
+        """Load a UsdSkel motion clip as the reference motion.
+
+        Drop-in alternative to `load_bvh` for a `.usd` carrying a UsdSkel
+        SkelAnimation (e.g. a Houdini bvh->UsdSkel export). `bvh_map` selects
+        the joint-name convention exactly like `load_bvh`: None -> Character1_*
+        Mixamo names, or joint_utils.MASS_NATIVE_BVH_MAP for MASS body names.
+        """
+        from rl_mass.usd_motion import UsdSkelMotion
+
+        self.bvh = UsdSkelMotion(bvh_map=bvh_map)
+        self.bvh.parse(filepath, cyclic, skel_path=skel_path)
+
     def reset(self) -> None:
         """Reset Tc to T0 with y-translation zeroed. Port of Character::Reset."""
         assert self.bvh is not None, "Load BVH first"

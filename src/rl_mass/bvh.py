@@ -190,6 +190,72 @@ _DART_DOF = {"Free": 6, "Ball": 3, "Revolute": 1}
 _MJ_QPOS = {"Free": 7, "Ball": 4, "Revolute": 1}
 
 
+def dart_qpos_from_local_R(
+    get_R,
+    root_trans_m: np.ndarray,
+    bvh_map: dict[str, str],
+    joint_types: list[str],
+    body_names: list[str],
+    revolute_axes: dict[str, np.ndarray],
+) -> np.ndarray:
+    """Build a DART qpos (exp-map) vector from per-joint LOCAL rotations.
+
+    Args:
+        get_R: callable(bvh_joint_name) -> 3x3 local rotation matrix of that
+            joint relative to its parent.
+        root_trans_m: (3,) root (FreeJoint) translation already in METERS.
+        bvh_map: body_name -> source joint name (None entries skipped -> zero).
+        joint_types / body_names / revolute_axes: skeleton description.
+
+    DART layout per joint:
+        Free:     [logMap(R)(3), translation(3)]
+        Ball:     [logMap(R)(3)]
+        Revolute: [angle(1)] along the joint's axis.
+
+    Shared by `BVH` (rotations from BVH euler channels) and
+    `UsdSkelMotion` (rotations from a UsdSkel SkelAnimation). Both feed
+    identical local rotations, so the produced motion is identical.
+    """
+    dart_dof = sum(_DART_DOF[jt] for jt in joint_types)
+    p = np.zeros(dart_dof, dtype=np.float64)
+
+    di = 0  # DART index
+    for i, body_name in enumerate(body_names):
+        jt = joint_types[i]
+        if body_name not in bvh_map:
+            # No mapping -> leave as zero
+            di += _DART_DOF[jt]
+            continue
+
+        R = get_R(bvh_map[body_name])
+
+        if jt == "Free":
+            p[di:di + 3] = _logmap(R)
+            p[di + 3:di + 6] = root_trans_m
+            di += 6
+        elif jt == "Ball":
+            p[di:di + 3] = _logmap(R)
+            di += 3
+        elif jt == "Revolute":
+            aa = _logmap(R)
+            axis = revolute_axes[body_name]
+            if np.linalg.norm(axis - np.array([1, 0, 0])) < 1e-4:
+                val = aa[0]
+            elif np.linalg.norm(axis - np.array([0, 1, 0])) < 1e-4:
+                val = aa[1]
+            else:
+                val = aa[2]
+            # Wrap to [-pi, pi]
+            if val > math.pi:
+                val -= 2 * math.pi
+            elif val < -math.pi:
+                val += 2 * math.pi
+            p[di] = val
+            di += 1
+
+    return p
+
+
 # ---------------------------------------------------------------------------
 # BVH class
 # ---------------------------------------------------------------------------
@@ -370,51 +436,15 @@ class BVH:
         for node in self.node_map.values():
             node.set_from_frame(m_t)
 
-        # Build DART qpos
-        dart_dof = sum(_DART_DOF[jt] for jt in self.joint_types)
-        p = np.zeros(dart_dof, dtype=np.float64)
-
-        di = 0  # DART index
-        for i, body_name in enumerate(self.body_names):
-            jt = self.joint_types[i]
-            if body_name not in self.bvh_map:
-                # No BVH mapping -> leave as zero
-                di += _DART_DOF[jt]
-                continue
-
-            bvh_name = self.bvh_map[body_name]
-            R = self.node_map[bvh_name].get()
-
-            if jt == "Free":
-                # FreeJoint: [logMap(R), 0.01*translation]
-                log_r = _logmap(R)
-                trans = 0.01 * m_t[:3]  # BVH cm -> meters
-                p[di:di + 3] = log_r
-                p[di + 3:di + 6] = trans
-                di += 6
-            elif jt == "Ball":
-                # BallJoint: logMap(R)
-                p[di:di + 3] = _logmap(R)
-                di += 3
-            elif jt == "Revolute":
-                # RevoluteJoint: extract angle along axis
-                aa = _logmap(R)
-                axis = self.revolute_axes[body_name]
-                if np.linalg.norm(axis - np.array([1, 0, 0])) < 1e-4:
-                    val = aa[0]
-                elif np.linalg.norm(axis - np.array([0, 1, 0])) < 1e-4:
-                    val = aa[1]
-                else:
-                    val = aa[2]
-                # Wrap to [-pi, pi]
-                if val > math.pi:
-                    val -= 2 * math.pi
-                elif val < -math.pi:
-                    val += 2 * math.pi
-                p[di] = val
-                di += 1
-
-        return p
+        # Build DART qpos from each mapped joint's local rotation.
+        return dart_qpos_from_local_R(
+            lambda n: self.node_map[n].get(),
+            0.01 * m_t[:3],  # BVH cm -> meters
+            self.bvh_map,
+            self.joint_types,
+            self.body_names,
+            self.revolute_axes,
+        )
 
     def get_motion_mujoco(self, t: float) -> np.ndarray:
         """Get raw BVH motion at time t in MuJoCo qpos format.

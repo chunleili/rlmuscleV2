@@ -1,0 +1,7 @@
+ID: Subject5
+Age: 24
+Gender: Male
+Body Height: 1.80 m
+Body Mass: 74.4 kg
+Leg Length: 0.82 m
+Foot Length: 0.27 m

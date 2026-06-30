@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import os
 import time
@@ -269,6 +270,47 @@ class PPO:
         )
         self.max_iteration = 50000
 
+        # Optional EMG activation prior (config-gated; default off → behaviour
+        # identical to stock training). Pulls the 4 Moreira surface muscles'
+        # activations toward the peak-normalised EMG envelope, indexed by gait
+        # phase. See tools/build_emg_prior.py for the target .npz.
+        self.emg_prior = None
+        try:
+            with open(config_path) as _f:
+                _ep = json.load(_f).get("emg_prior")
+        except (OSError, ValueError):
+            _ep = None
+        if _ep and _ep.get("enabled", False) and self.use_muscle:
+            _d = np.load(_ep["target_npz"])
+            _tgt = torch.FloatTensor(_d["target"])          # (P, 4) peak-norm EMG
+            _idx = torch.LongTensor(_d["snu_idx"])          # (4,) primary SNU cols
+            # Group aggregation: each EMG channel maps to one or more SNU muscles
+            # (a surface electrode detects a region). The model signal is the
+            # f0-weighted mean activation of the group. Singletons → weight 1.
+            _gidx = torch.LongTensor(_d["group_idx"])       # (4, G) SNU indices
+            _gw   = torch.FloatTensor(_d["group_w"])        # (4, G) weights (rows sum 1)
+            # Per-muscle weight: boosts muscles the torque solver tends to zero
+            # (e.g. R gastroc-lateral, which dies in the Tanh→ReLU output's dead
+            # zone under equal weighting — see model.MuscleNN). Default all 1.
+            _mw = np.asarray(_ep.get("muscle_lambda", [1.0] * len(_idx)), dtype=np.float32)
+            _mw_t = torch.FloatTensor(_mw)
+            if use_cuda:
+                _tgt = _tgt.cuda(); _idx = _idx.cuda(); _mw_t = _mw_t.cuda()
+                _gidx = _gidx.cuda(); _gw = _gw.cuda()
+            self.emg_prior = {
+                "lam":   float(_ep.get("lambda", 1.0)),
+                "scale": float(_ep.get("scale", 0.3)),       # EMG-peak → activation level
+                "n_phase": int(_tgt.shape[0]),
+                "snu_idx": _idx,
+                "group_idx": _gidx,
+                "group_w":   _gw,
+                "target":  _tgt,
+                "mw":      _mw_t,                            # (4,) per-channel weight
+            }
+            print(f"[emg_prior] enabled: lambda={self.emg_prior['lam']} "
+                  f"scale={self.emg_prior['scale']} muscles={_d['snu_idx'].tolist()} "
+                  f"muscle_lambda={_mw.tolist()}")
+
         self.w_entropy = -0.001
 
         self.loss_actor = 0.0
@@ -471,6 +513,9 @@ class PPO:
             self.muscle_buffer["b"] = np.stack(
                 [t.b for t in all_tuples]
             )
+            self.muscle_buffer["phase"] = np.array(
+                [t.phase for t in all_tuples], dtype=np.float32
+            )
             print(self.muscle_buffer["JtA"].shape)
         else:
             # Edge case: no muscle tuples collected
@@ -588,6 +633,19 @@ class PPO:
                 loss_target = (((tau - stack_tau_des) / 100.0).pow(2)).mean()
 
                 loss = 0.01 * loss_reg + loss_target
+
+                # EMG activation prior: pull the 4 surface muscles toward the
+                # peak-normalised EMG envelope at this minibatch's gait phases.
+                if self.emg_prior is not None:
+                    ep = self.emg_prior
+                    ph = self.muscle_buffer["phase"][minibatch]      # (B,) in [0,1)
+                    pidx = (ph * ep["n_phase"]).astype(np.int64) % ep["n_phase"]
+                    tgt = ep["target"][torch.as_tensor(pidx, device=ep["target"].device)]
+                    # f0-weighted group activation per EMG channel: (B,4,G)*(4,G)→(B,4)
+                    a_grp = activation[:, ep["group_idx"]]           # (B, 4, G)
+                    a_sel = (a_grp * ep["group_w"].unsqueeze(0)).sum(dim=2)  # (B, 4)
+                    loss_emg = (ep["mw"] * (a_sel - ep["scale"] * tgt).pow(2)).mean()
+                    loss = loss + ep["lam"] * loss_emg
 
                 self.optimizer_muscle.zero_grad()
                 loss.backward(retain_graph=True)

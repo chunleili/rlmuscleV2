@@ -50,6 +50,7 @@ class MuscleTuple:
     L: np.ndarray  # Vectorized full JtA matrix (non-root rows)
     b: np.ndarray  # Passive forces (non-root)
     tau_des: np.ndarray  # Desired torques (non-root)
+    phase: float = 0.0  # Gait-cycle phase [0,1) at collection (EMG prior lookup)
 
 
 # ---------------------------------------------------------------------------
@@ -136,13 +137,12 @@ class MassEnv:
         self.model = self.engine.model
         self.data = self.engine.data
 
-        # Character (BVH + SPD)
+        # Character (reference motion + SPD)
         self.character = Character(self.engine, kp=kp)
-        bvh_file = cfg["bvh_file"]
         bvh_cyclic = cfg.get("bvh_cyclic", True)
         # "character1" (default) -> MotionBuilder/HumanIK Character1_* joint
         #   names (18-joint biped) via MASS_BVH_MAP.
-        # "native" -> BVH already uses MASS body names (Pelvis, ArmL, ...).
+        # "native" -> motion already uses MASS body names (Pelvis, ArmL, ...).
         bvh_naming = cfg.get("bvh_naming", "character1")
         if bvh_naming == "native":
             from rl_mass.joint_utils import MASS_NATIVE_BVH_MAP
@@ -151,7 +151,13 @@ class MassEnv:
             bvh_map = None
         else:
             raise ValueError(f"bvh_naming must be 'character1' or 'native', got {bvh_naming!r}")
-        self.character.load_bvh(bvh_file, cyclic=bvh_cyclic, bvh_map=bvh_map)
+        # Reference motion source: a UsdSkel clip ("usd_file") takes precedence,
+        # else a classic .bvh ("bvh_file"). Both honour bvh_naming/bvh_cyclic.
+        usd_file = cfg.get("usd_file")
+        if usd_file:
+            self.character.load_usd(usd_file, cyclic=bvh_cyclic, bvh_map=bvh_map)
+        else:
+            self.character.load_bvh(cfg["bvh_file"], cyclic=bvh_cyclic, bvh_map=bvh_map)
 
         # Root joint DOFs (6 for FreeJoint)
         self.root_joint_dof: int = 6
@@ -496,11 +502,17 @@ class MassEnv:
         # most recent get_desired_torques() call in the inner loop.
         tau_des = self.desired_torque[self.root_joint_dof:]
 
+        # Gait-cycle phase [0,1) — same definition as get_state's phase, used by
+        # the optional EMG activation prior to look up the per-muscle target.
+        max_time = self.character.bvh.max_time
+        phase = math.fmod(self.engine.get_time(), max_time) / max_time
+
         self.current_muscle_tuple = MuscleTuple(
             JtA=JtA.copy(),
             L=L_vectorized.copy(),
             b=b.copy(),
             tau_des=tau_des.copy(),
+            phase=float(phase),
         )
         self.muscle_tuples.append(self.current_muscle_tuple)
 

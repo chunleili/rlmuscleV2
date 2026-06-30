@@ -1,0 +1,21 @@
+{
+    "skeleton_format": "mujoco_native",
+    "use_muscle": true,
+    "control_hz": 60,
+    "simulation_hz": 600,
+    "skeleton_file": "/mnt/storage_disk_1/chunleli/Dev/rlmuscleV2-finger/data/rl_mass_arm26/arm26.xml",
+    "trajectory_file": "/mnt/storage_disk_1/chunleli/Dev/rlmuscleV2-finger/data/rl_mass_arm26/arm26_motion.npz",
+    "reward_param": {
+        "w_q": 0.85,
+        "w_v": 0.15
+    },
+    "pose_error_threshold": 50.0,
+    "muscle_force_scale": 1.0,
+    "spd": {
+        "kp": 20.0
+    },
+    "muscle_groups": {
+        "flexor": ["BIClong", "BICshort", "BRA"],
+        "extensor": ["TRIlong", "TRIlat", "TRImed"]
+    }
+}

@@ -39,6 +39,11 @@ MUJOCO_LOG.TXT
 
 result/
 
+# Moreira 2021 walking sEMG — third-party data, re-fetch from figshare 4923162.
+# Keep the README (provenance) tracked; ignore the bulky signal/meta payload.
+data/rl_mass_emg_moreira/*
+!data/rl_mass_emg_moreira/README.md
+
 # Unzipped model assets — extracted from data/<case>/model.zip at runtime.
 data/Emil/model/
 data/humanV2/model/
