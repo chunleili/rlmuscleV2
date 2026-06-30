@@ -120,12 +120,20 @@ def compare(config_path: str) -> dict:
         raise RuntimeError("Body 'TalusR' not found in model")
 
     # ── Muscle index lookup ────────────────────────────────────────────────────
+    # A muscle_map value may be a single SNU name or a LIST (a surface electrode
+    # detects a region). For a group, the model signal is the f0(PCSA)-weighted
+    # mean activation — matching the EMG prior's aggregation.
     meta  = env.get_muscle_metadata()
     names = list(meta["names"])                            # SNU 284-muscle list
+    f0    = np.asarray(env.muscle_system.f0, dtype=np.float64)
     try:
-        midx = {emg_k: names.index(snu_v) for emg_k, snu_v in muscle_map.items()}
+        groups = {emg_k: ([v] if isinstance(v, str) else list(v))
+                  for emg_k, v in muscle_map.items()}
+        gidx = {k: [names.index(n) for n in g] for k, g in groups.items()}
     except ValueError as e:
         raise ValueError(f"Muscle not found in env metadata: {e}") from e
+    gw = {k: (np.array([f0[i] for i in idxs]) / sum(f0[i] for i in idxs))
+          for k, idxs in gidx.items()}
 
     # ── Rollout ────────────────────────────────────────────────────────────────
     state = env.reset(rsi=False)
@@ -172,9 +180,11 @@ def compare(config_path: str) -> dict:
             "rollout too short or character fell early."
         )
 
-    # Extract activation columns for the mapped muscles (in EMG label order)
+    # f0-weighted group activation per EMG channel (in EMG label order)
     emg_labels = list(muscle_map.keys())
-    act_cols   = A[:, [midx[k] for k in emg_labels]]      # (T, 4)
+    act_cols   = np.column_stack([
+        A[:, gidx[k]] @ gw[k] for k in emg_labels          # (T,) per channel
+    ])                                                     # (T, 4)
     rl_cycles  = fold_cycles(act_cols, strikes, n_points=n_points)  # (101, 4)
 
     # ── EMG ground truth ───────────────────────────────────────────────────────

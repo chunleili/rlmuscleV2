@@ -19,6 +19,12 @@
         "enabled": true,
         "target_npz": "data/rl_mass/emg_moreira/emg_prior_V4.npz",
         "lambda": 1.0,
-        "scale": 0.3
+        "scale": 0.3,
+        "muscle_lambda": [
+            1.0,
+            1.0,
+            1.0,
+            1.0
+        ]
     }
 }

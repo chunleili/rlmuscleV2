@@ -40,12 +40,31 @@ from rl_mass.finger.gt import (
     detect_heel_strikes,
 )
 
-# EMG label -> SNU muscle name (right leg surface muscles)
+# EMG label -> SNU muscle name(s). A surface electrode detects a region, so a
+# label may map to a GROUP of synergists; the model signal is then the
+# f0(PCSA)-weighted mean activation of the group. GAL (lateral gastroc
+# electrode) maps to the whole triceps-surae group because the model's
+# min-activation solver zeros the weak lateral head and carries push-off on the
+# stronger soleus / medial gastroc (see emg-prior diagnostics).
 MUSCLE_MAP = {
-    "VL":  "R_Vastus_Lateralis",
-    "BF":  "R_Bicep_Femoris_Longus",
-    "TA":  "R_Tibialis_Anterior",
-    "GAL": "R_Gastrocnemius_Lateral_Head",
+    # VL electrode → quadriceps group
+    "VL":  ["R_Vastus_Lateralis", "R_Vastus_Lateralis1",
+            "R_Vastus_Medialis", "R_Vastus_Medialis1", "R_Vastus_Medialis2",
+            "R_Vastus_Intermedius", "R_Vastus_Intermedius1",
+            "R_Rectus_Femoris", "R_Rectus_Femoris1"],
+    # BF electrode → hamstring group
+    "BF":  ["R_Bicep_Femoris_Longus", "R_Bicep_Femoris_Short",
+            "R_Bicep_Femoris_Short1", "R_Semitendinosus",
+            "R_Semimembranosus", "R_Semimembranosus1"],
+    # TA electrode → dorsiflexor group
+    "TA":  ["R_Tibialis_Anterior", "R_Extensor_Digitorum_Longus",
+            "R_Extensor_Digitorum_Longus1", "R_Extensor_Digitorum_Longus2",
+            "R_Extensor_Digitorum_Longus3", "R_Extensor_Digitorum1",
+            "R_Extensor_Hallucis_Longus", "R_Peroneus_Tertius",
+            "R_Peroneus_Tertius1"],
+    # GAL electrode → triceps-surae / plantarflexor group
+    "GAL": ["R_Gastrocnemius_Lateral_Head", "R_Gastrocnemius_Medial_Head",
+            "R_Soleus", "R_Soleus1"],
 }
 
 
@@ -83,8 +102,25 @@ def main():
 
     env = MassEnv(a.walk_config)
     names = list(env.get_muscle_metadata()["names"])
+    f0 = np.asarray(env.muscle_system.f0, dtype=np.float64)
     labels = list(MUSCLE_MAP.keys())
-    snu_idx = np.array([names.index(MUSCLE_MAP[k]) for k in labels], dtype=np.int64)
+
+    # Build a padded (n_labels, G) group index + f0-weight matrix. Singletons
+    # use one slot with weight 1; groups use f0/PCSA-weighted means. Unused
+    # slots get index 0 and weight 0 so they contribute nothing.
+    groups = [[MUSCLE_MAP[k]] if isinstance(MUSCLE_MAP[k], str) else MUSCLE_MAP[k]
+              for k in labels]
+    G = max(len(g) for g in groups)
+    group_idx = np.zeros((len(labels), G), dtype=np.int64)
+    group_w   = np.zeros((len(labels), G), dtype=np.float64)
+    for r, g in enumerate(groups):
+        idxs = [names.index(n) for n in g]
+        w = np.array([f0[i] for i in idxs], dtype=np.float64)
+        w = w / w.sum()
+        group_idx[r, :len(idxs)] = idxs
+        group_w[r, :len(idxs)] = w
+    # Back-compat scalar index = the primary (first) muscle of each channel.
+    snu_idx = group_idx[:, 0].copy()
 
     # Moreira cohort mean EMG, peak-normalised per muscle (shape prior).
     gt = EmgCohortLoader(a.emg_cohort, muscles=labels, n_points=101).load()
@@ -103,13 +139,18 @@ def main():
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
     np.savez(a.out,
              snu_idx=snu_idx,
+             group_idx=group_idx,
+             group_w=group_w.astype(np.float32),
              phase_grid=phase_grid,
              target=target,
              phi_hs=np.float64(phi_hs),
              labels=np.array(labels))
     print(json.dumps({
         "out": a.out, "phi_hs": phi_hs,
-        "snu_idx": snu_idx.tolist(), "labels": labels,
+        "groups": {labels[r]: [names[i] for i, w in zip(group_idx[r], group_w[r]) if w > 0]
+                   for r in range(len(labels))},
+        "group_w": {labels[r]: [round(float(w), 3) for w in group_w[r] if w > 0]
+                    for r in range(len(labels))},
         "target_peaks_at_pct": [float(src_pct[int(np.argmax(emg_norm[:, j]))])
                                 for j in range(len(labels))],
     }, indent=2))
