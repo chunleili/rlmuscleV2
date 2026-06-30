@@ -50,6 +50,7 @@ class MuscleTuple:
     L: np.ndarray  # Vectorized full JtA matrix (non-root rows)
     b: np.ndarray  # Passive forces (non-root)
     tau_des: np.ndarray  # Desired torques (non-root)
+    phase: float = 0.0  # Gait-cycle phase [0,1) at collection (EMG prior lookup)
 
 
 # ---------------------------------------------------------------------------
@@ -496,11 +497,17 @@ class MassEnv:
         # most recent get_desired_torques() call in the inner loop.
         tau_des = self.desired_torque[self.root_joint_dof:]
 
+        # Gait-cycle phase [0,1) — same definition as get_state's phase, used by
+        # the optional EMG activation prior to look up the per-muscle target.
+        max_time = self.character.bvh.max_time
+        phase = math.fmod(self.engine.get_time(), max_time) / max_time
+
         self.current_muscle_tuple = MuscleTuple(
             JtA=JtA.copy(),
             L=L_vectorized.copy(),
             b=b.copy(),
             tau_des=tau_des.copy(),
+            phase=float(phase),
         )
         self.muscle_tuples.append(self.current_muscle_tuple)
 
