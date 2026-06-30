@@ -933,12 +933,13 @@ class MultiGridSim(MuscleSim):
         for phase in self.program:
             phase()
 
-    def presubframe_pintotarget_step(self) -> None:
+    def apply_pintotarget_all(self) -> None:
         """Move every muscle vert to its bone target (soft pin-to-target) before the
         XPBD iters, so the muscle tracks the bone rather than lagging it. Like
-        apply_pintotarget but soft (verts stay free to relax into fiber/collision)
-        and over ALL verts (pinned ones are already at target -> no-op), so it works
-        with any/no pin mask. No-op when presubframe_pintotarget<=0 (default)."""
+        ``apply_pintotarget`` but soft (verts stay free to relax into fiber/collision)
+        and over ALL verts, not just the masked tendon (pinned ones are already at
+        target -> no-op), so it works with any/no pin mask. No-op when
+        presubframe_pintotarget<=0 (default)."""
         if self.presubframe_pintotarget <= 0.0:
             return
         wp.launch(presubframe_pintotarget_kernel, dim=self.NCONS,
@@ -946,10 +947,19 @@ class MultiGridSim(MuscleSim):
                           float(self.presubframe_pintotarget), self.pos],
                   device=self._device)
 
+    def _kinematic_step(self, t: float) -> None:
+        """Kinematic drive at (fractional) frame ``t`` (vs the dynamic ``substep``):
+        set the bone-driven targets, hard-pin tendon verts, then soft-pin every vert
+        onto the bone. Shared by ``step_frame`` (once/frame) and
+        ``substep_at_frac_frame`` (once/substep)."""
+        self.load_frame_targets(t)
+        self.apply_pintotarget()       # hard pin (masked tendon, kinematic)
+        self.apply_pintotarget_all()   # soft pin (all verts, free)
+
     def step_frame(self, frame: int) -> None:
-        self.load_frame_targets(frame)
-        self.apply_pintotarget()
-        self.presubframe_pintotarget_step()
+        """One output frame held at integer ``frame``: kinematic-step once, then run
+        ``nsubsteps`` substeps against that constant bone pose."""
+        self._kinematic_step(frame)
         # Fascia rides the skeleton: advect the shell by this frame's bone motion
         # ONCE (target_pos is constant across the frame's substeps) before solving.
         if self.fascia is not None:
@@ -957,19 +967,17 @@ class MultiGridSim(MuscleSim):
         for _ in range(self.nsubsteps):
             self.substep()
 
-    def advance_substep(self, t: float) -> None:
+    def substep_at_frac_frame(self, t: float) -> None:
         """One substep driven by the bone pose at FRACTIONAL frame ``t``.
 
         Sub-frame bone path: instead of holding the bone target constant across a
         frame's substeps (``step_frame``), the caller loops this ``nsubsteps`` times
         with ``t`` easing ``frame-1 -> frame`` so the muscle tracks the bone's PATH,
-        not a once-per-frame teleport. ``load_frame_targets`` resamples the bone
-        surface at ``t`` (UsdSkel interpolates joints natively) and re-pins; one
-        substep advances the solve. Fascia is NOT supported here (the run loop
-        guards on ``use_fascia``)."""
-        self.load_frame_targets(t)
-        self.apply_pintotarget()
-        self.presubframe_pintotarget_step()
+        not a once-per-frame teleport. ``_kinematic_step`` resamples the bone surface
+        at ``t`` (UsdSkel interpolates joints natively) and re-pins; one substep
+        advances the solve. Fascia is NOT supported here (the run loop guards on
+        ``use_fascia``)."""
+        self._kinematic_step(t)
         self.substep()
 
     def positions_np(self) -> np.ndarray:

@@ -1,16 +1,22 @@
-"""Per-tet muscle activation driven by a USD curve asset (walk.usd).
+"""Per-tet muscle activation sources.
 
-walk.usd carries line-of-action muscles under ``/Human/Muscles/<Name>``, each with
-a per-frame scalar ``primvars:muscle:activation`` on its ``curve`` (BasisCurves).
-The volumetric otto solver instead has TetMesh muscles keyed by a camelCase
-``muscle_id`` (e.g. ``L_bicepsBrachialis``). ``muscle_mapping.json`` maps every walk
-curve to ONE otto muscle (many-to-one): several walk lines (``Bicep_Femoris_Longus``,
-``_Short``, ``_Short1``) share one otto muscle, so their activations are aggregated
-(mean by default; ``max`` optional). Unmapped walk entries (authored as empty ``{}``)
-are skipped; otto muscles with no walk source stay passive (activation 0).
+An *activation source* is any object exposing ``per_tet(frame) -> (NT,) float32`` —
+the per-(muscle)-tet activation for that frame, ready for
+``MultiGridSim.set_fiber_activation()``. The run loop is source-agnostic: it just
+asks the source each frame, so a USD curve asset, a linear ramp, an RL policy, a
+constant, etc. are interchangeable. Two concrete sources live here:
 
-Output: a per-(muscle)-tet activation array per frame, length = ``sim._fiber_nt``,
-ready for ``MultiGridSim.set_fiber_activation()``.
+  * ``UsdActivationSource`` — driven by a USD per-muscle curve asset (e.g. walk.usd).
+  * ``RampActivationSource`` — a fixed mask ramped 0->1 over the frame range.
+
+USD curve asset (walk.usd) carries line-of-action muscles under
+``/Human/Muscles/<Name>``, each with a per-frame scalar ``primvars:muscle:activation``
+on its ``curve`` (BasisCurves). The volumetric otto solver instead has TetMesh muscles
+keyed by a camelCase ``muscle_id`` (e.g. ``L_bicepsBrachialis``).
+``muscle_mapping.json`` maps every curve to ONE muscle (many-to-one): several lines
+(``Bicep_Femoris_Longus``, ``_Short``, ``_Short1``) share one muscle, so their
+activations are aggregated (mean by default; ``max`` optional). Unmapped entries
+(authored as empty ``{}``) are skipped; muscles with no source stay passive (0).
 """
 
 import json
@@ -19,18 +25,37 @@ from pathlib import Path
 import numpy as np
 
 
-class WalkActivationSource:
-    """Maps walk.usd per-muscle activation curves onto otto per-tet activation.
+class RampActivationSource:
+    """Linearly ramp a fixed per-tet ``mask`` from 0 to 1 across the frame range —
+    drives one named muscle's activation against the passive baseline (demo /
+    single-muscle contraction test). ``per_tet(frame) = clamp((frame-start)/span,
+    0, 1) * mask``."""
+
+    def __init__(self, mask, start_frame, end_frame):
+        self._mask = np.asarray(mask, dtype=np.float32)
+        self.start_frame = int(start_frame)
+        self.end_frame = int(end_frame)
+        self._span = max(1, self.end_frame - self.start_frame)
+
+    def per_tet(self, frame: int) -> np.ndarray:
+        a = (int(frame) - self.start_frame) / self._span
+        a = min(1.0, max(0.0, a))                    # clamp outside [start, end]
+        return (a * self._mask).astype(np.float32)
+
+
+class UsdActivationSource:
+    """Maps a USD per-muscle activation curve asset (e.g. walk.usd) onto per-tet
+    activation.
 
     Parameters
     ----------
-    usd_path : str           walk.usd (the curve-muscle asset with activation)
-    mapping_path : str       muscle_mapping.json ({"mappings": {"<walk>/curve": {"value": "<otto>"}}})
+    usd_path : str           the curve-muscle asset with per-frame activation
+    mapping_path : str       muscle_mapping.json ({"mappings": {"<name>/curve": {"value": "<muscle_id>"}}})
     muscle_id_np : (NT,) int per-(muscle)-tet global index into ``muscle_id_strings``
-    muscle_id_strings : list global muscle-id name table (otto camelCase names)
+    muscle_id_strings : list global muscle-id name table (camelCase names)
     start_frame, end_frame   inclusive frame range to read
-    muscles_root : str       scope holding the walk muscles
-    aggregate : "mean"|"max" how to merge several walk lines onto one otto muscle
+    muscles_root : str       scope holding the curve muscles
+    aggregate : "mean"|"max" how to merge several curves onto one muscle
     """
 
     def __init__(self, usd_path, mapping_path, muscle_id_np, muscle_id_strings,
@@ -99,11 +124,11 @@ class WalkActivationSource:
         no_source = sorted(muscle_id_strings[i] for i in present
                            if i not in driven and 0 <= i < n_strings)
 
-        print(f"[walk-activation] {usd_path}  agg={self.aggregate}  "
+        print(f"[usd-activation] {usd_path}  agg={self.aggregate}  "
               f"frames {self.start_frame}..{self.end_frame}")
-        print(f"  walk curves read: {n_walk}  unmapped(empty): {n_unmapped}  "
+        print(f"  curves read: {n_walk}  unmapped(empty): {n_unmapped}  "
               f"missing prim/attr: {n_missing}")
-        print(f"  otto muscles driven: {len(matched)}  "
+        print(f"  muscles driven: {len(matched)}  "
               f"mapping-name absent from asset: {len(missing_otto)}  "
               f"present-but-no-source: {len(no_source)}")
         if missing_otto:

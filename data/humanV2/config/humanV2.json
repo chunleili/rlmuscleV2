@@ -41,7 +41,7 @@
         "device": "cuda:0",
         "no_export": false,
         "geo_out": null,
-        "no_collide_primvars": true,
+        "output_collide_primvars": false,
         "activate": null,
         "collision": {
             "enabled": true,

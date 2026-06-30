@@ -68,8 +68,10 @@ new:  [bone moves] → preset muscle onto target → XPBD fixes only local detai
 
 - `src/muscle/mg/kernel.py` — `presubframe_pintotarget_kernel`:
   `pos[v] = pos[v] + beta * (target_pos + rest_offset − pos[v])` over all verts.
-- `src/muscle/mg/mg.py` — `MultiGridSim.presubframe_pintotarget_step()`, launched
-  from `step_frame()` AND `advance_substep()` immediately after `apply_pintotarget()`.
+- `src/muscle/mg/mg.py` — `MultiGridSim.apply_pintotarget_all()` (soft, all verts;
+  vs hard masked `apply_pintotarget`), launched from the shared `_kinematic_step(t)`
+  helper (bone targets → hard `apply_pintotarget` → soft `apply_pintotarget_all`) used by
+  both `step_frame()` (once/frame) and `substep_at_frac_frame()` (once/substep).
 - Config key `presubframe_pintotarget` (float `beta`, **0 = off, the default** —
   plain `otto.json` is unchanged; `1.0` = snap fully to target then relax). Set in
   `data/humanV2/config/otto_walk.json`.
