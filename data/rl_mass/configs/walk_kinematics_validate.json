@@ -1,7 +1,0 @@
-{
-    "walk_config": "data/rl_mass/configs/walk.json",
-    "checkpoint": "data/rl_mass/checkpoints/walk_max",
-    "angles_cohort_dir": "data/rl_mass/emg_moreira/raw/moreira_ascii.zip",
-    "out_dir": "output/walk_kinematics",
-    "max_steps": 420
-}
