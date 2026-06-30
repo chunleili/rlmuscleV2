@@ -21,12 +21,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Friendly muscle names
+# Friendly names. Each surface-EMG channel is compared to the f0-weighted
+# activation of the corresponding synergist group (electrode reads a region;
+# the redundant solver distributes within the group), so the model side is
+# labelled as the group.
 LABELS = {
-    "VL": "Vastus Lateralis",
-    "BF": "Biceps Femoris (hamstring)",
-    "TA": "Tibialis Anterior",
-    "GAL": "Gastrocnemius Lat",
+    "VL": "Vastus Lateralis\n(vs quadriceps)",
+    "BF": "Biceps Femoris\n(vs hamstrings)",
+    "TA": "Tibialis Anterior\n(vs dorsiflexors)",
+    "GAL": "Gastrocnemius Lat.\n(vs triceps surae)",
 }
 
 
