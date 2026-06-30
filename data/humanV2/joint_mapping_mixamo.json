@@ -1,0 +1,320 @@
+{
+    "mappings": {
+        "C_root": {},
+        "C_pelvis": {},
+        "C_spine_01": {
+            "reference": "name",
+            "value": "mixamorig:Spine"
+        },
+        "L_thigh": {
+            "reference": "name",
+            "value": "mixamorig:LeftUpLeg"
+        },
+        "R_thigh": {
+            "reference": "name",
+            "value": "mixamorig:RightUpLeg"
+        },
+        "C_spine_02": {},
+        "L_calf": {},
+        "L_thighTwist_01": {},
+        "L_thighTwist_02": {},
+        "L_thighTwist_03": {},
+        "R_calf": {},
+        "R_thighTwist_01": {},
+        "R_thighTwist_02": {},
+        "R_thighTwist_03": {},
+        "C_spine_03": {},
+        "L_foot": {
+            "reference": "name",
+            "value": "mixamorig:LeftFoot"
+        },
+        "L_fibula": {},
+        "L_patella": {
+            "reference": "name",
+            "value": "mixamorig:LeftLeg"
+        },
+        "L_calfTwist_01": {},
+        "L_calfTwist_02": {},
+        "L_calfTwist_03": {},
+        "R_foot": {
+            "reference": "name",
+            "value": "mixamorig:RightFoot"
+        },
+        "R_fibula": {},
+        "R_patella": {
+            "reference": "name",
+            "value": "mixamorig:RightLeg"
+        },
+        "R_calfTwist_01": {},
+        "R_calfTwist_02": {},
+        "R_calfTwist_03": {},
+        "C_spine_04": {
+            "reference": "name",
+            "value": "mixamorig:Spine1"
+        },
+        "L_ball": {
+            "reference": "name",
+            "value": "mixamorig:LeftToeBase"
+        },
+        "R_ball": {
+            "reference": "name",
+            "value": "mixamorig:RightToeBase"
+        },
+        "C_spine_05": {
+            "reference": "name",
+            "value": "mixamorig:Spine2"
+        },
+        "L_thumbToe_01": {},
+        "L_indexToe_01": {},
+        "L_middleToe_01": {},
+        "L_ringToe_01": {},
+        "L_pinkyToe_01": {},
+        "R_thumbToe_01": {},
+        "R_indexToe_01": {},
+        "R_middleToe_01": {},
+        "R_ringToe_01": {},
+        "R_pinkyToe_01": {},
+        "C_neck_01": {
+            "reference": "name",
+            "value": "mixamorig:Neck"
+        },
+        "L_claviclePec": {},
+        "L_clavicle": {
+            "reference": "name",
+            "value": "mixamorig:LeftShoulder"
+        },
+        "R_clavicle": {
+            "reference": "name",
+            "value": "mixamorig:RightShoulder"
+        },
+        "R_claviclePec": {},
+        "L_thumbToe_02": {},
+        "L_indexToe_02": {},
+        "L_middleToe_02": {},
+        "L_ringToe_02": {},
+        "L_pinkyToe_02": {},
+        "R_thumbToe_02": {},
+        "R_indexToe_02": {},
+        "R_middleToe_02": {},
+        "R_ringToe_02": {},
+        "R_pinkyToe_02": {},
+        "C_neck_02": {},
+        "L_upperarm": {
+            "reference": "name",
+            "value": "mixamorig:LeftArm"
+        },
+        "L_clavicleScap": {},
+        "R_upperarm": {
+            "reference": "name",
+            "value": "mixamorig:RightArm"
+        },
+        "R_clavicleScap": {},
+        "L_indexToe_03": {},
+        "L_middleToe_03": {
+            "reference": "name",
+            "value": "mixamorig:LeftToe_End"
+        },
+        "L_ringToe_03": {},
+        "L_pinkyToe_03": {},
+        "R_indexToe_03": {},
+        "R_middleToe_03": {
+            "reference": "name",
+            "value": "mixamorig:RightToe_End"
+        },
+        "R_ringToe_03": {},
+        "R_pinkyToe_03": {},
+        "C_neck_03": {},
+        "L_lowerarm": {
+            "reference": "name",
+            "value": "mixamorig:LeftForeArm"
+        },
+        "L_upperarmTwist_01": {},
+        "L_upperarmTwist_02": {},
+        "L_upperarmTwist_03": {},
+        "R_lowerarm": {
+            "reference": "name",
+            "value": "mixamorig:RightForeArm"
+        },
+        "R_upperarmTwist_01": {},
+        "R_upperarmTwist_02": {},
+        "R_upperarmTwist_03": {},
+        "C_neck_04": {},
+        "L_ulna": {},
+        "L_radius": {},
+        "L_hand": {
+            "reference": "name",
+            "value": "mixamorig:LeftHand"
+        },
+        "L_lowerarmTwist_01": {},
+        "L_lowerarmTwist_02": {},
+        "L_lowerarmTwist_03": {},
+        "R_hand": {
+            "reference": "name",
+            "value": "mixamorig:RightHand"
+        },
+        "R_ulna": {},
+        "R_radius": {},
+        "R_lowerarmTwist_01": {},
+        "R_lowerarmTwist_02": {},
+        "R_lowerarmTwist_03": {},
+        "C_head": {
+            "reference": "name",
+            "value": "mixamorig:Head"
+        },
+        "L_thumb_01": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandThumb2"
+        },
+        "L_indexMetacarpal": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandIndex1"
+        },
+        "L_middleMetacarpal": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandMiddle1"
+        },
+        "L_ringMetacarpal": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandRing1"
+        },
+        "L_pinkyMetacarpal": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandPinky1"
+        },
+        "R_middleMetacarpal": {
+            "reference": "name",
+            "value": "mixamorig:RightHandMiddle1"
+        },
+        "R_pinkyMetacarpal": {
+            "reference": "name",
+            "value": "mixamorig:RightHandPinky1"
+        },
+        "R_ringMetacarpal": {
+            "reference": "name",
+            "value": "mixamorig:RightHandRing1"
+        },
+        "R_thumb_01": {
+            "reference": "name",
+            "value": "mixamorig:RightHandThumb2"
+        },
+        "R_indexMetacarpal": {
+            "reference": "name",
+            "value": "mixamorig:RightHandIndex1"
+        },
+        "L_eye": {},
+        "C_jaw": {},
+        "R_eye": {},
+        "L_thumb_02": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandThumb3"
+        },
+        "L_index_01": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandIndex2"
+        },
+        "L_middle_01": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandMiddle2"
+        },
+        "L_ring_01": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandRing2"
+        },
+        "L_pinky_01": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandPinky2"
+        },
+        "R_middle_01": {
+            "reference": "name",
+            "value": "mixamorig:RightHandMiddle2"
+        },
+        "R_pinky_01": {
+            "reference": "name",
+            "value": "mixamorig:RightHandPinky2"
+        },
+        "R_ring_01": {
+            "reference": "name",
+            "value": "mixamorig:RightHandRing2"
+        },
+        "R_thumb_02": {
+            "reference": "name",
+            "value": "mixamorig:RightHandThumb3"
+        },
+        "R_index_01": {
+            "reference": "name",
+            "value": "mixamorig:RightHandIndex2"
+        },
+        "L_thumb_03": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandThumb4"
+        },
+        "L_index_02": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandIndex3"
+        },
+        "L_middle_02": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandMiddle3"
+        },
+        "L_ring_02": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandRing3"
+        },
+        "L_pinky_02": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandPinky3"
+        },
+        "R_middle_02": {
+            "reference": "name",
+            "value": "mixamorig:RightHandMiddle3"
+        },
+        "R_pinky_02": {
+            "reference": "name",
+            "value": "mixamorig:RightHandPinky3"
+        },
+        "R_ring_02": {
+            "reference": "name",
+            "value": "mixamorig:RightHandRing3"
+        },
+        "R_thumb_03": {
+            "reference": "name",
+            "value": "mixamorig:RightHandThumb4"
+        },
+        "R_index_02": {
+            "reference": "name",
+            "value": "mixamorig:RightHandIndex3"
+        },
+        "L_index_03": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandIndex4"
+        },
+        "L_middle_03": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandMiddle4"
+        },
+        "L_ring_03": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandRing4"
+        },
+        "L_pinky_03": {
+            "reference": "name",
+            "value": "mixamorig:LeftHandPinky4"
+        },
+        "R_middle_03": {
+            "reference": "name",
+            "value": "mixamorig:RightHandMiddle4"
+        },
+        "R_pinky_03": {
+            "reference": "name",
+            "value": "mixamorig:RightHandPinky4"
+        },
+        "R_ring_03": {
+            "reference": "name",
+            "value": "mixamorig:RightHandRing4"
+        },
+        "R_index_03": {
+            "reference": "name",
+            "value": "mixamorig:RightHandIndex4"
+        }
+    }
+}
