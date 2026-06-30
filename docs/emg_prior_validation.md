@@ -50,29 +50,42 @@ activations genuinely actuate the walk (not a cosmetic overlay).
 
 Per muscle-training minibatch (`src/rl_mass/train.py`, `OptimizeMuscleNN`):
 
-```
-L  =  0.01 · L_reg   +   L_torque   +   λ · L_emg
-```
+$$
+L = 0.01\,L_{\text{reg}} + L_{\text{torque}} + \lambda\,L_{\text{emg}}
+$$
 
-- `L_reg = mean(a²)` — minimum-activation regularizer (Σa² family, same as Static
-  Optimization).
-- `L_torque = mean( ((τ − τ_des) / 100)² )` — the activations must produce the
-  joint torques the motion requires (`τ = L·a + b`).
-- **`L_emg`** — the EMG prior (new):
+- $L_{\text{reg}} = \operatorname{mean}(a^2)$ — minimum-activation regularizer
+  ($\Sigma a^2$ family, same as Static Optimization).
+- $L_{\text{torque}} = \operatorname{mean}\!\left(\left(\dfrac{\tau - \tau_{\text{des}}}{100}\right)^{2}\right)$
+  — the activations must produce the joint torques the motion requires
+  ($\tau = L\,a + b$).
+- **$L_{\text{emg}}$** — the EMG prior (new):
 
-```
-L_emg  =  mean_over(channels c, samples b)  [  w_c · ( ā_c(b)  −  s · ê_c(φ_b) )²  ]
-```
+$$
+L_{\text{emg}} = \operatorname*{mean}_{\substack{c \in \text{channels}\\ b \in \text{samples}}}
+\Big[\, w_c \,\big(\bar a_c(b) - s\,\hat e_c(\varphi_b)\big)^{2} \,\Big]
+$$
 
 with
 
-```
-ā_c(b)  =  Σ_{m ∈ G_c}  ω_{c,m} · a_m(b)        f0 / PCSA-weighted group activation
-ω_{c,m} =  f0_m / Σ_{m'∈G_c} f0_{m'}            (rows sum to 1)
-ê_c(φ)  =  peak-normalised Moreira cohort EMG of channel c at gait phase φ
-φ_b     =  fmod(t_b , T_cycle) / T_cycle        gait phase tagged on each tuple
-gait%(φ) = ((φ − φ_hs) mod 1) · 100             heel-strike-aligned phase lookup
-```
+$$
+\bar a_c(b) = \sum_{m \in G_c} \omega_{c,m}\, a_m(b)
+\qquad
+\omega_{c,m} = \frac{f0_m}{\sum_{m' \in G_c} f0_{m'}}
+$$
+
+$$
+\varphi_b = \frac{\operatorname{fmod}(t_b,\, T_{\text{cycle}})}{T_{\text{cycle}}}
+\qquad
+\mathrm{gait\%}(\varphi) = \big((\varphi - \varphi_{\text{hs}}) \bmod 1\big)\cdot 100
+$$
+
+- $\bar a_c(b)$ — f0 / PCSA-weighted group activation; the weights $\omega_{c,m}$
+  sum to 1 over each group.
+- $\hat e_c(\varphi)$ — peak-normalised Moreira cohort EMG of channel $c$ at gait
+  phase $\varphi$.
+- $\varphi_b$ — gait phase tagged on each tuple; $\mathrm{gait\%}$ is the
+  heel-strike-aligned phase lookup.
 
 `c ∈ {VL, BF, TA, GAL}` are the four Moreira surface channels. Each maps to a
 **synergist group** `G_c` (a surface electrode detects a region), and the model
