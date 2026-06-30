@@ -137,13 +137,12 @@ class MassEnv:
         self.model = self.engine.model
         self.data = self.engine.data
 
-        # Character (BVH + SPD)
+        # Character (reference motion + SPD)
         self.character = Character(self.engine, kp=kp)
-        bvh_file = cfg["bvh_file"]
         bvh_cyclic = cfg.get("bvh_cyclic", True)
         # "character1" (default) -> MotionBuilder/HumanIK Character1_* joint
         #   names (18-joint biped) via MASS_BVH_MAP.
-        # "native" -> BVH already uses MASS body names (Pelvis, ArmL, ...).
+        # "native" -> motion already uses MASS body names (Pelvis, ArmL, ...).
         bvh_naming = cfg.get("bvh_naming", "character1")
         if bvh_naming == "native":
             from rl_mass.joint_utils import MASS_NATIVE_BVH_MAP
@@ -152,7 +151,13 @@ class MassEnv:
             bvh_map = None
         else:
             raise ValueError(f"bvh_naming must be 'character1' or 'native', got {bvh_naming!r}")
-        self.character.load_bvh(bvh_file, cyclic=bvh_cyclic, bvh_map=bvh_map)
+        # Reference motion source: a UsdSkel clip ("usd_file") takes precedence,
+        # else a classic .bvh ("bvh_file"). Both honour bvh_naming/bvh_cyclic.
+        usd_file = cfg.get("usd_file")
+        if usd_file:
+            self.character.load_usd(usd_file, cyclic=bvh_cyclic, bvh_map=bvh_map)
+        else:
+            self.character.load_bvh(cfg["bvh_file"], cyclic=bvh_cyclic, bvh_map=bvh_map)
 
         # Root joint DOFs (6 for FreeJoint)
         self.root_joint_dof: int = 6
