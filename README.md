@@ -78,6 +78,40 @@ uv run -m example.humanV2 --config data/humanV2/config/humanV2.json
 
 <table>
   <tr>
+    <td colspan="3"><h3>Muscle Fiber Activation</h3></td>
+  </tr>
+  <tr>
+    <td colspan="3">
+      Inject a passive <code>fibernorm</code> fiber constraint (absent in the
+      baseline config) and ramp one muscle's activation <b>0 → 1</b> against a
+      <b>static skeleton</b>. Tendon tips are hard-pinned and the belly is freed,
+      so the muscle contracts / bulges along its fibers. The USD
+      <code>displayColor</code> is a per-vertex displacement heatmap (blue → red).
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="src/example/humanV2_fiber.py">
+        <img width="320" src="docs/images/humanv2_fiber.png" alt="humanV2 right bicep fiber activation">
+      </a><br><b>humanV2 bicep fiber activation (right arm)</b>
+    </td>
+    <td align="center" width="33%"></td>
+    <td align="center" width="33%"></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%"><code>uv run -m example.humanV2_fiber</code></td>
+    <td align="center" width="33%"></td>
+    <td align="center" width="33%"></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%"><sub>→ <code>output/humanV2_fiber.usd</code></sub></td>
+    <td align="center" width="33%"></td>
+    <td align="center" width="33%"></td>
+  </tr>
+</table>
+
+<table>
+  <tr>
     <td colspan="3"><h3>Muscle / One-Way Coupling</h3></td>
   </tr>
   <tr>
