@@ -1,13 +1,21 @@
 """humanV2 fiber-activation demo — contract one muscle with a static skeleton.
 
 The baseline ``humanV2.json`` ships with NO fiber constraint (skeletal follow
-only). This example injects a passive ``fibernorm`` fiber constraint, hard-pins
-only the tendon TIPS (freeing the belly so it can bulge), holds the skeleton
-static at frame 1, and ramps the chosen muscle's activation **0 → 1** in equal
-levels — each settled to equilibrium. It writes a single time-sampled USD whose
-``displayColor`` is a per-vertex displacement heatmap (blue → red), so scrubbing
-the timeline shows the fiber contraction build up. A static grey skeleton
-(``/bones``) is included for reference.
+only). This example injects a HOBAK **anisotropic-ARAP** (``aniso_arap``) fiber
+constraint, hard-pins only the tendon TIPS (freeing the belly so it can bulge),
+holds the skeleton static at frame 1, and ramps the chosen muscle's activation
+**0 → 1** in equal levels — each settled to equilibrium. It writes a single
+time-sampled USD whose ``displayColor`` is a per-vertex displacement heatmap
+(blue → red), so scrubbing the timeline shows the fiber contraction build up. A
+static grey skeleton (``/bones``) is included for reference.
+
+``aniso_arap`` (quadratic HOBAK energy ``0.5*(s - SI4*fiberscale)^2``) is used
+instead of the linear ``fibernorm``: the latter normalizes its XPBD compliance by
+the tet rest VOLUME (``alpha = 1/(k*V0*dt^2)``, V0 ~ 1e-9), which makes the
+effective stiffness ~1e9x too small so the constraint never reaches its target
+(~0.2% shrink, bulge only visible via inertial overshoot). ``aniso_arap`` has no
+volume term (``alpha = 1/(k*dt^2)``), reaches the target, and gives a strong
+TARGET-DRIVEN static contraction (~25mm bulge vs ~2.6mm), insensitive to k.
 
     uv run -m example.humanV2_fiber                       # right bicep (default)
     uv run -m example.humanV2_fiber --muscle L_bicepsBrachialis
@@ -30,7 +38,8 @@ from example.humanV2 import build_humanV2_sim
 
 # Fixed fiber-demo parameters (tuned for a stable, visible, drift-free contraction
 # on the 468k-tet humanV2 mesh under the GPU Jacobi solver).
-FIBER_STIFFNESS = 1.0e8        # fibernorm constraint stiffness
+FIBER_MODEL = "aniso_arap"     # HOBAK quadratic anisotropic ARAP (target-driven)
+FIBER_STIFFNESS = 1.0e8        # aniso_arap stiffness (k-insensitive: reaches target)
 CONTRACTION_RATIO = 0.6        # target along-fiber shortening at activation 1
 FINE_ITERS = 100              # Jacobi iters/substep (large mesh needs many)
 PIN_THRESHOLD = 0.9           # tendonmask>thr -> hard pin (tips only; frees belly)
@@ -60,7 +69,7 @@ def _compact(surf_flat, n_verts):
 def build_fiber_config(config_path, muscle):
     """Patch the baseline humanV2 config for the fiber-activation demo: static
     single frame, no fascia/collision, tendon-tip pin (freed belly), and an
-    injected fibernorm fiber constraint. Returns the cfg dict."""
+    injected aniso_arap (HOBAK) fiber constraint. Returns the cfg dict."""
     cfg = load_config(config_path)
     cfg["start_frame"] = 1
     cfg["end_frame"] = 1
@@ -75,7 +84,7 @@ def build_fiber_config(config_path, muscle):
             c["region"] = "tendonmask"
             c["tendon_pin_threshold"] = PIN_THRESHOLD
     cfg.setdefault("constraints", []).append(dict(
-        type="fiber", name="fiber", enable=True, fiber_model="fibernorm",
+        type="fiber", name="fiber", enable=True, fiber_model=FIBER_MODEL,
         stiffness=FIBER_STIFFNESS, dampingratio=0.1,
         contraction_ratio=CONTRACTION_RATIO))
     demo = cfg.setdefault("demo", {})
@@ -88,7 +97,7 @@ def run(config_path, muscle, out):
     wp.init()
     cfg = build_fiber_config(config_path, muscle)
     sim = build_humanV2_sim(cfg)
-    print(f"[fiber-demo] activate '{muscle}'  fibernorm k={sim.fiber_stiffness:g} "
+    print(f"[fiber-demo] activate '{muscle}'  {sim.fiber_model} k={sim.fiber_stiffness:g} "
           f"ratio={sim.contraction_ratio}  fine_iters={sim.fine_iters}  "
           f"tip-pin>{PIN_THRESHOLD} belly_k={BELLY_STIFFNESS:g}")
 

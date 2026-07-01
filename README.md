@@ -82,11 +82,17 @@ uv run -m example.humanV2 --config data/humanV2/config/humanV2.json
   </tr>
   <tr>
     <td colspan="3">
-      Inject a passive <code>fibernorm</code> fiber constraint (absent in the
-      baseline config) and ramp one muscle's activation <b>0 → 1</b> against a
-      <b>static skeleton</b>. Tendon tips are hard-pinned and the belly is freed,
-      so the muscle contracts / bulges along its fibers. The USD
+      Inject a HOBAK <b>anisotropic-ARAP</b> (<code>aniso_arap</code>) fiber
+      constraint (absent in the baseline config) and ramp one muscle's activation
+      <b>0 → 1</b> against a <b>static skeleton</b>. Tendon tips are hard-pinned and
+      the belly is freed, so the muscle contracts / bulges along its fibers. The USD
       <code>displayColor</code> is a per-vertex displacement heatmap (blue → red).
+      <br><sub><code>aniso_arap</code> replaces the linear <code>fibernorm</code>:
+      the latter normalizes its XPBD compliance by the tet rest volume, making the
+      effective stiffness ~1e9× too small to reach the contraction target
+      (~0.2&nbsp;% shrink); <code>aniso_arap</code> reaches the target and gives a
+      strong, k-insensitive <b>target-driven</b> contraction (~28&nbsp;mm right-bicep
+      bulge vs ~8&nbsp;mm). See <a href="docs/fiber_jacobi_debug.md">docs/fiber_jacobi_debug.md</a>.</sub>
     </td>
   </tr>
   <tr>

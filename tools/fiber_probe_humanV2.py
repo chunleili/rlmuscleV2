@@ -101,6 +101,11 @@ def main():
     ap.add_argument("--act", type=float, default=1.0)
     ap.add_argument("--fiber-stiffness", type=float, default=1e8)
     ap.add_argument("--contraction-ratio", type=float, default=0.4)
+    ap.add_argument("--fiber-model", default="aniso_arap",
+                    choices=["fibernorm", "aniso_arap"],
+                    help="fibernorm = linear TETFIBERNORM (branch2 + target); "
+                         "aniso_arap = HOBAK quadratic anisotropic ARAP (branch1, "
+                         "TETARAPANISO: SI4 inversion flag + detF/s>1.5 guard)")
     ap.add_argument("--fiber-scale", type=float, default=None,
                     help="override sim.fiber_stiffness_scale (default mg.py hardcoded 1.0)")
     ap.add_argument("--collision", action="store_true", help="keep SDF bone collision on")
@@ -155,7 +160,7 @@ def main():
     cfg["use_colored_gs"] = (args.mode == "cgs")
     # Inject fiber constraint humanV2.json omits.
     cfg.setdefault("constraints", []).append(dict(
-        type="fiber", name="fiber", enable=True, fiber_model="fibernorm",
+        type="fiber", name="fiber", enable=True, fiber_model=args.fiber_model,
         stiffness=args.fiber_stiffness, dampingratio=0.1,
         contraction_ratio=args.contraction_ratio))
     demo = cfg.setdefault("demo", {})

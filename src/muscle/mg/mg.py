@@ -178,11 +178,15 @@ class MultiGridSim(MuscleSim):
         # attribute, so the two passive Houdini fiber models are supported:
         #   "fibernorm"  -> solve_fibernorm_kernel  (linear TETFIBERNORM)
         #   "aniso_arap" -> solve_aniso_arap_kernel (quadratic HOBAK fiber)
+        # Default is "aniso_arap": fibernorm normalizes XPBD compliance by the tet
+        # rest volume (alpha=1/(k*V0*dt^2), V0~1e-9) so its effective stiffness is
+        # ~1e9x too small to reach the contraction target (~0.2% shrink); aniso_arap
+        # has no volume term and reaches the target (target-driven ~25mm bulge).
         # The active "fibermillard" model still needs per-tet activation (from an
         # RL trajectory) that the asset lacks, so it remains gated off.
         _fib = find_constraint(cfg, "fiber")
         self.use_fiber = _fib is not None
-        self.fiber_model = str((_fib or {}).get("fiber_model", "fibernorm"))
+        self.fiber_model = str((_fib or {}).get("fiber_model", "aniso_arap"))
         self.fiber_stiffness = float((_fib or {}).get("stiffness", 1.0e8))
         self.fiber_damp = float((_fib or {}).get("dampingratio", 0.0))
         self.contraction_ratio = float((_fib or {}).get("contraction_ratio", 0.4))
