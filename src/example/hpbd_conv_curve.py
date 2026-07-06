@@ -83,6 +83,9 @@ REGIMES = {
     "squash": ("squash", ["off", "hpbd_sync"]),
     "pin":    ("pin",    ["off", "hpbd_sync"]),
     "attach": ("attach", ["off", "projection", "hpbd_sync"]),
+    # round-trip: drive the attach target rest -> F0 bone -> rest (triangle alpha).
+    # Ends at rest, so the FINAL residual-vs-rest is meaningful (recovery quality).
+    "cycle":  ("cycle",  ["off", "hpbd_sync"]),
 }
 
 
@@ -98,7 +101,7 @@ def build_cfg(base, solver_over, drive):
     cfg.update(solver_over)
     for c in cfg.get("constraints", []):
         if c.get("name") == "belly_attach":
-            c["enable"] = (drive == "attach")
+            c["enable"] = drive in ("attach", "cycle")
     if drive in ("squash", "pin"):
         cfg["mg_coarse_attach_beta"] = 0.0
     return cfg
@@ -130,12 +133,25 @@ def run_variant(base, name, drive, F0, M, device, squash_scale, pin_frac):
     sumbuf = wp.zeros(1, dtype=wp.float32, device=device)
     sim.preload_targets([F0])
 
+    tgt_cycle = None
     if drive == "squash":
         # no BC: start compressed, relax freely (no kinematic drive)
         sq = squash_positions(sim.pos0_np.astype(np.float32), squash_scale)
         sim.pos = wp.from_numpy(sq, dtype=wp.vec3, device=device)
         sim.pprev = wp.from_numpy(sq, dtype=wp.vec3, device=device)
         sim.vel.zero_()
+    elif drive == "cycle":
+        # round-trip: start at REST, drive the attach target rest -> F0 bone -> rest
+        # over M substeps (triangle alpha). Ends at rest so the final residual-vs-rest
+        # measures how cleanly the solver recovered (no hysteresis / stuck fold).
+        rest_np = sim.pos0_np.astype(np.float32)
+        sim.pos = wp.from_numpy(rest_np, dtype=wp.vec3, device=device)
+        sim.pprev = wp.from_numpy(rest_np, dtype=wp.vec3, device=device)
+        sim.vel.zero_()
+        sim.load_frame_targets(F0)                    # target_pos = F0 bone goal
+        tgt_F0 = sim.target_pos.numpy().copy()
+        tgt_rest = rest_np.copy()                     # alpha=0 goal = rest (mesh rest_offset=0)
+        tgt_cycle = (tgt_rest, tgt_F0)
     else:
         # pin/attach: start at rest, freeze the bone BC at F0
         sim.pos = wp.from_numpy(sim.pos0_np.astype(np.float32), dtype=wp.vec3, device=device)
@@ -151,6 +167,13 @@ def run_variant(base, name, drive, F0, M, device, squash_scale, pin_frac):
 
     rows = [(0, arap_rms(sim, fine_B, sumbuf), sim.count_inverted())]
     for k in range(M):
+        if tgt_cycle is not None:
+            # triangle alpha over the M substeps: 0 -> 1 (at M/2) -> 0 (at M)
+            frac = (k + 1) / M
+            alpha = 1.0 - abs(2.0 * frac - 1.0)
+            tgt = ((1.0 - alpha) * tgt_cycle[0] + alpha * tgt_cycle[1]).astype(np.float32)
+            sim.target_pos.assign(tgt)
+            sim._update_belly_attach_targets()        # fine attach follows; coarse tracks in _coarse_solve
         sim.substep()
         r = arap_rms(sim, fine_B, sumbuf)
         rows.append((k + 1, r, sim.count_inverted()))
@@ -179,7 +202,8 @@ def main():
 
     titles = {"squash": "no BC - squash recovery (free ARAP)",
               "pin": f"Dirichlet BC - pin (bone-nearest {pin_frac:.0%})",
-              "attach": "Neumann BC - attach (belly_attach)"}
+              "attach": "Neumann BC - attach (belly_attach)",
+              "cycle": "round-trip rest->F0->rest (final residual = recovery)"}
     print(f"C-residual convergence: F0={F0}, {M} substeps; regimes={regimes}; "
           f"squash_scale={squash_scale}; pin_frac={pin_frac:g}")
 

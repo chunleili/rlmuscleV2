@@ -194,6 +194,16 @@ class MultiGridSim(MuscleSim):
         # HPBD coarse-solve knobs (mg_mode='hpbd' only).
         self.mg_coarse_iters = int(cfg.get("mg_coarse_iters", 15))     # coarse ARAP sweeps/substep
         self.mg_coarse_attach_beta = float(cfg.get("mg_coarse_attach_beta", 0.5))  # coarse BC pull
+        # Coarse PIN (Dirichlet) BC: a coarse node is a hard pin if this fraction of
+        # the fine verts embedding around it are themselves fine hard-pins
+        # (muscleToBonePin). Built in _build_coarse_arap by restricting the fine pin
+        # set onto the cage. These coarse nodes are moved kinematically to the bone
+        # target then held while the free cage ARAP-relaxes.
+        self.mg_coarse_pin_frac = float(cfg.get("mg_coarse_pin_frac", 0.5))
+        # hpbd step-1 restrict operator: "direct" -> _restrict_cage (state restrict,
+        # galerkin or c2f per mg_sync_restrict); "galerkin" -> target restrict; "none"
+        # -> SKIP restrict (coarse evolves on its own, isolation test).
+        self.mg_restrict_mode = str(cfg.get("mg_restrict_mode", "direct")).lower()
         # Diagnostic (Test-A): skip the coarse ARAP relax, keep only the soft attach
         # to the restricted bone target. Isolates BC-consistency failure (a) from
         # coarse-cage-inversion failure (b): if attach-only is stable+helps while
@@ -513,7 +523,7 @@ class MultiGridSim(MuscleSim):
             # hands the belly a smooth bone-following start before the fine attach.
             if self.coarse_npz_path is None:
                 raise ValueError("use_multigrid=true requires coarse_npz_path")
-            self._init_coarse_cage()
+            self._init_coarse()
 
         # Fascia: a standalone shell sub-solver (its own MuscleSim: ARAP + volume)
         # coupled by anchor + two-way glue. It builds itself in __init__ (loads the
@@ -701,15 +711,16 @@ class MultiGridSim(MuscleSim):
 
     # ------------------------------------------------------------------
 
-    def _init_coarse_cage(self) -> None:
-        """Load the conforming per-muscle cage + baked transfer maps from the npz
-        produced by tools/gen_coarse_cage.py (--method inflate, the default).
-        Restrict is the Galerkin least-squares projection (P^T P)^-1 P^T; prolong
-        is the f->c barycentric. Projection-only V-cycle: it hands the fine solve a
-        smooth bone-following start with no measurable downside. No coarse ARAP
-        relax — a free coarse smooth dragged the cage off the clean projection
-        toward its rest shape and blew the fine residual up ~100x (removed; see
-        docs/humanV2_cage_multigrid.md)."""
+    def _init_coarse(self) -> None:
+        """Initialise the whole coarse level in one place.
+
+        (1) Load the conforming per-muscle cage + baked transfer maps from the npz
+        produced by tools/gen_coarse_cage.py (--method inflate, the default): prolong
+        is the f->c barycentric (cage_idx/uvw), restrict is the Galerkin least-squares
+        projection (P^T P)^-1 P^T (minv_flat/blk_*). Auto-bakes the npz on first run.
+        (2) For mg_mode='hpbd', additionally allocate the coarse cage's OWN ARAP-SVD
+        sim state (rest matrices, redistributed mass, attach + pin masks) so it can
+        run the same otto XPBD ARAP as the fine muscle. Called once from __init__."""
         device = self._device
         # Auto-bake on first run: the cage npz is a gitignored asset, so a fresh
         # checkout won't have it. Rather than fail, invoke tools/gen_coarse_cage.py
@@ -759,22 +770,33 @@ class MultiGridSim(MuscleSim):
               f"coarse NV={self.coarse_NV} NT={self.coarse_NT}; "
               f"Galerkin lsq restrict (projection-only)")
 
-        if self.mg_mode == "hpbd":
-            self._build_coarse_arap(d, device)
+        if self.mg_mode != "hpbd":
+            return
 
-    def _build_coarse_arap(self, d, device) -> None:
-        """Allocate the coarse level's independent ARAP-SVD sim state (mg_mode='hpbd').
-
-        The coarse cage runs the SAME otto XPBD ARAP-SVD constraint
-        (solve_tetarap_svd_kernel) as the fine muscle, on its own tets + rest
-        matrices + REDISTRIBUTED mass (fine total_mass spread over coarse nodes by
-        coarse-tet volume). stopped=0 everywhere (its BC is the soft attach to the
-        restricted bone target, not hard pins). Quasi-static (no coarse velocity):
-        each substep it relaxes from its persistent previous state toward the bone
-        pose; the validated squash bench showed quasi-static coarse suffices."""
+        # ---- hpbd: allocate the coarse level's own ARAP-SVD sim state. The coarse
+        # cage runs the SAME otto XPBD ARAP-SVD constraint (solve_tetarap_svd_kernel)
+        # as the fine muscle, on its own tets + rest matrices + REDISTRIBUTED mass
+        # (fine total_mass spread over coarse nodes by coarse-tet volume). Quasi-
+        # static: relaxes from its persistent prev state toward the bone pose. ----
         cpos = d["coarse_pos"].astype(np.float64)
         ctet = d["coarse_tet"].astype(np.int64)
-        B_np = _rest_B_p3ref(cpos, ctet)
+        # FAS consistency: the coarse ARAP REST must be the RESTRICTION of the fine rest
+        # (q0 = (P^T P)^-1 P^T x_fine_rest), NOT the baked cage rest. Otherwise
+        # restrict(fine_rest) != coarse ARAP rest, so the per-substep state-sync hands the
+        # coarse relax a "strained" rest and delta-prolong injects strain (+ inversions)
+        # even at global equilibrium — the MG correction MUST vanish at the solution.
+        rest_dense = wp.from_numpy(self.pos0_np.astype(np.float32), dtype=wp.vec3, device=device)
+        self.coarse_b.zero_()
+        wp.launch(restrict_galerkin_scatter_kernel, dim=self.mg_fine_nv,
+                  inputs=[self.cage_idx, self.uvw, self.coarse_tet_idx, rest_dense, self.coarse_b],
+                  device=device)
+        q0 = wp.zeros(self.coarse_NV, dtype=wp.vec3, device=device)
+        wp.launch(block_solve_kernel, dim=self.coarse_NV,
+                  inputs=[self.minv_flat, self.blk_base, self.blk_dim, self.blk_matoff,
+                          self.coarse_b, q0],
+                  device=device)
+        q0_np = q0.numpy().astype(np.float64)
+        B_np = _rest_B_p3ref(q0_np, ctet)
         m_np = _node_mass_redistribute(cpos, ctet, self.total_mass)
         # Coarse attach mask: a node has a VALID restricted target only if some fine
         # vert scatters onto it (nonzero P column). Nodes with a zero column get
@@ -787,26 +809,66 @@ class MultiGridSim(MuscleSim):
         wacc = np.zeros(self.coarse_NV)
         np.add.at(wacc, corners.reshape(-1), np.abs(w4).reshape(-1))
         attach_mask = (wacc > 1e-9).astype(np.int32)
+        # Coarse PIN mask: restrict the FINE hard-pin set (muscleToBonePin.pin_active)
+        # onto the cage. Per fine vert map its pin flag onto its 4 coarse corners with
+        # |w4|; a coarse node is a pin if the pinned fraction of the fine weight around
+        # it >= mg_coarse_pin_frac (it sits in the bone-attached region). Unlike
+        # attach_mask (ALL referenced nodes, soft beta), this is the Dirichlet subset
+        # to move kinematically to the bone target and then hold during the coarse
+        # relax. NB: taken from the pre-fascia pin_active (fascia rebuilds it later;
+        # use_fascia is off for the cage bench).
+        fine_pin = np.zeros(self.mg_fine_nv, dtype=np.float64)
+        fine_pin[self._pin_pts_np] = self.pin_active.numpy().astype(np.float64)
+        pin_acc = np.zeros(self.coarse_NV)
+        np.add.at(pin_acc, corners.reshape(-1),
+                  (fine_pin[:, None] * np.abs(w4)).reshape(-1))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pin_frac_node = np.where(wacc > 1e-9, pin_acc / wacc, 0.0)
+        coarse_pin = ((pin_frac_node >= self.mg_coarse_pin_frac)
+                      & (wacc > 1e-9)).astype(np.int32)
         self.coarse_B = wp.from_numpy(B_np, dtype=wp.mat33, device=device)
         self.coarse_mass = wp.from_numpy(m_np, dtype=wp.float32, device=device)
         self.coarse_tetid = wp.from_numpy(
             np.arange(self.coarse_NT, dtype=np.int32), dtype=wp.int32, device=device)
         self.coarse_stiffness = wp.from_numpy(
             np.full(self.coarse_NT, self.mu, np.float32), dtype=wp.float32, device=device)
-        self.coarse_stopped = wp.zeros(self.coarse_NV, dtype=wp.int32, device=device)
+        # Pin nodes are held fixed (inv_mass 0) during the coarse ARAP relax: their
+        # kinematic bone-target position IS the coarse Dirichlet BC. All-zero when the
+        # asset has no fine pins (free/no-BC squash regime — cage relaxes freely).
+        self.coarse_stopped = wp.from_numpy(coarse_pin, dtype=wp.int32, device=device)
         self.coarse_L = wp.zeros(self.coarse_NT, dtype=wp.vec3, device=device)
         self.coarse_dP = wp.zeros(self.coarse_NV, dtype=wp.vec3, device=device)
         self.coarse_dPw = wp.zeros(self.coarse_NV, dtype=wp.float32, device=device)
         self.coarse_prev = wp.zeros(self.coarse_NV, dtype=wp.vec3, device=device)
         self.coarse_attach_mask = wp.from_numpy(attach_mask, dtype=wp.int32, device=device)
-        n_attach = int(attach_mask.sum())
+        # Coarse constraint set mirroring the fine muscleToBonePin (mesh mode: every
+        # node is a constraint point -> identity pts, zero rest_offset). coarse_pin_active
+        # selects the hard-pin subset (restricted from the fine pins). coarse_target_pos
+        # is a FIXED per-node bone goal: the fine bone target (target_pos, read from the
+        # CURRENT-pose bone at init) c2f-restricted onto the cage once below. No per-frame
+        # update — the pins hold this constant bone pose as the coarse Dirichlet BC.
+        self.coarse_NCONS = self.coarse_NV
+        self.coarse_pts = wp.from_numpy(
+            np.arange(self.coarse_NV, dtype=np.int32), dtype=wp.int32, device=device)
+        self.coarse_rest_offset = wp.zeros(self.coarse_NV, dtype=wp.vec3, device=device)
+        self.coarse_target_pos = wp.zeros(self.coarse_NV, dtype=wp.vec3, device=device)
+        self.coarse_pin_active = wp.from_numpy(coarse_pin, dtype=wp.int32, device=device)
+        n_pin_c = int(coarse_pin.sum())
+        print(f"[hpbd] coarse PIN mask from fine pins: {n_pin_c}/{self.coarse_NV} "
+              f"coarse nodes are Dirichlet pins (frac>={self.mg_coarse_pin_frac:g}); "
+              f"fine hard-pins={int(fine_pin.sum())}")
         print(f"[hpbd] coarse ARAP sim: {self.coarse_NT} tets, mass redistributed "
-              f"(total={m_np.sum():.4g}); {n_attach}/{self.coarse_NV} nodes soft-attached "
-              f"to bone target (rest unreferenced follow ARAP); "
-              f"{self.mg_coarse_iters} coarse sweeps/substep, attach beta="
-              f"{self.mg_coarse_attach_beta:g}")
-        if self.mg_coarse_sync_state and self.mg_sync_restrict == "c2f":
+              f"(total={m_np.sum():.4g}); {self.mg_coarse_iters} ARAP sweeps/substep; "
+              f"BC = kinematic-pin {n_pin_c} nodes to bone pose then hold (Dirichlet), "
+              f"free cage relaxes")
+        # c2f (coarse-in-fine) embedding is only well-conditioned when coarse verts sit
+        # INSIDE fine tets; the baked cage is fine-in-coarse (enclosing), so c2f
+        # extrapolates (|w|>>1). Build it ONLY for the opt-in c2f state-restrict.
+        if self.mg_sync_restrict == "c2f":
             self._build_c2f_embedding(cpos, device)
+        # coarse_target_pos (the coarse bone goal) is refreshed each substep in
+        # _coarse_solve (_refresh_coarse_target = Galerkin restrict of the current fine
+        # target), so the coarse attach/pin BC tracks a moving bone target.
 
     def _build_c2f_embedding(self, cpos, device) -> None:
         """Bunny-style coarse-in-fine embedding for the c2f state-restrict: for each
@@ -872,17 +934,20 @@ class MultiGridSim(MuscleSim):
                   device=self._device)
         return int(cnt.numpy()[0])
 
-    def _restrict_fine_state_to_coarse(self) -> None:
-        """Galerkin-restrict the CURRENT fine positions onto the coarse cage:
-        coarse_pos = (P^T P)^-1 P^T x_fine (Test-C, mg_coarse_sync_state=true).
-
-        Re-syncs the coarse scaffold to the fine each substep so the subsequent
-        relax + delta-prolong produces a TRUE MG correction (vanishes when the fine
-        is already smooth) rather than a free-running coarse whose per-substep delta
-        adds a SECOND copy of the bone motion on top of the fine's own belly-attach."""
+    def _restrict_cage(self) -> None:
+        """Pipeline step 1 — reset the coarse cage to the CURRENT fine STATE. Operator
+        chosen by mg_sync_restrict:
+          "galerkin" (default; REQUIRED for the fine-in-coarse enclosing cage): the
+            least-squares restrict coarse_pos = (P^T P)^-1 P^T x_fine (scatter fine pos
+            -> per-muscle block-solve). Bounded weights.
+          "c2f": bunny-style coarse-in-fine barycentric readout coarse_pos = Σ w
+            fine_pos. Only valid when coarse verts sit INSIDE fine tets; on an enclosing
+            cage it extrapolates (|w|>>1) and blows the fine solve up (NaN, mass
+            inversions).
+        Coarse re-solves from this fresh fine-consistent state, so the delta-prolonged
+        correction is a TRUE residual correction (vanishes when the fine is smooth)."""
         s = self
         if s.mg_sync_restrict == "c2f":
-            # Bunny-style direct barycentric readout: coarse_pos[c] = Σ w fine_pos.
             wp.launch(restrict_c2f_kernel, dim=s.coarse_NV,
                       inputs=[s.c2f_tet, s.c2f_w, s.pos, s.coarse_pos],
                       device=s._device)
@@ -895,31 +960,84 @@ class MultiGridSim(MuscleSim):
                   inputs=[s.minv_flat, s.blk_base, s.blk_dim, s.blk_matoff,
                           s.coarse_b, s.coarse_pos],
                   device=s._device)
+        
+    def _restrict(self,mode="direct"):
+        if mode=="direct":
+            self._restrict_cage()
+        elif mode=="galerkin":
+            self._restrict_galerkin()
+        else:
+            return
 
-    def _hpbd_vcycle(self) -> None:
-        """TRUE HPBD coarse correction (mg_mode='hpbd'), once per substep before the
-        fine iters. coarse_target must already hold the restricted bone target (set
-        by _restrict()). Save q -> relax coarse (ARAP + soft attach to the bone pose,
-        interleaved) -> delta-prolong the coarse DISPLACEMENT onto fine.pos."""
+    def _coarse_kinematic_pin(self) -> None:
+        """Pipeline step 2a — kinematic Dirichlet BC on the coarse cage. Hard-overwrite
+        the coarse PIN nodes (coarse_pin_active, restricted from the fine
+        muscleToBonePin set) to their FIXED coarse_target_pos (the coarse rest pose — no
+        per-frame bone update for now), then hold them (coarse_stopped) while the free
+        cage ARAP-relaxes. No-op when there are no coarse pins (all zero)."""
         s = self
-        if s.mg_coarse_sync_state:
-            s._restrict_fine_state_to_coarse()               # coarse_pos = R x_fine
-        wp.copy(s.coarse_prev, s.coarse_pos)                 # q_j
-        for _ in range(s.mg_coarse_iters):
-            if s.mg_coarse_arap:
-                s._coarse_arap_sweep()
-            wp.launch(dense_soft_attach_kernel, dim=s.coarse_NV,
-                      inputs=[s.coarse_target, s.coarse_attach_mask,
-                              s.mg_coarse_attach_beta, s.coarse_pos],
-                      device=s._device)
-        # eq (7): fine.pos[i] += Σ_j w_ij (coarse_pos[j] − coarse_prev[j])
-        wp.launch(prolong_delta_kernel, dim=s.mg_fine_nv,
-                  inputs=[s.coarse_pos, s.coarse_prev, s.coarse_tet_idx,
-                          s.cage_idx, s.uvw, s.pos],
+        # Hard-overwrite the pinned coarse nodes (coarse_pin_active==1) to their fixed
+        # target; freed nodes (==0) are skipped and left for the ARAP relax.
+        wp.launch(pintotarget_overwrite_masked_kernel, dim=s.coarse_NCONS,
+                  inputs=[s.coarse_pts, s.coarse_target_pos, s.coarse_rest_offset,
+                          s.coarse_pin_active, s.coarse_pos],
                   device=s._device)
 
-    # ------------------------------------------------------------------
+    def _refresh_coarse_target(self) -> None:
+        """Fill coarse_target_pos = Galerkin least-squares restrict of the CURRENT fine
+        bone goal (target_pos + rest_offset scattered onto the dense fine field). The
+        coarse attach + pin BC pull toward this. Called once (lazily, first coarse
+        solve) so it captures the scenario's held bone pose, then frozen."""
+        s = self
+        wp.launch(scatter_target_kernel, dim=s.NCONS,
+                  inputs=[s.pts, s.target_pos, s.rest_offset, s.fine_target_dense],
+                  device=s._device)
+        s.coarse_b.zero_()
+        wp.launch(restrict_galerkin_scatter_kernel, dim=s.mg_fine_nv,
+                  inputs=[s.cage_idx, s.uvw, s.coarse_tet_idx,
+                          s.fine_target_dense, s.coarse_b],
+                  device=s._device)
+        wp.launch(block_solve_kernel, dim=s.coarse_NV,
+                  inputs=[s.minv_flat, s.blk_base, s.blk_dim,
+                          s.blk_matoff, s.coarse_b, s.coarse_target_pos],
+                  device=s._device)
 
+    def _coarse_solve(self) -> None:
+        """Run the coarse cage as a STANDALONE sim with its OWN BC (independent of the
+        fine): kinematic-pin its Dirichlet nodes to their target (before the iters),
+        then XPBD-relax by ARAP interleaved with the soft-attach Neumann BC
+        (dense_soft_attach toward coarse_target_pos, beta=mg_coarse_attach_beta). Pinned
+        nodes stay fixed (coarse_stopped). beta=0 (squash/pin regimes) -> pure ARAP, no
+        attach drive."""
+        s = self
+        s._refresh_coarse_target()                           # track the current (moving) bone goal
+        s._coarse_kinematic_pin()                            # Dirichlet pin, before iters
+        for _ in range(s.mg_coarse_iters):
+            s._coarse_arap_sweep()                           # ARAP
+            wp.launch(dense_soft_attach_kernel, dim=s.coarse_NV,   # Neumann attach BC
+                      inputs=[s.coarse_target_pos, s.coarse_attach_mask,
+                              s.mg_coarse_attach_beta, s.coarse_pos],
+                      device=s._device)
+
+    def _hpbd_vcycle(self) -> None:
+        """TRUE HPBD V-cycle (mg_mode='hpbd'), once per substep before the fine iters:
+        (1) restrict — reset the coarse cage to the current fine state (Galerkin
+            least-squares state restrict by default, _restrict_cage);
+        (2) coarse solve — run the coarse as a STANDALONE sim with its own BC
+            (_coarse_solve: kinematic pin + ARAP interleaved with the soft-attach
+            Neumann BC toward the bone target);
+        (3) prolong — add the coarse displacement (coarse_pos − q_j) back onto the
+            fine as a delta correction (prolong_delta_kernel, Müller 2008 eq 7).
+        Fine post-smoothing is the iter_phase that follows. q_j is snapshotted BEFORE
+        the coarse solve, so the coarse's BC-driven motion is the prolonged correction."""
+        s = self
+        s._restrict(s.mg_restrict_mode)                      # (1) coarse_pos = restrict(fine state)
+        wp.copy(s.coarse_prev, s.coarse_pos)                 # q_j snapshot
+        s._coarse_solve()                                    # (2) standalone coarse sim + BC
+        s._prolong("delta")                                  # (3) delta-prolong to fine
+
+
+    # ------------------------------------------------------------------
     def tet_mask_for_muscles(self, names) -> np.ndarray:
         """Boolean per-(muscle)-tet mask selecting tets in the named muscles.
 
@@ -1057,7 +1175,7 @@ class MultiGridSim(MuscleSim):
 
     # ─── Multigrid V-cycle: restrict → prolong (projection-only) ─────────────
 
-    def _restrict(self) -> None:
+    def _restrict_galerkin(self) -> None:
         """Fine → coarse transfer, writing ``coarse_pos``.
 
         Coarse is a bone-driven scaffold: scatter the dense fine bone target,
@@ -1096,16 +1214,23 @@ class MultiGridSim(MuscleSim):
         if s.mg_mode == "projection":
             wp.copy(s.coarse_pos, s.coarse_target)
 
-    def _prolong(self) -> None:
+    def _prolong(self, mode="direct") -> None:
         """Coarse → fine transfer: blend each fine vert from its containing
         coarse tet (barycentric prolong P), writing ``pos``."""
-        wp.launch(
-            prolong_kernel,
-            dim=getattr(self, "mg_fine_nv", self.NV),
-            inputs=[self.coarse_pos, self.coarse_tet_idx,
-                    self.cage_idx, self.uvw, self.pos],
-            device=self._device,
-        )
+        s = self
+        if mode == "delta":
+            wp.launch(prolong_delta_kernel, dim=s.mg_fine_nv,    # (3) delta-prolong
+                  inputs=[s.coarse_pos, s.coarse_prev, s.coarse_tet_idx,
+                          s.cage_idx, s.uvw, s.pos],
+                  device=s._device)
+        elif mode == "direct":
+            wp.launch(
+                prolong_kernel,
+                dim=s.NV,
+                inputs=[s.coarse_pos, s.coarse_tet_idx,
+                        s.cage_idx, s.uvw, s.pos],
+                device=s._device,
+            )
 
     def build_program(self):
         s = self
@@ -1118,23 +1243,9 @@ class MultiGridSim(MuscleSim):
             # pin- or prolong-polluted one.
             s.integrate()
             if s.use_multigrid and s.mg_mode == "hpbd":
-                # TRUE HPBD coarse correction, ONCE per substep before the fine iters:
-                # restrict sets the coarse BC target, hard-pin the tendon, then relax
-                # the cage toward the restricted bone pose and delta-prolong its motion
-                # onto the predicted fine state. Low modes drive high; the fine iters
-                # then add high-freq detail + enforce the fine BC (pin/belly/collision).
-                # _restrict MUST run first: it fills coarse_target (the coarse BC the
-                # cage soft-attaches toward). Without it coarse_target stays zero and
-                # the cage is dragged to the origin (attach regime, beta>0 -> blow-up).
-                s._restrict()
                 s._hpbd_vcycle()
             elif s.use_multigrid:
-                # Projection V-cycle: restrict fine→coarse (Galerkin projection of the
-                # bone target onto the cage), absolute-prolong coarse→fine onto the
-                # predicted state, then re-pin kinematically. Projection-only — no
-                # coarse relax.
-                s._restrict()
-
+                s._restrict_galerkin()
                 s._prolong()
             s.apply_pintotarget()
 

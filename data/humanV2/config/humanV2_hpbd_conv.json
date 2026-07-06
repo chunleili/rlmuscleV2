@@ -16,7 +16,7 @@
     "use_multigrid": true,
     "mg_mode": "hpbd",
     "mg_coarse_iters": 15,
-    "mg_coarse_attach_beta": 0.5,
+    "mg_coarse_attach_beta": 0.0,
     "mg_coarse_sync_state": true,
     "coarse_npz_path": "data/humanV2/model/muscle/coarse_cage.npz",
     "omega": 0.1,
@@ -29,7 +29,7 @@
 
     "conv_frame": 120,
     "conv_substeps": 120,
-    "conv_regimes": ["squash", "pin", "attach"],
+    "conv_regimes": ["squash", "pin", "attach", "cycle"],
     "conv_squash_scale": [1, 0, 1],
     "conv_pin_frac": 0.15,
     "bench_out": "output/hpbd_conv",
