@@ -1,0 +1,46 @@
+{
+    "start_frame": 1,
+    "end_frame": 200,
+    "geo_dir": "data/humanV2/model",
+    "cons_dir": "data/humanV2/model/cons",
+    "target_mode": "mesh",
+    "use_sliding": false,
+    "bone_dir": "data/humanV2/model/bone",
+    "slide_range": 0.005,
+    "slide_interval": 999999,
+    "rest_path": "data/humanV2/model/muscle/restpos.geo",
+
+    "use_fascia": false,
+
+    "quasi_static": false,
+    "use_multigrid": true,
+    "mg_mode": "hpbd",
+    "mg_coarse_iters": 15,
+    "mg_coarse_attach_beta": 0.5,
+    "mg_coarse_sync_state": true,
+    "coarse_npz_path": "data/humanV2/model/muscle/coarse_cage.npz",
+    "omega": 0.1,
+    "delta_t": 0.04166,
+    "gravity": [0.0, 0.0, 0.0],
+    "total_mass": 70.0,
+    "mass_density": -1.0,
+    "fine_iterations": 20,
+    "nsubsteps": 10,
+
+    "conv_frame": 120,
+    "conv_substeps": 120,
+    "diag_variants": ["off", "projection", "hpbd_sync", "hpbd_sync_attach"],
+    "bench_out": "output/hpbd_conv",
+
+    "constraints": [
+        { "type": "tetarapsvd", "name": "arap",          "enable": true,  "stiffness": 1e6, "dampingratio": 0.1 },
+        { "type": "attach",     "name": "belly_attach",  "enable": true,  "stiffness": 1e6, "dampingratio": 0.1 },
+        { "type": "pin",        "name": "muscleToBonePin","enable": true,  "region": "pinmask", "pin_threshold": 0.5 }
+    ],
+
+    "demo": {
+        "out": "output/humanV2/humanV2_hpbd_conv.usd",
+        "device": "cuda:0",
+        "no_export": true
+    }
+}

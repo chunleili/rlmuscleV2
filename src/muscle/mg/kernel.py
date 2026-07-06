@@ -2,6 +2,120 @@ from __future__ import annotations
 
 import warp as wp
 
+from muscle.constraint.solve_kernels import ssvd_fn
+
+
+@wp.kernel
+def prolong_delta_kernel(
+    coarse_pos: wp.array(dtype=wp.vec3),      # coarse pos AFTER this level's solve
+    coarse_prev: wp.array(dtype=wp.vec3),     # coarse pos saved BEFORE the solve (q_j)
+    coarse_tet: wp.array(dtype=wp.vec4i),
+    cage_idx: wp.array(dtype=wp.int32),
+    uvw: wp.array(dtype=wp.vec3),
+    fine_pos: wp.array(dtype=wp.vec3),        # in/out: fine.pos[i] += prolonged delta
+):
+    """TRUE HPBD prolongation — Müller 2008 "Hierarchical Position Based Dynamics"
+    §7, eq (7):  p_i <- p_i + Σ_{j∈P(i)} w_ij (p_j − q_j).
+
+    Propagate only the coarse level's projection DISPLACEMENT (coarse_pos −
+    coarse_prev), barycentric-weighted onto the fine children, NOT the absolute
+    coarse position (that is `prolong_kernel`). §8: "only the corrections computed
+    on a level are propagated down ... this guarantees that all the small detail in
+    the high resolution levels is preserved." Because the increment → 0 as the
+    coarse reaches its own rest, it can never bias the fine equilibrium (unlike the
+    absolute restrict/prolong FAS scheme). Low modes drive high modes."""
+    i = wp.tid()
+    t = cage_idx[i]
+    idx = coarse_tet[t]
+    b = uvw[i]
+    u = b[0]
+    v = b[1]
+    w = b[2]
+    a = 1.0 - u - v - w
+    d0 = coarse_pos[idx[0]] - coarse_prev[idx[0]]
+    d1 = coarse_pos[idx[1]] - coarse_prev[idx[1]]
+    d2 = coarse_pos[idx[2]] - coarse_prev[idx[2]]
+    d3 = coarse_pos[idx[3]] - coarse_prev[idx[3]]
+    fine_pos[i] = fine_pos[i] + (a * d0 + u * d1 + v * d2 + w * d3)
+
+
+@wp.kernel
+def restrict_c2f_kernel(
+    c2f_tet: wp.array(dtype=wp.vec4i),    # per coarse vert: its enclosing/nearest fine tet
+    c2f_w: wp.array(dtype=wp.vec4),       # per coarse vert: barycentric weights in that tet
+    fine_pos: wp.array(dtype=wp.vec3),
+    coarse_pos: wp.array(dtype=wp.vec3),  # out: coarse_pos[c] = Σ_k w[c,k] fine_pos[tet_k]
+):
+    """BUNNY-STYLE (coarse-in-fine) direct position restriction, the realtimeMuscle
+    scheme: each coarse vert is embedded in a FINE tet, so its position is read
+    straight off the fine mesh by barycentric interpolation. Contrast the Galerkin
+    restrict (restrict_galerkin_scatter_kernel + block_solve_kernel) which uses the
+    fine-in-coarse operator P and its pseudo-inverse. Well-conditioned only when the
+    coarse vert sits inside a fine tet (weights in [0,1]); enclosing cages extrapolate
+    (|w|>1) and amplify fine motion."""
+    c = wp.tid()
+    t = c2f_tet[c]
+    w = c2f_w[c]
+    coarse_pos[c] = (w[0] * fine_pos[t[0]] + w[1] * fine_pos[t[1]]
+                     + w[2] * fine_pos[t[2]] + w[3] * fine_pos[t[3]])
+
+
+@wp.kernel
+def dense_soft_attach_kernel(
+    target: wp.array(dtype=wp.vec3),
+    mask: wp.array(dtype=wp.int32),       # 1 = node has a valid restricted target
+    beta: wp.float32,
+    pos: wp.array(dtype=wp.vec3),
+):
+    """Coarse-level BC: soft-pull every REFERENCED coarse node toward its
+    (restricted) bone target, ``pos += beta·(target − pos)``. beta=1 snaps, <1
+    partial. Interleaved with the coarse ARAP sweeps so the coarse scaffold tracks
+    the bone pose while ARAP keeps its shape; its per-substep motion is
+    delta-prolonged to the fine.
+
+    ``mask`` skips coarse nodes with a zero P column (no fine vert scatters onto
+    them): the Galerkin block-solve leaves those targets at the ORIGIN, so
+    attaching them would drag the cage to (0,0,0). Unmasked, they follow the ARAP
+    sweep via their referenced neighbours — which is the correct free behaviour."""
+    i = wp.tid()
+    if mask[i] == 0:
+        return
+    pos[i] = pos[i] + beta * (target[i] - pos[i])
+
+
+@wp.kernel
+def arap_residual_accum_kernel(
+    tet: wp.array(dtype=wp.vec4i),
+    pos: wp.array(dtype=wp.vec3),
+    rest_matrix: wp.array(dtype=wp.mat33),    # B = inv(Dm), Dm cols (p0-p3,p1-p3,p2-p3)
+    out_sumsq: wp.array(dtype=wp.float32),    # length 1: accumulates Σ C^2
+):
+    """Accumulate Σ C² where C = ‖σ(F) − 1‖ per tet — the same ARAP-SVD constraint
+    value `solve_tetarap_svd_kernel` drives to zero. Host divides by NT and sqrts
+    for the residual RMS (matches tools/cage_diagnostic.arap_residual). Reference
+    vert is pt3 (V2 convention), oriented SVD via ssvd_fn so tet winding is
+    irrelevant to the metric."""
+    c = wp.tid()
+    pts = tet[c]
+    p0 = pos[pts[0]]
+    p1 = pos[pts[1]]
+    p2 = pos[pts[2]]
+    p3 = pos[pts[3]]
+    c0 = p0 - p3
+    c1 = p1 - p3
+    c2 = p2 - p3
+    Ds = wp.mat33(
+        c0[0], c1[0], c2[0],
+        c0[1], c1[1], c2[1],
+        c0[2], c1[2], c2[2])
+    F = Ds * rest_matrix[c]
+    svd = ssvd_fn(F)
+    s = svd.sigma
+    csq = ((s[0] - 1.0) * (s[0] - 1.0)
+           + (s[1] - 1.0) * (s[1] - 1.0)
+           + (s[2] - 1.0) * (s[2] - 1.0))
+    wp.atomic_add(out_sumsq, 0, csq)
+
 
 @wp.kernel
 def scatter_target_kernel(
