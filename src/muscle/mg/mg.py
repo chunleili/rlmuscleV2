@@ -74,8 +74,8 @@ def find_constraint(cfg: dict, name: str) -> dict | None:
     dampingratio / extra params). Returns None when absent OR when the entry sets
     ``"enable": false`` — so a constraint can be toggled off in place without
     deleting its tuned params. ``enable`` defaults to true. For the optional
-    constraints (muscle volume, fiber) absence/disabled == off; for the mandatory
-    ones (arap, belly_attach) disabling raises at the call site."""
+    constraints (muscle volume, fiber, belly_attach) absence/disabled == off;
+    only arap is mandatory (disabling it raises at the call site)."""
     for c in cfg.get("constraints", []):
         if c.get("name") == name:
             return c if c.get("enable", True) else None
@@ -420,13 +420,13 @@ class MultiGridSim(MuscleSim):
         self.pin_active = None  # rebuilt by Fascia (glue-ring free) when fascia is active
 
         # Belly-attach constraint config (the compliant pin for the FREED verts —
-        # those not hard-pinned to bone). Stiffness / dampingratio only.
+        # those not hard-pinned to bone). OPTIONAL: absent or disabled leaves the
+        # belly FREE (no compliant pin) — e.g. a pure no-BC squash-recovery test, or
+        # a Dirichlet-only case where the hard pins are the sole drive.
         _belly = find_constraint(cfg, "belly_attach")
-        if _belly is None:
-            raise ValueError("constraints[] must define a 'belly_attach' entry "
-                             "(the freed-belly compliant pin)")
-        self.pin_attach_stiffness = float(_belly["stiffness"])
-        self.pin_attach_damp = float(_belly.get("dampingratio", 0.0))
+        self._belly_enabled = _belly is not None
+        self.pin_attach_stiffness = float(_belly["stiffness"]) if _belly else 0.0
+        self.pin_attach_damp = float(_belly.get("dampingratio", 0.0)) if _belly else 0.0
 
         # Muscle-to-bone HARD pin set (REQUIRED, type 'pin'). `region` selects WHICH
         # muscle verts are hard-pinned to their bone target (pin_active==1); the rest
@@ -500,9 +500,12 @@ class MultiGridSim(MuscleSim):
         # it (vs a position-blend pin they could not move). The fine attach is
         # built after fascia so pin_active is final.
         self.attach_L = None
-        print(f"[belly-attach] XPBD point attach for belly verts "
-              f"(stiffness={self.pin_attach_stiffness:g}, "
-              f"dampingratio={self.pin_attach_damp:g})")
+        if self._belly_enabled:
+            print(f"[belly-attach] XPBD point attach for belly verts "
+                  f"(stiffness={self.pin_attach_stiffness:g}, "
+                  f"dampingratio={self.pin_attach_damp:g})")
+        else:
+            print("[belly-attach] disabled: belly verts left free (no compliant pin)")
 
         if self.use_multigrid:
             # The conforming cage feeds the full-pin scaffold path (Galerkin
@@ -655,7 +658,12 @@ class MultiGridSim(MuscleSim):
             self._build_colored_gs(cons)
 
     def _build_fine_belly_attach(self):
-        """Append a per-belly-vert ATTACH constraint (target filled per frame)."""
+        """Append a per-belly-vert ATTACH constraint (target filled per frame).
+        No-op when belly_attach is disabled — the belly is then left free."""
+        if not self._belly_enabled:
+            self._belly_cons_idx = np.empty(0, dtype=np.int64)
+            self._belly_attach_off = None
+            return
         active = (self.pin_active.numpy() if self.pin_active is not None
                   else np.ones(self.NCONS, np.int32))
         k = float(self.pin_attach_stiffness)
@@ -1103,44 +1111,41 @@ class MultiGridSim(MuscleSim):
         s = self
 
         def pre_phase():
+            # XPBD PREDICT FIRST: snapshot pprev=pos and apply inertia. Every
+            # subsequent step in the substep (MG restrict/correct, kinematic pin,
+            # fine smoothing) operates on this predicted state, and the end-of-substep
+            # velocity v=(pos-pprev)/dt is measured from the true prior state — not a
+            # pin- or prolong-polluted one.
+            s.integrate()
             if s.use_multigrid and s.mg_mode == "hpbd":
-                # TRUE HPBD: restrict only sets coarse_target (the coarse BC); the
-                # coarse ARAP relax + delta-prolong runs in iter_phase (after
-                # integrate snapshots pprev). No absolute prolong here.
+                # TRUE HPBD coarse correction, ONCE per substep before the fine iters:
+                # restrict sets the coarse BC target, hard-pin the tendon, then relax
+                # the cage toward the restricted bone pose and delta-prolong its motion
+                # onto the predicted fine state. Low modes drive high; the fine iters
+                # then add high-freq detail + enforce the fine BC (pin/belly/collision).
+                # _restrict MUST run first: it fills coarse_target (the coarse BC the
+                # cage soft-attaches toward). Without it coarse_target stays zero and
+                # the cage is dragged to the origin (attach regime, beta>0 -> blow-up).
                 s._restrict()
-                s.apply_pintotarget()
+                s._hpbd_vcycle()
             elif s.use_multigrid:
-                # V-cycle: restrict fine→coarse (Galerkin projection of the bone
-                # target onto the cage), prolong coarse→fine, then re-pin
-                # kinematically. Projection-only — no coarse relax.
+                # Projection V-cycle: restrict fine→coarse (Galerkin projection of the
+                # bone target onto the cage), absolute-prolong coarse→fine onto the
+                # predicted state, then re-pin kinematically. Projection-only — no
+                # coarse relax.
                 s._restrict()
+
                 s._prolong()
-                s.apply_pintotarget()
-            else:
-                # No multigrid: re-apply the hard tendon pin every substep (the
-                # MG branch above does this via prolong). Freed belly verts are
-                # driven by the compliant belly-attach in iter_phase.
-                s.apply_pintotarget()
-            # Fascia anchor + glue run in post_phase (s.fascia.substep), AFTER the
-            # muscle solve, so the shell tracks the just-updated muscle and the
-            # two-way glue squeezes the relaxed belly.
-            # XPBD Lagrange / Jacobi accumulators are reset by s.clear() inside
-            # iter_phase each fine iter — no per-substep HPBD L.zero_() needed.
+            s.apply_pintotarget()
+
 
 
         def iter_phase():
-            # SoA XPBD sweep. Quasi-static integrate snapshots pprev=pos; each
-            # fine iter clears the Jacobi accumulators + constraint Lagrange,
-            # dispatches the built constraint table (ARAP-SVD + optional volume /
-            # fiber / belly-attach — parallel-Jacobi over constraint types),
+            # Fine XPBD smoothing sweep (predict + coarse correction already done in
+            # pre_phase). Each fine iter clears the Jacobi accumulators + constraint
+            # Lagrange, dispatches the built constraint table (ARAP-SVD + optional
+            # volume / fiber / belly-attach — parallel-Jacobi over constraint types),
             # applies the averaged correction, then re-pins kinematically.
-            s.integrate()
-            # TRUE HPBD coarse correction: relax the cage toward the restricted bone
-            # pose and delta-prolong its motion onto the fine predicted state, once
-            # per substep before the fine iters. Low modes drive high; the fine iters
-            # then add high-freq detail + enforce the fine BC (pin/belly/collision).
-            if s.use_multigrid and s.mg_mode == "hpbd":
-                s._hpbd_vcycle()
             for it in range(s.fine_iters):
                 s.clear()
                 s.solve_constraints(run_extras=False)

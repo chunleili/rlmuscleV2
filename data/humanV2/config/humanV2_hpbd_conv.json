@@ -29,7 +29,9 @@
 
     "conv_frame": 120,
     "conv_substeps": 120,
-    "diag_variants": ["off", "projection", "hpbd_sync", "hpbd_sync_attach"],
+    "conv_regimes": ["squash", "pin", "attach"],
+    "conv_squash_scale": [1, 0, 1],
+    "conv_pin_frac": 0.15,
     "bench_out": "output/hpbd_conv",
 
     "constraints": [
