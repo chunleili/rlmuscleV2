@@ -17,10 +17,10 @@ import csv
 import numpy as np
 from pxr import Usd, UsdGeom, Sdf, Vt
 
-# pin=full-pin diagnostic (emil_full.json), nopin=attach-only (emil_nopin.json),
-# tendon=canonical tendon-only pin (emil.json).
-RUNS = {"pin": "output/emil/emil_full.anim.usd", "nopin": "output/emil/emil_nopin.anim.usd",
-        "tendon": "output/emil/emil.anim.usd"}
+# full=100% hard-pin diagnostic (emil_full.json), nopin=soft attach 1e6 (emil_nopin.json),
+# softanchor=canonical: no hard pin + stiff soft attach 1e8, min inversions (emil.json).
+RUNS = {"full": "output/emil/emil_full.anim.usd", "nopin": "output/emil/emil_nopin.anim.usd",
+        "softanchor": "output/emil/emil.anim.usd"}
 PRIM = "/char/sim/muscle"
 OUT = "output/emil/emil_spike.usdc"
 CSV = "output/emil/emil_spike.csv"
@@ -120,6 +120,6 @@ for name in RUNS:
             mesh.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(pts[i]), Usd.TimeCode(f))
             cols = jet(rough[name][i] / VMAX if VMAX > 0 else rough[name][i])
             pv.GetAttr().Set(Vt.Vec3fArray.FromNumpy(cols), Usd.TimeCode(f))
-vset.SetVariantSelection("pin")
+vset.SetVariantSelection("full")   # default to the spiky diagnostic; toggle to softanchor to see the fix
 stage.GetRootLayer().Save()
 print(f"WROTE {OUT}  (variantSet run = {list(RUNS)}, jet roughness VMAX={VMAX*1e3:.2f}mm)")

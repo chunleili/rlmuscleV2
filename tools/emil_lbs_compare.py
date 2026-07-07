@@ -27,10 +27,13 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap, Normalize
 from matplotlib.cm import ScalarMappable
 from scipy.spatial import cKDTree
-from pxr import Usd, UsdGeom, Sdf, Vt
+from pxr import Usd, UsdGeom, UsdSkel, Sdf, Vt
 
 SOLVER_USD = "output/emil/emil.anim.usd"
 SOLVER_PRIM = "/char/sim/muscle"
+BONE_ROOT = "/char/bone"                       # UsdSkel SkelRoot in the solver USD
+BONE_MESH = "/char/bone/SKM_skeleton_upper_body"
+BONE_SKEL = "/char/bone/Skel"
 LBS_NPZ = "output/emil/emil_lbs.npz"
 OUT = "output/emil/emil_cmp_dist.usdc"
 CBAR = "output/emil/colorbar_emil_dist.png"
@@ -92,6 +95,26 @@ with open(VOLCSV, "w", newline="") as fh:
 print(f"WROTE {VOLCSV}  solver vol f{frames[0]}->f{frames[-1]}: "
       f"{vol[0,0]*1e3:.2f}L->{vol[-1,0]*1e3:.2f}L  lbs: {vol[0,1]*1e3:.2f}L->{vol[-1,1]*1e3:.2f}L")
 
+# ---- bake the skeleton (UsdSkel-skinned in the solver USD -> per-frame points so
+#      ANY viewer shows bone + muscle moving together; gives the attach context) ----
+_cache = UsdSkel.Cache()
+_cache.Populate(UsdSkel.Root(s.GetPrimAtPath(BONE_ROOT)), Usd.PrimDefaultPredicate)
+_bp = s.GetPrimAtPath(BONE_MESH)
+_sq = _cache.GetSkinningQuery(_bp)
+_skq = _cache.GetSkelQuery(UsdSkel.Skeleton(s.GetPrimAtPath(BONE_SKEL)))
+_brest = np.asarray(UsdGeom.PointBased(_bp).GetPointsAttr().Get(), np.float32)
+_bM = np.array(UsdGeom.XformCache().GetLocalToWorldTransform(_bp)).reshape(4, 4)
+_bmesh = UsdGeom.Mesh(_bp)
+bone_fc = np.asarray(_bmesh.GetFaceVertexCountsAttr().Get(), np.int32)
+bone_fi = np.asarray(_bmesh.GetFaceVertexIndicesAttr().Get(), np.int32)
+bone_pts = np.empty((len(frames), len(_brest), 3), np.float32)
+for i, f in enumerate(frames):
+    _pts = Vt.Vec3fArray.FromNumpy(_brest.copy())
+    _sq.ComputeSkinnedPoints(_skq.ComputeSkinningTransforms(f), _pts, f)
+    a = np.asarray(_pts, np.float32)
+    bone_pts[i] = (np.c_[a, np.ones(len(a), np.float32)] @ _bM)[:, :3]
+print(f"bone: baked {len(_brest)} verts x {len(frames)} frames")
+
 # ---- heatmap stage ----
 stage = Usd.Stage.CreateNew(OUT)
 stage.SetStartTimeCode(t0); stage.SetEndTimeCode(t1)
@@ -124,8 +147,19 @@ UsdGeom.PrimvarsAPI(ref.GetPrim()).CreatePrimvar(
 ).GetAttr().Set(Vt.Vec3fArray.FromNumpy(np.array([[0.6, 0.6, 0.6]], np.float32)))
 UsdGeom.Imageable(ref.GetPrim()).CreateVisibilityAttr().Set(UsdGeom.Tokens.invisible)  # off by default
 
+# skeleton, baked per-frame points, constant dark-grey (attach context)
+bone = UsdGeom.Mesh.Define(stage, "/emil_cmp/bone")
+bone.GetFaceVertexCountsAttr().Set(Vt.IntArray.FromNumpy(bone_fc))
+bone.GetFaceVertexIndicesAttr().Set(Vt.IntArray.FromNumpy(bone_fi))
+bpp = bone.GetPointsAttr()
+for i, f in enumerate(frames):
+    bpp.Set(Vt.Vec3fArray.FromNumpy(bone_pts[i]), Usd.TimeCode(f))
+UsdGeom.PrimvarsAPI(bone.GetPrim()).CreatePrimvar(
+    "displayColor", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.constant
+).GetAttr().Set(Vt.Vec3fArray.FromNumpy(np.array([[0.35, 0.35, 0.4]], np.float32)))
+
 stage.GetRootLayer().Save()
-print(f"WROTE {OUT}  (/emil_cmp/solver jet heatmap + /emil_cmp/lbs grey ref)")
+print(f"WROTE {OUT}  (/emil_cmp/solver jet heatmap + /emil_cmp/lbs grey ref + /emil_cmp/bone)")
 
 # ---- colorbar ----
 vmm = round(VMAX * 1e3, 1)
