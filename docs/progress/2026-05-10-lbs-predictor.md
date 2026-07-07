@@ -1,3 +1,7 @@
+> **⚠️ Historical progress log.** The `MultigridMuscleSim` / `coarse_solver.py`
+> GMG references below are from the old `coupleOneWay` codebase (since replaced by
+> `src/muscle/mg/mg.py`). Current multigrid: [`../humanV2_cage_multigrid.md`](../humanV2_cage_multigrid.md).
+
 # LBS-as-predictor (bone-driven muscles without collision)
 
 ## 背景

@@ -17,9 +17,12 @@ Three regimes (one panel each), to compare MG under no BC vs the two BC types:
           bone pose; the rest of the belly relaxes by ARAP from that pinned
           boundary. attach is neutralized so the pin is the only drive.
 
-  attach  (Neumann BC): every muscle vert soft-attached (belly_attach) to the F0
-          bone pose, driven from rest. This is the humanV2 muscle's real BC —
-          the regime where hpbd_sync was shown to be BIASED.
+  attach  (Robin BC): every muscle vert soft-attached (belly_attach) to the F0
+          bone pose, driven from rest. A compliant spring (force ∝ k(target−x))
+          is a Robin / elastic-support BC — NOT Neumann (which prescribes a
+          displacement-independent traction). Limits: k→∞ = Dirichlet, k→0 =
+          Neumann. This is the humanV2 muscle's real BC — the regime where
+          hpbd_sync was shown to be BIASED.
 
 projection MG only appears in the attach panel: it restricts and teleports the
 full bone target, which is meaningful only for all-vert attach. In squash it
@@ -82,7 +85,7 @@ VARIANTS = {
 REGIMES = {
     "squash": ("squash", ["off", "hpbd_sync"]),
     "pin":    ("pin",    ["off", "hpbd_sync"]),
-    "attach": ("attach", ["off", "projection", "hpbd_sync"]),
+    "attach": ("attach", ["off", "hpbd_sync"]),
     # round-trip: drive the attach target rest -> F0 bone -> rest (triangle alpha).
     # Ends at rest, so the FINAL residual-vs-rest is meaningful (recovery quality).
     "cycle":  ("cycle",  ["off", "hpbd_sync"]),
@@ -92,8 +95,8 @@ REGIMES = {
 def build_cfg(base, solver_over, drive):
     """Deep-merge base + solver override + regime BC override.
 
-    The Neumann belly-attach is a genuine on/off per regime: attach ENABLES it (it
-    IS the Neumann BC); squash/pin DISABLE it entirely — squash recovers freely,
+    The Robin belly-attach is a genuine on/off per regime: attach ENABLES it (it
+    IS the Robin/elastic-support BC); squash/pin DISABLE it entirely — squash recovers freely,
     pin is driven only by its hard pins. squash/pin also kill the coarse soft-attach
     (beta=0). The base belly_attach entry supplies the stiffness the attach regime
     uses; its enable flag is overridden here per regime."""
@@ -202,7 +205,7 @@ def main():
 
     titles = {"squash": "no BC - squash recovery (free ARAP)",
               "pin": f"Dirichlet BC - pin (bone-nearest {pin_frac:.0%})",
-              "attach": "Neumann BC - attach (belly_attach)",
+              "attach": "Robin BC - attach (belly_attach)",
               "cycle": "round-trip rest->F0->rest (final residual = recovery)"}
     print(f"C-residual convergence: F0={F0}, {M} substeps; regimes={regimes}; "
           f"squash_scale={squash_scale}; pin_frac={pin_frac:g}")
@@ -244,7 +247,7 @@ def main():
         ax.set_ylim(ymin * 0.7, ymax * 1.4)
         ax.grid(True, which="both", alpha=0.3)
         ax.legend()
-    fig.suptitle(f"ARAP C-residual convergence, F0={F0}: no BC vs Dirichlet vs Neumann",
+    fig.suptitle(f"ARAP C-residual convergence, F0={F0}: no BC vs Dirichlet vs Robin",
                  fontsize=13)
     fig.tight_layout()
     png = os.path.join(out_dir, f"conv_cresidual_F{F0}.png")

@@ -1,3 +1,7 @@
+> **⚠️ Historical plan.** `OneWaySim` / `coupleOneWayGmg/solver.py` and its
+> multigrid phase references predate `src/muscle/mg/mg.py` (`MultiGridSim`) and no
+> longer exist. Current multigrid: [`../../humanV2_cage_multigrid.md`](../../humanV2_cage_multigrid.md).
+
 # Unified XPBD Engine Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

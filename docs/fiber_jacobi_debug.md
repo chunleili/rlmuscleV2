@@ -79,12 +79,18 @@ the gain is modest vs simply raising iterations (200 iters → 9.6 mm). And mg's
 colored-GS is impractically slow here: graph coloring gives **116 colors**
 (~90 s to build) + 116 sequential kernel launches per substep → launch-bound.
 
-## Result 4 — multigrid makes it WORSE (rules it out as a fix)
+## Result 4 — the `projection` multigrid makes it WORSE (rules it out as a fix)
 
-Real config + `use_multigrid=true` (coarse cage 28131 NV): max_disp **0.18 mm**,
-shrink ~0 %. The projection-only V-cycle restricts the bone target onto the cage
-and prolongs, re-imposing the bone/rest shape each substep — same clamping family
-as the all-vert belly-attach, stronger. Not a fix.
+Real config + `use_multigrid=true`, **`mg_mode=projection`** (coarse cage 28131
+NV): max_disp **0.18 mm**, shrink ~0 %. The projection V-cycle restricts the bone
+target onto the cage and prolongs, re-imposing the bone/rest shape each substep —
+same clamping family as the all-vert belly-attach, stronger. Not a fix.
+
+> This applies to `mg_mode=projection` only. The current `mg_mode=hpbd`
+> (state-sync residual smoother + delta-prolong, see
+> [`humanV2_cage_multigrid.md`](humanV2_cage_multigrid.md)) does not teleport to
+> the bone target, so it does not clamp the same way — but fiber contraction was
+> never MG's job; fixes 1–2 below are the real levers.
 
 ## Verdict & fixes
 
@@ -102,7 +108,8 @@ Fix, in order of leverage:
    "fibernorm","stiffness":1e8,"contraction_ratio":0.4}` + an activation source.
 3. **Converge harder on the big mesh**: raise `fine_iterations` (20→100+), or use
    colored-GS (faster/iter but needs the 116-color launch cost optimized). Do NOT
-   rely on `use_multigrid` for fiber — it suppresses contraction.
+   rely on `mg_mode=projection` for fiber — it suppresses contraction (hpbd does
+   not, but MG is not the fiber lever regardless).
 4. Not the problem: `fiber_stiffness_scale` (mg hardcodes 1.0 vs bicep 10000 —
    irrelevant, saturated), ARAP-SVD stiffness, omega.
 

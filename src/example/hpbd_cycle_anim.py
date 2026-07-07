@@ -34,9 +34,14 @@ for _p in (str(_REPO_ROOT), str(_REPO_ROOT / "src")):
 from muscle.mg.mg import MultiGridSim, load_config
 from muscle.util.mesh_io import vectorized_surface_tris
 
-# Force the validated hpbd_sync variant (mirror hpbd_conv_curve.VARIANTS["hpbd_sync"]).
-HPBD_SYNC = {"use_multigrid": True, "mg_mode": "hpbd",
-             "mg_coarse_sync_state": True, "mg_coarse_arap": True}
+# A/B variants (mirror hpbd_conv_curve.VARIANTS): single-level baseline vs the
+# validated state-sync HPBD. Both baked over the SAME round-trip so the recovery
+# can be compared frame-for-frame in usdview.
+VARIANTS = {
+    "off":  {"use_multigrid": False},
+    "hpbd": {"use_multigrid": True, "mg_mode": "hpbd",
+             "mg_coarse_sync_state": True, "mg_coarse_arap": True},
+}
 
 
 def muscle_surface(sim):
@@ -47,46 +52,39 @@ def muscle_surface(sim):
         np.asarray(sim.tet_idx.numpy(), dtype=np.int64)).reshape(-1).astype(np.int32)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
-    args = ap.parse_args()
-    base = load_config(args.config)
-    wp.init()
-    device = base.get("demo", {}).get("device", "cuda:0")
-    F0 = int(base.get("conv_frame", 120))
-    M = int(base.get("conv_substeps", 120))
-    out = base.get("cycle_anim_out") or os.path.join(
-        base.get("bench_out", "output/hpbd_cycle"), "muscle_cycle_hpbd.usd")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
+def run_variant(base, name, over, frames, device, out):
+    """Build the sim for one variant, sweep the real bone frames, bake USD.
+
+    frames = the round-trip frame schedule (start -> F0 -> start). Driving by REAL
+    bone frames (load_frame_targets each substep) makes the belly-attach target
+    ride the true bone ARC — unlike a straight-line world-space position lerp,
+    which chords through a limb's rotation and collapses the distal targets toward
+    the rotation center mid-cycle (spaghettifies thin forearm/hand muscles)."""
+    from pxr import Usd, UsdGeom, Vt
 
     cfg = copy.deepcopy(base)
-    cfg.update(HPBD_SYNC)
+    cfg.update(over)
     for c in cfg.get("constraints", []):          # attach IS the round-trip drive
         if c.get("name") == "belly_attach":
             c["enable"] = True
 
     sim = MultiGridSim(cfg, device=device)
-    sim.preload_targets([F0])
+    sim.preload_targets(sorted(set(frames)))
     tris = muscle_surface(sim)
     ntri = tris.shape[0] // 3
-    print(f"NV={sim.NV} NT={sim.NT} surface_tris={ntri}; cycle rest->F{F0}->rest, "
-          f"{M} substeps -> {out}")
+    nsub = len(frames)
+    print(f"[{name}] NV={sim.NV} NT={sim.NT} surface_tris={ntri}; "
+          f"cycle F{frames[0]}->F{max(frames)}->F{frames[-1]}, {nsub} substeps -> {out}")
 
-    # rest init + F0 bone target (the alpha=1 goal); alpha=0 goal = rest.
+    # rest init (muscle rest == start-frame bone pose, target reconstructs it exactly)
     rest_np = sim.pos0_np.astype(np.float32)
     sim.pos = wp.from_numpy(rest_np, dtype=wp.vec3, device=device)
     sim.pprev = wp.from_numpy(rest_np, dtype=wp.vec3, device=device)
     sim.vel.zero_()
-    sim.load_frame_targets(F0)
-    tgt_F0 = sim.target_pos.numpy().copy()
-    tgt_rest = rest_np.copy()
-
-    from pxr import Usd, UsdGeom, Vt, Sdf
 
     stage = Usd.Stage.CreateNew(out)
     stage.SetStartTimeCode(0)
-    stage.SetEndTimeCode(M)
+    stage.SetEndTimeCode(nsub)
     stage.SetTimeCodesPerSecond(1.0 / max(float(base.get("delta_t", 0.04166)), 1e-6))
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
     mesh = UsdGeom.Mesh.Define(stage, "/muscle_cycle")
@@ -100,22 +98,40 @@ def main():
             sim.pos.numpy().astype(np.float32)), Usd.TimeCode(t))
 
     bake(0)                                        # rest
-    for k in range(M):
-        frac = (k + 1) / M
-        alpha = 1.0 - abs(2.0 * frac - 1.0)        # triangle: 0 -> 1 (mid) -> 0
-        tgt = ((1.0 - alpha) * tgt_rest + alpha * tgt_F0).astype(np.float32)
-        sim.target_pos.assign(tgt)
-        sim._update_belly_attach_targets()
+    for k, f in enumerate(frames):
+        sim.load_frame_targets(f)                  # bone -> frame f, target rides real arc
         sim.substep()
         bake(k + 1)
         if np.isnan(sim.pos.numpy()).any():
-            print(f"  NaN at substep {k + 1}")
+            print(f"  [{name}] NaN at substep {k + 1} (frame {f})")
             break
-        if (k + 1) % 20 == 0 or k + 1 == M:
-            print(f"  substep {k + 1}/{M}  alpha={alpha:.3f}  inv={sim.count_inverted()}")
+        if (k + 1) % 40 == 0 or k + 1 == nsub:
+            print(f"  [{name}] substep {k + 1}/{nsub}  frame={f}  "
+                  f"inv={sim.count_inverted()}")
 
     stage.GetRootLayer().Save()
-    print(f"\nwrote {out}  ({M + 1} frames)")
+    print(f"[{name}] wrote {out}  ({nsub + 1} frames)\n")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    args = ap.parse_args()
+    base = load_config(args.config)
+    wp.init()
+    device = base.get("demo", {}).get("device", "cuda:0")
+    start = int(base.get("start_frame", 1))
+    F0 = int(base.get("conv_frame", 120))
+    out_dir = os.path.dirname(base.get("cycle_anim_out") or "") or \
+        base.get("bench_out", "output/hpbd_cycle")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # one bone frame per substep, up then back: start -> F0 -> start (true arc)
+    frames = list(range(start, F0 + 1)) + list(range(F0 - 1, start - 1, -1))
+
+    for name, over in VARIANTS.items():
+        run_variant(base, name, over, frames, device,
+                    os.path.join(out_dir, f"muscle_cycle_{name}.usd"))
 
 
 if __name__ == "__main__":

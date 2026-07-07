@@ -1,3 +1,8 @@
+> **⚠️ Historical design doc.** References to `OneWaySim` /
+> `coupleOneWayGmg/solver.py` and its multigrid phases predate the move to
+> `src/muscle/mg/mg.py` (`MultiGridSim`); those module paths no longer exist. For
+> the current multigrid scheme see [`../../humanV2_cage_multigrid.md`](../../humanV2_cage_multigrid.md).
+
 # Unified XPBD Engine — design
 
 **Date:** 2026-06-13

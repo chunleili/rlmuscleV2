@@ -6,11 +6,17 @@ entry point (`--config` is the only argument); the baseline config
 (`data/humanV2/config/humanV2.json`) is **fascia shell + animated-bone SDF
 collision, multigrid OFF**.
 
+> **⚠️ Note:** the physics solver moved from `coupleOneWayGmg/solver.py`
+> (`OneWaySim`) to **`src/muscle/mg/mg.py` (`MultiGridSim`)**; the `solver.py:NNNN`
+> line jumps below are stale. The flow is otherwise unchanged. For the multigrid
+> details in particular see [`humanV2_cage_multigrid.md`](humanV2_cage_multigrid.md)
+> (the current `mg_mode: off|projection|hpbd` scheme).
+
 Two source files carry the whole flow:
 
 - `src/example/humanV2.py` — the demo driver (build, collider, render loop).
-- `src/muscle/coupleOneWayGmg/solver.py` — `OneWaySim`, the ARAP-HPBD
-  pin-to-target physics.
+- `src/muscle/mg/mg.py` — `MultiGridSim`, the ARAP-HPBD bone-driven physics
+  (was `coupleOneWayGmg/solver.py` `OneWaySim`).
 
 ## Data flow (one glance)
 
@@ -162,9 +168,12 @@ for _ in range(nsubsteps):     # 10
 `substep()` (`solver.py:1596`) runs the three-phase `program`
 (`build_program`, `solver.py:1491`):
 
-**pre_phase** (`solver.py:1494`)
-- Multigrid (if ON): `restrict_direct_kernel` → coarse ARAP × `coarse_iters` →
-  `prolong_kernel` → `apply_pintotarget`.
+**pre_phase**
+- Multigrid (if ON): the V-cycle depends on `mg_mode` — `projection` restricts
+  the bone target onto the cage and prolongs (one-shot smoother); **`hpbd`**
+  Galerkin state-restricts the fine state, relaxes coarse ARAP, and
+  delta-prolongs the correction. See
+  [`humanV2_cage_multigrid.md`](humanV2_cage_multigrid.md).
 - Else partial-pin: `apply_pintotarget`.
 - `apply_anchor`; zero `L` / `vol_L` / `fiber_L`.
 
@@ -190,7 +199,7 @@ for _ in range(nsubsteps):     # 10
 | key | effect | baseline |
 |-----|--------|----------|
 | `use_fascia` | merge the fascia squeeze shell | true |
-| `use_multigrid` | coarse-mesh V-cycle in pre_phase | false |
+| `use_multigrid` / `mg_mode` | coarse-mesh V-cycle in pre_phase (`off`/`projection`/`hpbd`) | false |
 | `use_fiber` / `fiber_model` | passive along-fiber stiffness | off |
 | `fascia_rest_scale` | fascia rest shrink (squeeze strength) | 0.95 |
 | `nsubsteps` / `fine_iterations` | substeps per frame / ARAP iters per substep | 10 / 2 |

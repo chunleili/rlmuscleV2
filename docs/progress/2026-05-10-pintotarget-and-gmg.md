@@ -1,3 +1,9 @@
+> **⚠️ SUPERSEDED (historical progress log).** The GMG / `coarse_solver.py` /
+> `MultigridMuscleSim` / `coupleOneWay` code paths below were replaced by
+> `src/muscle/mg/mg.py` (`MultiGridSim`) and no longer exist. For the current,
+> validated multigrid see [`../humanV2_cage_multigrid.md`](../humanV2_cage_multigrid.md).
+> Kept as a dated record of the pintotarget + SVD-ARAP work.
+
 # Pintotarget hard pin + Geometric Multigrid (GMG)
 
 ## 背景

@@ -1,3 +1,7 @@
+> **⚠️ Historical design doc.** The multigrid / `gmg` / `restpos_lowres.geo`
+> references below predate `src/muscle/mg/mg.py` (`MultiGridSim`) with the inflate
+> cage. For the current multigrid see [`../../humanV2_cage_multigrid.md`](../../humanV2_cage_multigrid.md).
+
 # Fascia + Muscle Two-Way Simulation — Design
 
 Date: 2026-06-06
