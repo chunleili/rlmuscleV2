@@ -25,6 +25,8 @@
     "mass_density": -1.0,
     "fine_iterations": 20,
     "nsubsteps": 10,
+    "presubframe_pintotarget": 1.0,
+    "subframe_bone": true,
 
     "constraints": [
         { "type": "tetarapsvd", "name": "arap",            "enable": true, "stiffness": 1e9, "dampingratio": 0.1 },

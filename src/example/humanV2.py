@@ -733,8 +733,10 @@ class HumanV2:
                 self._render_frame(frame, n_inv)
             if frame % 5 == 0 or frame == sim.end_frame:
                 elapsed = time.perf_counter() - t0
+                trk_p50, trk_mean = sim.belly_track_mm()   # bone-tracking residual
                 print(f"  frame {frame:>3d}  {elapsed:6.1f}s  {self.meter.summary()}  "
-                      f"inverted {n_inv}/{sim.NT} ({n_inv / sim.NT * 100:.2f}%)")
+                      f"inverted {n_inv}/{sim.NT} ({n_inv / sim.NT * 100:.2f}%)  "
+                      f"track p50 {trk_p50:.2f}mm mean {trk_mean:.2f}mm")
         self._finalize()
         if self._self_finalize is not None:
             self._self_finalize()              # self-collision end-of-run stats

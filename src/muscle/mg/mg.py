@@ -109,6 +109,19 @@ class MultiGridSim(MuscleSim):
                              "(the muscle ARAP-SVD shape match)")
         self.mu = float(_arap["stiffness"])
         self._arap_damp = float(_arap.get("dampingratio", 0.0))
+        # Optional Stable Neo-Hookean elastic model (Macklin XPBD SNH: coupled
+        # deviatoric ||F||-sqrt(3) + volumetric J-alpha with an inversion barrier).
+        # When a 'snh' constraint is configured it REPLACES the ARAP-SVD shape match
+        # in the fine muscle solve: SNH resists det(F)->0, so it PREVENTS tet
+        # inversion under a hard bone-driven fold rather than only repairing it
+        # (ARAP-SVD's energy is reflection-symmetric -> no inversion barrier). `mu`
+        # = shear (falls back to the arap stiffness), `lam` = bulk modulus. The MG
+        # coarse path still uses ARAP-SVD (self.mu); SNH is fine-level only.
+        _snh = find_constraint(cfg, "snh")
+        self.use_snh = _snh is not None
+        self.snh_mu = float(_snh.get("mu", _snh.get("stiffness", self.mu))) if _snh else 0.0
+        self.snh_lam = float(_snh.get("lam", 1.0e8)) if _snh else 0.0
+        self.snh_damp = float(_snh.get("dampingratio", self._arap_damp)) if _snh else 0.0
         self.omega = float(cfg["omega"])
         self.dt_frame = float(cfg["delta_t"])
         self.nsubsteps = int(cfg["nsubsteps"])
@@ -358,14 +371,22 @@ class MultiGridSim(MuscleSim):
                     "dispatch; supported: 'fibernorm' (ConstraintType.TETFIBERNORM) "
                     "and 'aniso_arap' (ConstraintType.TETARAPANISO).")
 
-        # Constraint set: ARAP-SVD shape match (always) + optional volume + fiber.
-        # ARAP stiffness = mu (the old HPBD ARAP stiffness); volume / fiber take
-        # their configured stiffness. Targets / pins stay kinematic (apply_pintotarget).
-        self.constraint_configs = [
-            dict(type="tetarapsvd", name="arap", stiffness=self.mu,
-                 dampingratio=self._arap_damp),
-        ]
-        if self.use_volume:
+        # Constraint set: SNH (if configured) OR ARAP-SVD shape match, + optional
+        # volume + fiber. ARAP stiffness = mu; volume / fiber take their configured
+        # stiffness. Targets / pins stay kinematic (apply_pintotarget). SNH is a
+        # complete deviatoric+volumetric energy, so it REPLACES ARAP-SVD and the
+        # separate volume constraint (its `lam` term is the volumetric part).
+        if self.use_snh:
+            self.constraint_configs = [
+                dict(type="snh", name="snh", mu=self.snh_mu, lam=self.snh_lam,
+                     dampingratio=self.snh_damp),
+            ]
+        else:
+            self.constraint_configs = [
+                dict(type="tetarapsvd", name="arap", stiffness=self.mu,
+                     dampingratio=self._arap_damp),
+            ]
+        if self.use_volume and not self.use_snh:
             self.constraint_configs.append(
                 dict(type="volume", name="volume", stiffness=self.volume_stiffness,
                      dampingratio=self.volume_damp))
@@ -422,6 +443,8 @@ class MultiGridSim(MuscleSim):
         self.slide_interval = int(cfg.get("slide_interval", 1))     # re-project every N frames
         if self.target_mode == "mesh":
             self._build_bone_slide_binding(rest, device)
+        elif self.target_mode == "lbs":
+            self._build_lbs_target(rest, device)
         else:
             # Pin-to-target: topology (pts) is constant across all cons_<frame>.geo
             # files; only target_pos varies.
@@ -941,6 +964,18 @@ class MultiGridSim(MuscleSim):
                   device=self._device)
         return int(cnt.numpy()[0])
 
+    def belly_track_mm(self):
+        """Bone-tracking residual: how far the muscle is from its bone-driven goal.
+
+        Per-vert distance ||pos - (target_pos + rest_offset)|| over all constraint
+        verts (= the belly-attach residual; in mesh mode rest_offset=0 so the goal
+        is the per-vert bone-surface projection target_pos). Returns (p50, mean) in
+        millimetres. Small = the muscle tightly follows the bone; large = it lags /
+        detaches. A GPU->CPU sync; call at print cadence, not every substep."""
+        goal = self.target_pos.numpy() + self.rest_offset.numpy()
+        d = np.linalg.norm(self.pos.numpy() - goal, axis=1)
+        return float(np.percentile(d, 50) * 1e3), float(d.mean() * 1e3)
+
     def _restrict_cage(self) -> None:
         """Pipeline step 1 — reset the coarse cage to the CURRENT fine STATE. Operator
         chosen by mg_sync_restrict:
@@ -1138,6 +1173,46 @@ class MultiGridSim(MuscleSim):
                   device=self._device)
         self._update_belly_attach_targets()
 
+    def _build_lbs_target(self, rest, device) -> None:
+        """target_mode='lbs': drive every muscle vert toward a precomputed SMOOTH
+        LBS target sequence (tools.emil_lbs_tet_bake -> npz of (F, NV, 3) world
+        points, tet order). Unlike the single-bone-triangle 'mesh' binding this
+        target is continuous across joints, so it does not shear the elbow crease
+        into inverted tets. target_pos carries the full goal (rest_offset=0)."""
+        path = self.cfg.get("lbs_target_npz")
+        if not path:
+            raise ValueError("target_mode='lbs' requires cfg['lbs_target_npz']")
+        z = np.load(path)
+        pts = np.asarray(z["points"], np.float32)               # (F, NV, 3)
+        fr = np.asarray(z["frames"], np.int32)
+        if pts.shape[1] != self.NV:
+            raise ValueError(f"lbs_target_npz NV={pts.shape[1]} != muscle NV={self.NV}")
+        self._lbs_pts = pts
+        self._lbs_f0 = int(fr[0])
+        self.NCONS = int(self.NV)
+        _ident = np.arange(self.NV, dtype=np.int32)
+        self.pts = wp.array(_ident, dtype=wp.int32, device=device)
+        self._pin_pts_np = _ident.astype(np.int64)
+        self.rest_offset = wp.zeros(self.NV, dtype=wp.vec3, device=device)
+        self.target_pos = wp.array(pts[0].copy(), dtype=wp.vec3, device=device)
+        print(f"[lbs-target] {pts.shape[0]} frames x {self.NV} verts from {path}")
+
+    def _update_lbs_target(self, frame) -> None:
+        """Write the (optionally sub-frame-interpolated) LBS target for `frame`."""
+        f = float(frame)
+        n = self._lbs_pts.shape[0]
+        lo = int(np.floor(f)) - self._lbs_f0
+        hi = int(np.ceil(f)) - self._lbs_f0
+        lo = min(max(lo, 0), n - 1)
+        hi = min(max(hi, 0), n - 1)
+        if lo == hi:
+            tgt = self._lbs_pts[lo]
+        else:
+            w = f - np.floor(f)
+            tgt = (1.0 - w) * self._lbs_pts[lo] + w * self._lbs_pts[hi]
+        self.target_pos.assign(np.ascontiguousarray(tgt, np.float32))
+        self._update_belly_attach_targets()
+
     def preload_targets(self, frames=None) -> None:
         """Parse every frame's target once and hold it in RAM.
 
@@ -1148,6 +1223,8 @@ class MultiGridSim(MuscleSim):
         """
         if frames is None:
             frames = range(self.start_frame, self.end_frame + 1)
+        if self.target_mode == "lbs":
+            return                                    # target sequence already in RAM (npz)
         if self.target_mode == "mesh":
             self._bone_pos_stack = {f: self._bone_frame_positions(f) for f in frames}
         else:
@@ -1156,6 +1233,9 @@ class MultiGridSim(MuscleSim):
     def load_frame_targets(self, frame: int) -> None:
         if self.target_mode == "mesh":
             self._update_slide_target(frame)
+            return
+        if self.target_mode == "lbs":
+            self._update_lbs_target(frame)
             return
         stack = getattr(self, "_target_stack", None)
         if stack is None or frame not in stack:
