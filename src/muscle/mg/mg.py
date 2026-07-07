@@ -188,12 +188,19 @@ class MultiGridSim(MuscleSim):
         #       is delta-prolonged onto the fine (prolong_delta_kernel, eq 7) — low
         #       modes drive high, and the increment→0 at rest so it never biases the
         #       fine equilibrium (unlike the absolute-prolong "projection"/FAS paths).
-        self.mg_mode = str(cfg.get("mg_mode", "projection")).lower()
+        # Default = 'hpbd': enabling multigrid (use_multigrid=true) gives the
+        # validated state-sync V-cycle out of the box, no extra config needed. Set
+        # mg_mode='projection' explicitly for the legacy one-shot target smoother.
+        self.mg_mode = str(cfg.get("mg_mode", "hpbd")).lower()
         if self.mg_mode not in ("projection", "hpbd"):
             raise ValueError(f"mg_mode must be 'projection' or 'hpbd', got {self.mg_mode!r}")
         # HPBD coarse-solve knobs (mg_mode='hpbd' only).
         self.mg_coarse_iters = int(cfg.get("mg_coarse_iters", 15))     # coarse ARAP sweeps/substep
-        self.mg_coarse_attach_beta = float(cfg.get("mg_coarse_attach_beta", 0.5))  # coarse BC pull
+        # Coarse attach (Robin) BC pull. Default 0: the state-sync restrict already
+        # carries the fine BC into the coarse, and a coarse attach toward
+        # restrict(bone target) is ill-conditioned on the enclosing cage's outer
+        # nodes -> biases/injects error. Keep 0 (validated); >0 is harmful here.
+        self.mg_coarse_attach_beta = float(cfg.get("mg_coarse_attach_beta", 0.0))
         # Coarse PIN (Dirichlet) BC: a coarse node is a hard pin if this fraction of
         # the fine verts embedding around it are themselves fine hard-pins
         # (muscleToBonePin). Built in _build_coarse_arap by restricting the fine pin
