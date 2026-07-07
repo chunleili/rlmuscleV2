@@ -1,0 +1,57 @@
+{
+    "start_frame": 1,
+    "end_frame": 200,
+    "geo_dir": "data/Emil/model",
+    "cons_dir": "data/Emil/model/cons",
+    "target_mode": "mesh",
+    "use_sliding": false,
+    "bone_usd": "data/Emil/model/Emil.usd",
+    "slide_range": 0.005,
+    "slide_interval": 999999,
+    "rest_path": "data/Emil/model/Emil.usd",
+
+    "use_fascia": false,
+    "fascia_path": "data/Emil/model/fascia.geo",
+    "fascia_mode": "squeeze",
+    "fascia_bind_max_dist": 0.05,
+
+    "quasi_static": false,
+    "use_multigrid": false,
+    "coarse_npz_path": "data/Emil/model/coarse_cage.npz",
+    "omega": 0.1,
+    "delta_t": 0.04166,
+    "gravity": [0.0, 0.0, 0.0],
+    "total_mass": 70.0,
+    "mass_density": -1.0,
+    "fine_iterations": 20,
+    "nsubsteps": 10,
+
+    "constraints": [
+        { "type": "tetarapsvd", "name": "arap",            "enable": true, "stiffness": 1e9, "dampingratio": 0.1 },
+        { "type": "attach",     "name": "belly_attach",    "enable": true, "stiffness": 1e6, "dampingratio": 0.1 },
+        { "type": "pin",        "name": "muscleToBonePin", "enable": true, "region": "full", "tendon_pin_threshold": 1.1 }
+    ],
+
+    "demo": {
+        "out": "output/emil/emil_full.anim.usd",
+        "graft_src": "data/Emil/model/Emil.usd",
+        "sim_scope": "/char/sim",
+        "device": "cuda:0",
+        "no_export": false,
+        "geo_out": null,
+        "output_collide_primvars": false,
+        "activate": null,
+        "collision": {
+            "enabled": true,
+            "static_bone": false,
+            "max_dist": 0.2,
+            "contact_offset": 1e-5,
+            "collide_eps": 1e-6,
+            "max_push": -1.0,
+            "flip_bone_winding": false
+        },
+        "self_collision": {
+            "method": "none"
+        }
+    }
+}

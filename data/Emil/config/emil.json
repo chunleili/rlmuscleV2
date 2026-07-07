@@ -29,7 +29,7 @@
     "constraints": [
         { "type": "tetarapsvd", "name": "arap",            "enable": true, "stiffness": 1e9, "dampingratio": 0.1 },
         { "type": "attach",     "name": "belly_attach",    "enable": true, "stiffness": 1e6, "dampingratio": 0.1 },
-        { "type": "pin",        "name": "muscleToBonePin", "enable": true, "region": "full", "tendon_pin_threshold": 1.1 }
+        { "type": "pin",        "name": "muscleToBonePin", "enable": true, "region": "tendonmask", "tendon_pin_threshold": 0.5 }
     ],
 
     "demo": {
