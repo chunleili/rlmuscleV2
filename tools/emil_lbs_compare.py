@@ -167,10 +167,10 @@ cmap = LinearSegmentedColormap.from_list("vsjet", list(map(tuple, STOPS)), N=256
 sm2 = ScalarMappable(norm=Normalize(0, vmm), cmap=cmap)
 plt.rcParams.update({"font.size": 11, "pdf.fonttype": 42})
 step = max(1, round(vmm / 6))
-fig = plt.figure(figsize=(4.8, 1.3))
-cax = fig.add_axes([0.06, 0.55, 0.88, 0.22])
-cb = fig.colorbar(sm2, cax=cax, orientation="horizontal", extend="max",
+fig = plt.figure(figsize=(1.1, 4.8))
+cax = fig.add_axes([0.05, 0.05, 0.34, 0.9])
+cb = fig.colorbar(sm2, cax=cax, orientation="vertical", extend="max",
                   ticks=list(np.arange(0, vmm + 1e-6, step)))
-cb.set_label("Solver muscle distance to LBS surface — mm")
+# no descriptive label — keep only tick marks + numeric tick labels
 fig.savefig(CBAR, dpi=300, bbox_inches="tight", transparent=True)
 print(f"WROTE {CBAR}  (VMAX={vmm}mm)")

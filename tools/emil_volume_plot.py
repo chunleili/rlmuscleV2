@@ -21,13 +21,13 @@ with open(CSV) as fh:
 f, vs, vl = np.array(f), np.array(vs), np.array(vl)
 
 fig, ax = plt.subplots(1, 2, figsize=(9, 3.2))
-ax[0].plot(f, vs, label="solver (physics)", lw=1.8)
-ax[0].plot(f, vl, label="LBS (skinning)", lw=1.8, ls="--")
+ax[0].plot(f, vs, label="Ours", lw=1.8)
+ax[0].plot(f, vl, label="Epic (Han 2024)", lw=1.8, ls="--")
 ax[0].set(xlabel="frame", ylabel="muscle volume (L)", title="Muscle volume")
 ax[0].legend(); ax[0].grid(alpha=0.3)
 
-ax[1].plot(f, (vs / vs[0] - 1) * 100, label="solver", lw=1.8)
-ax[1].plot(f, (vl / vl[0] - 1) * 100, label="LBS", lw=1.8, ls="--")
+ax[1].plot(f, (vs / vs[0] - 1) * 100, label="Ours", lw=1.8)
+ax[1].plot(f, (vl / vl[0] - 1) * 100, label="Epic (Han 2024)", lw=1.8, ls="--")
 ax[1].axhline(0, color="k", lw=0.6)
 ax[1].set(xlabel="frame", ylabel="volume change vs rest (%)", title="Volume preservation")
 ax[1].legend(); ax[1].grid(alpha=0.3)
