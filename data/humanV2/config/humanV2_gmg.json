@@ -1,0 +1,103 @@
+{
+    "start_frame": 1,
+    "end_frame": 200,
+    "geo_dir": "data/humanV2/model",
+    "cons_dir": "data/humanV2/model/cons",
+    "target_mode": "mesh",
+    "use_sliding": false,
+    "bone_dir": "data/humanV2/model/bone",
+    "slide_range": 0.005,
+    "slide_interval": 999999,
+    "rest_path": "data/humanV2/model/muscle/restpos.geo",
+    "use_fascia": false,
+    "fascia_path": "data/humanV2/model/fascia/fascia.geo",
+    "fascia_mode": "ride",
+    "fascia_bind_max_dist": 0.05,
+    "quasi_static": false,
+    "use_multigrid": true,
+    "coarse_npz_path": "data/humanV2/model/muscle/coarse_cage.npz",
+    "omega": 0.1,
+    "delta_t": 0.04166,
+    "gravity": [
+        0.0,
+        0.0,
+        0.0
+    ],
+    "total_mass": 70.0,
+    "mass_density": -1.0,
+    "fine_iterations": 20,
+    "nsubsteps": 10,
+    "constraints": [
+        {
+            "type": "tetarapsvd",
+            "name": "arap",
+            "enable": true,
+            "stiffness": 1000000.0,
+            "dampingratio": 0.1
+        },
+        {
+            "type": "attach",
+            "name": "belly_attach",
+            "enable": true,
+            "stiffness": 1000000.0,
+            "dampingratio": 0.1
+        },
+        {
+            "type": "pin",
+            "name": "muscleToBonePin",
+            "enable": true,
+            "region": "pinmask",
+            "tendon_pin_threshold": 1.1
+        },
+        {
+            "type": "glue",
+            "name": "fascia_glue",
+            "enable": true,
+            "stiffness_scale": 0.5,
+            "dampingratio": 0.1,
+            "iterations": 20
+        },
+        {
+            "type": "tetarapsvd",
+            "name": "fascia_arap",
+            "enable": true,
+            "stiffness": -1.0,
+            "dampingratio": 0.1,
+            "rest_scale": 1.0
+        },
+        {
+            "type": "volume",
+            "name": "fascia_volume",
+            "enable": true,
+            "stiffness": 1000000.0,
+            "dampingratio": 0.1
+        },
+        {
+            "type": "snh",
+            "name": "fascia_snh",
+            "enable": true,
+            "mu": 1000.0,
+            "lam": 100000000.0,
+            "dampingratio": 0.1
+        }
+    ],
+    "demo": {
+        "out": "output/humanV2/humanV2_gmg.usd",
+        "device": "cuda:0",
+        "no_export": false,
+        "geo_out": null,
+        "output_collide_primvars": false,
+        "activate": null,
+        "collision": {
+            "enabled": true,
+            "static_bone": false,
+            "max_dist": 0.2,
+            "contact_offset": 1e-05,
+            "collide_eps": 1e-06,
+            "max_push": -1.0
+        },
+        "self_collision": {
+            "method": "none"
+        }
+    }
+}
