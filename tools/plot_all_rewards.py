@@ -10,7 +10,7 @@ TASKS = [
     ("swim-ellipsoid", "output/swim-ellipsoid/runs/20260522_152506-nid011212-n64/rewards.csv"),
     ("kick-preroll",   "output/kick-preroll/runs/20260522_152506-nid011212-n64/rewards.csv"),
     ("walk",           "output/walk/runs/20260522_174007-nid011212-n64-gpu3/rewards.csv"),
-    ("overhead-squat", "output/overhead-squat/runs/20260522_184139-nid011212-n64-heightfix-posecutoff/rewards.csv"),
+    ("squat", "output/overhead-squat/runs/20260522_184139-nid011212-n64-heightfix-posecutoff/rewards.csv"),
 ]
 
 

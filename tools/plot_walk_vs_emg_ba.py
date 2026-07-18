@@ -48,7 +48,7 @@ def main():
     p.add_argument("-o", "--output", required=True)
     a = p.parse_args()
 
-    cols = {"Baseline (tracking only)": _load(a.before),
+    cols = {"without EMG prior": _load(a.before),
             "With EMG prior": _load(a.after)}
     fig, axes = plt.subplots(len(MUSCLES), 2, figsize=(8, 8), sharex=True)
     t = cols["With EMG prior"]["time_pct"]
