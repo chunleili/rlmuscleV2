@@ -1,6 +1,8 @@
 # A GPU XPBD Physics Engine for Muscle-Skeletal Character Animation
 
-It is also the code for paper **"RLMuscle: Physics-Based Muscle-Driven Character Animation via Reinforcement Learning"**
+It is also the code for paper **"RLMuscle: Muscle-Driven Character Animation via Reinforcement Learning"**
+([arXiv:2610.30033](https://arxiv.org/abs/2610.30033) · [project page](https://chunleili.github.io/project-page-rlmuscle/)).
+The exact code for the arXiv version is on branch [`one-way`](https://github.com/chunleili/rlmuscleV2/tree/one-way) / tag [`arxiv-2610.30033`](https://github.com/chunleili/rlmuscleV2/releases/tag/arxiv-2610.30033).
 
 Based on NVIDIA Warp, which is capable for **all platforms (Windows, Linux, MacOS)** and **GPU as well as CPU** parallelization.
 
@@ -244,14 +246,24 @@ uv run -m example.humanV2 --config data/humanV2/config/humanV2.json
 
 ## Art assets
 
-Large `model/` geometry is not in git — it lives in the private HF dataset
+Large `model/` geometry is not in git — it lives in the public HF dataset
 [`chunleili/rlmuscleV2-assets`](https://huggingface.co/datasets/chunleili/rlmuscleV2-assets)
 as `<case>/model.zip`, extracting to `data/<case>/model/`.
 
 ```bash
 pip install huggingface_hub
-hf auth login                  # read token; ask owner for repo access (private)
 python tools/fetch_assets.py   # download all cases (or pass case names)
 ```
 
 Upload (maintainer): `hf upload chunleili/rlmuscleV2-assets data/<case>/model.zip <case>/model.zip --repo-type dataset`
+
+## Citation
+
+```bibtex
+@article{Li2026RLMuscle,
+  title={RLMuscle: Muscle-Driven Character Animation via Reinforcement Learning},
+  author={Li, Chunlei and Yu, Siyuan and Gao, Yang and Li, Shuai and Yu, Peng and Hao, Aimin and Wang, He},
+  journal={arXiv preprint arXiv:2610.30033},
+  year={2026}
+}
+```

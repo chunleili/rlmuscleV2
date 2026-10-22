@@ -1,4 +1,4 @@
-"""Download per-case art assets (model.zip) from the private HF dataset.
+"""Download per-case art assets (model.zip) from the public HF dataset.
 
 Assets live in chunleili/rlmuscleV2-assets as <case>/model.zip; each zip holds a
 model/ prefix, so it extracts to data/<case>/model/. Cases are discovered from
@@ -6,8 +6,6 @@ the repo, so new cases are picked up automatically.
 
 Prereqs (one-time):
     pip install huggingface_hub
-    hf auth login        # read token from https://huggingface.co/settings/tokens
-    # private repo: ask the owner to add you as a collaborator first
 
     python tools/fetch_assets.py                 # all cases
     python tools/fetch_assets.py humanV2 lion     # only these cases
