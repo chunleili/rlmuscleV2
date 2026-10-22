@@ -2,7 +2,6 @@
 
 It is also the code for paper **"RLMuscle: Muscle-Driven Character Animation via Reinforcement Learning"**
 ([arXiv:2610.30033](https://arxiv.org/abs/2610.30033) · [project page](https://chunleili.github.io/project-page-rlmuscle/)).
-The exact code for the arXiv version is on branch [`one-way`](https://github.com/chunleili/rlmuscleV2/tree/one-way) / tag [`arxiv-2610.30033`](https://github.com/chunleili/rlmuscleV2/releases/tag/arxiv-2610.30033).
 
 Based on NVIDIA Warp, which is capable for **all platforms (Windows, Linux, MacOS)** and **GPU as well as CPU** parallelization.
 
